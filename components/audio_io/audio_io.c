@@ -29,6 +29,15 @@ static volatile bool s_capture_active = false;
 // deaf; this makes that failure class visible from the log line alone.
 static volatile uint32_t s_capture_samples_total = 0;
 
+// Playback samples LOST because the ringbuffer stayed full past the 200 ms
+// send timeout in audio_io_write_pcm. Before 0.2.62 the upsample branches
+// discarded those chunks silently (and still counted them as written), so a
+// mid-reply skip was indistinguishable from clean playback. The [hb] line
+// prints the running total as pcm_drop= — nonzero means the server is
+// pacing faster than the ring drains (see LEAD_MS in lib/voice-tts-stream.mjs
+// server-side; ring capacity is PLAYBACK_RB_BYTES ≈ 1.36 s at 48 k stereo).
+static volatile uint32_t s_playback_drop_samples = 0;
+
 // Software playback volume. Linear gain applied in the int16→int32 shift
 // inside playback_task. 0 = silent, 100 = unity. 80 by default (mild
 // headroom for the XVF DAC stage so we don't clip on loud peaks).
@@ -192,6 +201,10 @@ uint32_t audio_io_get_capture_rms_1s(void) {
 
 uint32_t audio_io_get_capture_samples_total(void) {
     return s_capture_samples_total;
+}
+
+uint32_t audio_io_get_playback_drop_samples(void) {
+    return s_playback_drop_samples;
 }
 
 static void playback_task(void *arg)
@@ -377,6 +390,21 @@ esp_err_t audio_io_pause_playback(void)  { s_paused = true;  return ESP_OK; }
 esp_err_t audio_io_resume_playback(void) { s_paused = false; return ESP_OK; }
 bool      audio_io_is_paused(void)       { return s_paused; }
 
+// Send one chunk to the playback ring, counting (instead of hiding) a loss.
+// Deliberately no retry: write_pcm runs on latency-sensitive tasks
+// (websocket_task for TTS, the AirPlay receiver for music), and the 200 ms
+// timeout already gives the drain task ample room. If it still expires,
+// blocking longer only trades an audible skip for delayed pongs — count the
+// loss so pcm_drop= in [hb] surfaces it, and let server pacing take the blame.
+static bool rb_send_playback(const void *data, size_t bytes)
+{
+    if (xRingbufferSend(s_playback_rb, data, bytes, pdMS_TO_TICKS(200)) == pdTRUE) return true;
+    s_playback_drop_samples += bytes / sizeof(int16_t);
+    ESP_LOGW(TAG, "playback rb full: dropped %u samples (pcm_drop total %u)",
+             (unsigned)(bytes / sizeof(int16_t)), (unsigned)s_playback_drop_samples);
+    return false;
+}
+
 size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate)
 {
     if (!s_playback_rb) return 0;
@@ -399,8 +427,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
 
     if (source_rate == AUDIO_BUS_SAMPLE_RATE) {
         // 48 kHz native stereo — push straight to bus rb.
-        BaseType_t r = xRingbufferSend(s_playback_rb, pcm_stereo, samples * sizeof(int16_t), pdMS_TO_TICKS(200));
-        return r == pdTRUE ? samples : 0;
+        return rb_send_playback(pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
     }
 
     if (source_rate == 16000) {
@@ -429,7 +456,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            xRingbufferSend(s_playback_rb, buf, bi * sizeof(int16_t), pdMS_TO_TICKS(200));
+            rb_send_playback(buf, bi * sizeof(int16_t));
             total_written += bi;
             in_base += chunk_in;
         }
@@ -480,7 +507,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
                 out[out_idx++] = o_r;
                 phase += PHASE_STEP_44K;
                 if (out_idx >= (sizeof(out) / sizeof(out[0]))) {
-                    xRingbufferSend(s_playback_rb, out, out_idx * sizeof(int16_t), pdMS_TO_TICKS(200));
+                    rb_send_playback(out, out_idx * sizeof(int16_t));
                     total_written += out_idx;
                     out_idx = 0;
                 }
@@ -491,7 +518,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
         }
 
         if (out_idx > 0) {
-            xRingbufferSend(s_playback_rb, out, out_idx * sizeof(int16_t), pdMS_TO_TICKS(200));
+            rb_send_playback(out, out_idx * sizeof(int16_t));
             total_written += out_idx;
         }
         s_44k_prev_l = prev_l;
@@ -520,7 +547,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            xRingbufferSend(s_playback_rb, buf, bi * sizeof(int16_t), pdMS_TO_TICKS(200));
+            rb_send_playback(buf, bi * sizeof(int16_t));
             total_written += bi;
             in_base += chunk_in;
         }
@@ -530,8 +557,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
     // Unknown source rate — fall back to 1:1 push (will sound wrong unless
     // it happens to be 48 kHz). Log so future-us notices.
     ESP_LOGW(TAG, "audio_io_write_pcm: unhandled source_rate=%u, pushing 1:1", (unsigned) source_rate);
-    BaseType_t r = xRingbufferSend(s_playback_rb, pcm_stereo, samples * sizeof(int16_t), pdMS_TO_TICKS(200));
-    return r == pdTRUE ? samples : 0;
+    return rb_send_playback(pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
 }
 
 void audio_io_flush_playback(void)

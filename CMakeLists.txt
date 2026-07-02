@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.16)
 # the device reports it via esp_app_get_description()->version on WS auth so
 # the server can decide whether an OTA push is needed. Keep in sync with
 # public/firmware/voice-device/manifest.json "version" on the OE side.
-set(PROJECT_VER "0.2.61-fullduplex")
+set(PROJECT_VER "0.2.62-selfheal")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(oe_voice_device VERSION 0.2.13)

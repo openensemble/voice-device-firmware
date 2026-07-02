@@ -190,6 +190,15 @@ static void agc_freeze_task(void *arg)
         // time we successfully count 3 quiet seconds, the AGC is
         // settled and the freeze captures the correct high gain.
         if (airplay_is_streaming()) continue;
+        // Same reasoning for the device's OWN output (TTS reply, routine
+        // announcement, auto-resumed ambient): a boot that lands into
+        // playback would otherwise burn the wait cap against speaker noise
+        // and freeze the AGC at the gain it adapted DOWN to — the exact
+        // starved-wake-word state this task exists to prevent. Don't count
+        // these seconds toward the cap either; like the AirPlay case, the
+        // AGC's own ~1-2 s recovery after playback ends resets quiet_seconds
+        // naturally, so the freeze always captures settled quiet-room gain.
+        if (audio_io_playback_active()) continue;
         total_seconds++;
         uint32_t rms = audio_io_get_capture_rms_1s();
         if (rms > 0 && rms < QUIET_RMS_MAX) {
@@ -315,7 +324,11 @@ static inline bool frame_is_speech(const int16_t *samples, size_t n)
 #define WIFI_FAIL_BIT      BIT1
 static EventGroupHandle_t s_wifi_evt = NULL;
 
-#define CAPTURE_BUFFER_SAMPLES (16000 * 12)
+// Must hold a full VAD-bounded utterance: max_utterance_ms is 15 s, so 16 s
+// gives the ceiling plus margin. 12 s (pre-0.2.62) silently truncated the
+// longest questions — the append gate below just stops copying when full, so
+// STT got a cut-off utterance with no error anywhere. 512 KB, lands in PSRAM.
+#define CAPTURE_BUFFER_SAMPLES (16000 * 16)
 static int16_t *s_capture_buf = NULL;
 static size_t s_capture_used = 0;
 
@@ -1181,6 +1194,26 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             esp_restart();
             break;
         }
+        case OE_WS_EVT_REBOOT: {
+            // Plain restart, everything preserved — the server health loop's
+            // recovery primitive for broken-but-heartbeating states (deaf mic
+            // etc.). Log the server's reason so the serial/UDP trail explains
+            // the [boot] line that follows. Brief delay to flush this log.
+            char reason[32] = "unspecified";
+            cJSON *j = evt->text ? cJSON_ParseWithLength(evt->text, evt->text_len) : NULL;
+            if (j) {
+                cJSON *jr = cJSON_GetObjectItem(j, "reason");
+                if (cJSON_IsString(jr) && jr->valuestring && jr->valuestring[0]) {
+                    strncpy(reason, jr->valuestring, sizeof(reason) - 1);
+                    reason[sizeof(reason) - 1] = '\0';
+                }
+                cJSON_Delete(j);
+            }
+            ESP_LOGW(TAG, "reboot (server, reason=%s)", reason);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+            break;
+        }
         default:
             break;
     }
@@ -1310,6 +1343,16 @@ static void mute_change_cb(bool muted)
 {
     g_dev_config.muted = muted;
     if (muted) {
+        // Ambient is a "real teardown" case (see s_ambient_stop's comment) —
+        // before 0.2.62 this callback skipped it, leaving the ambient task's
+        // HTTP stream alive and, worse, the server's ambient session marker
+        // intact, so the wake-mid-ambient resume logic would resurrect the
+        // "muted away" ambient after the next turn. Stop the worker AND tell
+        // the server so both halves of the session die together.
+        if (s_ambient_active) {
+            s_ambient_stop = true;
+            oe_ws_send_ambient_stopped("mute");
+        }
         audio_io_stop_playback();
         audio_io_flush_playback();
         // Cancel any in-flight server-pushed TTS stream (server halts on stop).
@@ -1350,6 +1393,9 @@ static void capture_and_drive_task(void *arg)
     s_vad = vad_create(&vcfg);
 
     bool in_utterance = false;
+    // Log-once guard for the capture-buffer saturation warning below —
+    // without it a saturated utterance would warn on every remaining frame.
+    bool capture_sat_logged = false;
 
     // Wait-one-frame slot arbitration. When two wake-word models cover
     // overlapping phrases ("hey korra" vs "hey computer") the first slot to
@@ -1565,6 +1611,7 @@ static void capture_and_drive_task(void *arg)
                 }
                 vad_reset(s_vad);
                 s_capture_used = 0;
+                capture_sat_logged = false;
                 in_utterance = true;
                 xEventGroupSetBits(g_dev_events, DEV_EVT_WAKE_DETECTED);
             }
@@ -1572,6 +1619,14 @@ static void capture_and_drive_task(void *arg)
             if (s_capture_used + n < CAPTURE_BUFFER_SAMPLES) {
                 memcpy(s_capture_buf + s_capture_used, frame, n * sizeof(int16_t));
                 s_capture_used += n;
+            } else if (!capture_sat_logged) {
+                // Saturated mid-utterance: STT will get a truncated question.
+                // Should be unreachable now that the buffer (16 s) exceeds
+                // the VAD ceiling (max_utterance_ms 15 s) — log loudly if it
+                // ever happens instead of silently cutting the user off.
+                ESP_LOGW(TAG, "capture buffer full at %u samples — utterance tail dropped",
+                         (unsigned)s_capture_used);
+                capture_sat_logged = true;
             }
             bool ended = false;
             vad_feed(s_vad, frame, n, &ended);
@@ -2082,11 +2137,16 @@ static void heartbeat_task(void *arg)
             const uint32_t cap_total = audio_io_get_capture_samples_total();
             const uint32_t cap_sps = (cap_total - prev_cap_samples) / 10u;
             prev_cap_samples = cap_total;
-            char hbline[128];
-            snprintf(hbline, sizeof(hbline), "[hb] alive tick=%lu rssi=%d heap_int=%luKB cap_sps=%lu",
+            char hbline[160];
+            // pcm_drop is the running total of playback samples lost to a
+            // full ring (audio_io_write_pcm). Nonzero = audible skip
+            // happened; steadily climbing = server pacing outrunning the
+            // ring. Cumulative on purpose — a rare drop stays visible.
+            snprintf(hbline, sizeof(hbline), "[hb] alive tick=%lu rssi=%d heap_int=%luKB cap_sps=%lu pcm_drop=%lu",
                      (unsigned long)n++, rssi_now,
                      (unsigned long)(esp_get_free_heap_size() / 1024),
-                     (unsigned long)cap_sps);
+                     (unsigned long)cap_sps,
+                     (unsigned long)audio_io_get_playback_drop_samples());
             ESP_LOGI(TAG, "%s", hbline);
             oe_udplog_send(hbline);
         }

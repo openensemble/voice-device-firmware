@@ -56,6 +56,12 @@ typedef enum {
     // Wi-Fi / re-pair — move a device to a different network with no computer
     // or physical button. (Wake-word models in SPIFFS are preserved.)
     OE_WS_EVT_ENTER_AP,
+    // Server requested a plain reboot: { type:'reboot', reason?:'mic_dead' }.
+    // Credentials, pairing, and wake-word models all survive — this is the
+    // recovery primitive the server-side health loop sends when telemetry
+    // says the device is broken-but-heartbeating (e.g. cap_sps=0). Raw JSON
+    // payload so main.c can log the server's reason before restarting.
+    OE_WS_EVT_REBOOT,
     // Alarm protocol — server → device. Raw JSON payload; main.c parses
     // id/label/trigger_at_ms/audio_marker/type and delegates to the alarm
     // component. See lib/alarms.mjs (server) for the message shapes.
@@ -118,6 +124,13 @@ bool      oe_ws_connected(void);
 
 esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob);
 esp_err_t oe_ws_send_stop(const char *agent_id);
+
+// Tell the server the device tore down ambient playback on its own (e.g.
+// the user hit the physical mute button). Without this the server keeps its
+// ambient session marker + ffmpeg stream alive and the wake-mid-ambient
+// logic resurrects the "stopped" ambient after the next turn. reason is a
+// short tag for the server log ("mute").
+esp_err_t oe_ws_send_ambient_stopped(const char *reason);
 
 // Acknowledge a server-pushed ww_upload. Server uses these to serialize
 // per-slot pushes (won't send slot N+1 until N is acked) and to gate the

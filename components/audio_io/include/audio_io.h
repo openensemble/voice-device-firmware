@@ -81,6 +81,11 @@ uint32_t audio_io_get_capture_rms_1s(void);
 // take deltas.
 uint32_t audio_io_get_capture_samples_total(void);
 
+// Monotonic count of playback samples dropped because the ring stayed full
+// past the write_pcm send timeout. The heartbeat prints it as pcm_drop= —
+// nonzero means server pacing outran the ring (see rb_send_playback).
+uint32_t audio_io_get_playback_drop_samples(void);
+
 // Playback ringbuffer telemetry. *used returns bytes currently queued
 // (decoder-produced PCM waiting for I²S to drain), *capacity returns the
 // ringbuffer's total size. Used by the ambient-stats heartbeat to

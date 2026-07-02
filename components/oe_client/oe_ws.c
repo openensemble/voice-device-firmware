@@ -90,6 +90,9 @@ static void handle_message(const char *data, size_t len)
         emit(OE_WS_EVT_OTA_CHECK, NULL, 0);
     } else if (strcmp(type, "enter_ap_mode") == 0) {
         emit(OE_WS_EVT_ENTER_AP, NULL, 0);
+    } else if (strcmp(type, "reboot") == 0) {
+        // Raw JSON; main.c logs the optional reason before esp_restart().
+        emit(OE_WS_EVT_REBOOT, data, len);
     } else if (strcmp(type, "alarm_arm") == 0) {
         // Raw JSON; main.c parses id/label/triggerAtMs/audioMarker/alarmType.
         emit(OE_WS_EVT_ALARM_ARM, data, len);
@@ -292,6 +295,17 @@ esp_err_t oe_ws_send_stop(const char *agent_id)
     cJSON_AddStringToObject(o, "type", "stop");
     // Omitted when empty — the server falls back to the user's coordinator.
     if (agent_id && agent_id[0]) cJSON_AddStringToObject(o, "agent", agent_id);
+    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    cJSON_Delete(o);
+    return err;
+}
+
+esp_err_t oe_ws_send_ambient_stopped(const char *reason)
+{
+    if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "ambient_stopped");
+    if (reason && reason[0]) cJSON_AddStringToObject(o, "reason", reason);
     esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
     cJSON_Delete(o);
     return err;
