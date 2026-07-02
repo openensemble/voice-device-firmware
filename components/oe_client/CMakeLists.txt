@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "oe_pair.c"
+        "oe_ws.c"
+        "oe_stt.c"
+        "oe_tts.c"
+        "oe_b64.c"
+        "oe_ota.c"
+        "oe_udplog.c"
+    INCLUDE_DIRS "include"
+    REQUIRES
+        esp_http_client
+        esp_websocket_client
+        esp_https_ota
+        app_update
+        esp-tls
+        nvs_creds
+        mp3_decode
+        json
+)

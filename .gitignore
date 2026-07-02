@@ -1,0 +1,28 @@
+# ESP-IDF build output
+build/
+build-*/
+sdkconfig.old
+dependencies.lock.old
+
+# IDF-managed components — resolved from main/idf_component.yml at
+# configure time; dependencies.lock pins the exact versions.
+managed_components/
+
+# Pre-git manual backups (obsolete now that history lives in git; kept
+# on disk locally, never committed)
+*.bak
+*.bak-*
+backups_pre_airplay/
+wakewords_backup/
+
+# Local build logs
+*.log
+
+# Personal dev work-logs — session notes with local paths, not docs
+CHANGES_AIRPLAY.md
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

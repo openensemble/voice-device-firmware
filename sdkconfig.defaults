@@ -1,0 +1,70 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# Max CPU clock — ESP32-S3 tops out at 240 MHz. TFLM + audio frontend +
+# WS + Wi-Fi all want as much CPU as possible. Default IDF is 160 MHz;
+# this matches the third-party reference (gillespinault/respeaker-xvf3800-vad).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# PSRAM: required for libhelix decode buffers + TFLM tensor arena
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+# Flash: 8 MB on XIAO ESP32-S3
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# Custom partition table (OTA dual-app + dedicated wake-word partition)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Main task stack — state machine + libhelix transient frames
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# FreeRTOS tuning
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+
+# Wi-Fi station + soft-AP coexistence (provisioning flow)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+
+# HTTPS / mbedTLS — needed for OE's WSS + STT/TTS over TLS
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+
+# WebSocket client
+CONFIG_WS_TRANSPORT=y
+
+# JSON
+CONFIG_JSON=y
+
+# microWakeWord / esp-tflite-micro
+CONFIG_TFLITE_MICRO_ENABLED=y
+
+# Log level: info at runtime, warn on networking spam
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# USB-Serial-JTAG only (no USB-OTG — XVF3800 is on I²S, not USB host)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# SPIFFS GC budget — each run reclaims one 4 KB block; default 10 only
+# clears ~40 KB. Wake-word tflite writes are ~62 KB so a pre-write GC
+# needs ~18 runs minimum; 32 leaves headroom for the sibling .json plus
+# fragmentation when slots are swapped repeatedly.
+CONFIG_SPIFFS_GC_MAX_RUNS=32
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+
+# Voice devices are mains-powered and must respond to mDNS/AirPlay TCP at any
+# time. The default IDF behavior puts the Wi-Fi radio into low-power mode
+# whenever the STA is disconnected, and the modem PS state is reset on every
+# reconnect — so transient Wi-Fi blips leave the device sluggish/unresponsive
+# until next reboot. We keep the radio always-on (PS_NONE) in code; pinning
+# this default off here is belt-and-suspenders so fresh checkouts don't drift.
+# CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE is not set
