@@ -34,9 +34,9 @@ void vad_reset(vad_state_t *vad)
     vad->any_speech_seen = false;
 }
 
-bool vad_feed(vad_state_t *vad, const int16_t *samples, size_t n_samples, bool *utterance_ended)
+bool vad_feed(vad_state_t *vad, const int16_t *samples, size_t n_samples, vad_end_reason_t *end_reason)
 {
-    *utterance_ended = false;
+    *end_reason = VAD_END_NONE;
     if (n_samples == 0) return false;
 
     uint64_t sum_sq = 0;
@@ -57,9 +57,13 @@ bool vad_feed(vad_state_t *vad, const int16_t *samples, size_t n_samples, bool *
     }
 
     if (vad->any_speech_seen && vad->silence_ms >= vad->cfg.silence_ms_to_end) {
-        *utterance_ended = true;
+        *end_reason = VAD_END_SILENCE;
+    } else if (!vad->any_speech_seen &&
+               vad->cfg.no_speech_ms_to_end > 0 &&
+               vad->total_ms >= vad->cfg.no_speech_ms_to_end) {
+        *end_reason = VAD_END_NO_SPEECH;
     } else if (vad->total_ms >= vad->cfg.max_utterance_ms) {
-        *utterance_ended = true;
+        *end_reason = vad->any_speech_seen ? VAD_END_MAX_UTTERANCE : VAD_END_NO_SPEECH;
     }
 
     // Per-second rolling max RMS so the tuner can see what their room

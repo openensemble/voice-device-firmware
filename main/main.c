@@ -1502,10 +1502,13 @@ static void capture_and_drive_task(void *arg)
     //   silence_ms_to_end = 500 — half second of below-threshold audio ends
     //     the utterance. Was 1000; faster cut-off feels markedly snappier
     //     and matches what Alexa/Google use.
+    //   no_speech_ms_to_end = 5000 — if the wake word fires and no command
+    //     speech follows, close LISTENING without posting empty audio to STT.
     //   max_utterance_ms unchanged at 15 s — hard ceiling.
     vad_config_t vcfg = {
         .energy_threshold = 800000,
         .silence_ms_to_end = 500,
+        .no_speech_ms_to_end = 5000,
         .max_utterance_ms = 15000,
         .sample_rate = 16000,
     };
@@ -1755,16 +1758,27 @@ static void capture_and_drive_task(void *arg)
                          (unsigned)s_capture_used);
                 capture_sat_logged = true;
             }
-            bool ended = false;
-            vad_feed(s_vad, frame, n, &ended);
-            if (ended) {
+            vad_end_reason_t end_reason = VAD_END_NONE;
+            vad_feed(s_vad, frame, n, &end_reason);
+            if (end_reason != VAD_END_NONE) {
                 in_utterance = false;
+                xEventGroupSetBits(g_dev_events, DEV_EVT_VAD_END);
+
+                if (end_reason == VAD_END_NO_SPEECH) {
+                    ESP_LOGI(TAG, "wake capture ended after %ums with no speech; skipping STT",
+                             (unsigned)vad_elapsed_ms(s_vad));
+                    oe_udplog_send("[voice] no speech after wake; skipping STT");
+                    s_capture_used = 0;
+                    set_ui_state(UI_STATE_IDLE);
+                    airplay_resume();
+                    continue;
+                }
+
                 set_ui_state(UI_STATE_THINKING);
                 // Close the wake-word feed until SPEAKING starts (or the
                 // reply path errors back to IDLE) — see s_awaiting_reply.
                 s_awaiting_reply = true;
                 set_awaiting_since_us(esp_timer_get_time());  // arm watchdog
-                xEventGroupSetBits(g_dev_events, DEV_EVT_VAD_END);
 
                 char transcript[512] = {0};
                 if (oe_stt_post(g_dev_config.server_url, g_dev_config.token,
