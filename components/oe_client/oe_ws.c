@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_websocket_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_app_desc.h"
 #include "cJSON.h"
@@ -144,6 +145,22 @@ static void send_auth(void)
     cJSON_Delete(o);
 }
 
+static void build_ws_url(char *out, size_t out_len, const char *server_url)
+{
+    const char *base = server_url;
+    const char *scheme = "";
+    if (strncasecmp(server_url, "https://", 8) == 0) {
+        scheme = "wss://";
+        base = server_url + 8;
+    } else if (strncasecmp(server_url, "http://", 7) == 0) {
+        scheme = "ws://";
+        base = server_url + 7;
+    }
+    size_t n = strnlen(base, OE_URL_BUF);
+    while (n > 0 && base[n - 1] == '/') n--;
+    snprintf(out, out_len, "%s%.*s/ws", scheme, (int)n, base);
+}
+
 static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_websocket_event_data_t *d = (esp_websocket_event_data_t *)event_data;
@@ -155,6 +172,7 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "ws disconnected");
+            s_msg_accum_len = 0;
             emit(OE_WS_EVT_DISCONNECTED, NULL, 0);
             break;
         case WEBSOCKET_EVENT_DATA:
@@ -201,13 +219,7 @@ esp_err_t oe_ws_start(const char *server_url, const char *token,
     // and produce a malformed ws_url (HTTP://.../ws), which esp_websocket
     // silently can't parse and the connection never opens.
     char ws_url[OE_URL_BUF + 8];
-    if (strncasecmp(server_url, "https://", 8) == 0) {
-        snprintf(ws_url, sizeof(ws_url), "wss://%s/ws", server_url + 8);
-    } else if (strncasecmp(server_url, "http://", 7) == 0) {
-        snprintf(ws_url, sizeof(ws_url), "ws://%s/ws", server_url + 7);
-    } else {
-        snprintf(ws_url, sizeof(ws_url), "%s/ws", server_url);
-    }
+    build_ws_url(ws_url, sizeof(ws_url), server_url);
     ESP_LOGI(TAG, "ws uri: %s", ws_url);
 
     // The two flags that matter for reconnect across an OE server restart:
@@ -242,7 +254,7 @@ esp_err_t oe_ws_start(const char *server_url, const char *token,
         .keep_alive_idle        = 10,
         .keep_alive_interval    = 5,
         .keep_alive_count       = 3,
-        .skip_cert_common_name_check = true,
+        .crt_bundle_attach      = esp_crt_bundle_attach,
     };
     s_ws = esp_websocket_client_init(&cfg);
     if (!s_ws) return ESP_FAIL;

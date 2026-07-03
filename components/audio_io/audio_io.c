@@ -21,6 +21,7 @@ static RingbufHandle_t s_playback_rb = NULL;
 
 static volatile bool s_playback_active = false;
 static volatile bool s_capture_active = false;
+static volatile bool s_flush_req = false;
 
 // Monotonic count of 16 kHz mono samples pushed into the capture ringbuffer.
 // The [hb] heartbeat in main.c prints the per-interval delta as cap_sps —
@@ -70,6 +71,14 @@ static int64_t  s_rms_window_start = 0;
 static int16_t  s_44k_prev_l = 0, s_44k_prev_r = 0;
 static uint32_t s_44k_phase  = 0;
 static uint32_t s_44k_last_rate_witness = 0;
+
+static void reset_44k_resampler(void)
+{
+    s_44k_prev_l = 0;
+    s_44k_prev_r = 0;
+    s_44k_phase = 0;
+    s_44k_last_rate_witness = 0;
+}
 
 // DMA sizing was tuned for 16 kHz. At 48 kHz a frame = 480 samples ≈ 10 ms
 // (still); 6 frames = 60 ms of buffering, plenty for interrupt latency.
@@ -207,6 +216,16 @@ uint32_t audio_io_get_playback_drop_samples(void) {
     return s_playback_drop_samples;
 }
 
+static void drain_playback_ringbuffer(void)
+{
+    if (!s_playback_rb) return;
+    size_t item_size = 0;
+    void *p = NULL;
+    while ((p = xRingbufferReceive(s_playback_rb, &item_size, 0)) != NULL) {
+        vRingbufferReturnItem(s_playback_rb, p);
+    }
+}
+
 static void playback_task(void *arg)
 {
     const size_t bus_chunk_samples = TX_DMA_SAMPLES * AUDIO_BUS_CHANNELS;
@@ -226,6 +245,10 @@ static void playback_task(void *arg)
     // 16 kHz TTS sources still play correctly. playback_task here just
     // scales each L/R sample and pushes it to I2S at 1:1 bus rate.
     while (1) {
+        if (s_flush_req) {
+            s_flush_req = false;
+            drain_playback_ringbuffer();
+        }
         if (!s_playback_active || !s_tx) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -272,7 +295,6 @@ static void playback_task(void *arg)
 
         size_t bw;
         i2s_channel_write(s_tx, bus_buf, out_idx * sizeof(int32_t), &bw, pdMS_TO_TICKS(100));
-        s_playback_active = true;
     }
 }
 
@@ -563,11 +585,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
 void audio_io_flush_playback(void)
 {
     if (!s_playback_rb) return;
-    size_t item_size;
-    void *p;
-    while ((p = xRingbufferReceive(s_playback_rb, &item_size, 0)) != NULL) {
-        vRingbufferReturnItem(s_playback_rb, p);
-    }
+    s_flush_req = true;
     // OE 2026-05-27: reset the 44.1→48 kHz fractional resampler state
     // so a fresh AirPlay stream (or post-pause resume) doesn't linear-
     // interpolate between a stale prev_l/prev_r and the new first
@@ -576,10 +594,7 @@ void audio_io_flush_playback(void)
     // source_rate changes; on pause-then-resume the source stays 44100
     // so without this reset the statics carry forward. The 16k/24k
     // branches use stack-local state and aren't affected.
-    s_44k_prev_l = 0;
-    s_44k_prev_r = 0;
-    s_44k_phase = 0;
-    s_44k_last_rate_witness = 0;
+    reset_44k_resampler();
 }
 
 bool audio_io_playback_active(void) { return s_playback_active; }

@@ -14,6 +14,7 @@ idf_component_register(
         esp_https_ota
         app_update
         esp-tls
+        mbedtls
         nvs_creds
         mp3_decode
         json

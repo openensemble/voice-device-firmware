@@ -3,10 +3,18 @@
 #include <string.h>
 #include <stdio.h>
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "cJSON.h"
 
 static const char *TAG = "oe_pair";
+
+static void build_api_url(char *out, size_t out_len, const char *server_url, const char *path)
+{
+    size_t n = strnlen(server_url, OE_URL_BUF);
+    while (n > 0 && server_url[n - 1] == '/') n--;
+    snprintf(out, out_len, "%.*s%s", (int)n, server_url, path);
+}
 
 typedef struct {
     char *buf;
@@ -31,7 +39,7 @@ esp_err_t oe_pair_redeem(const char *server_url, const char *pair_code,
                          const char *device_name, oe_pair_result_t *out)
 {
     char url[OE_URL_BUF + 32];
-    snprintf(url, sizeof(url), "%s/api/devices/redeem", server_url);
+    build_api_url(url, sizeof(url), server_url, "/api/devices/redeem");
 
     cJSON *body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "code", pair_code);
@@ -48,8 +56,7 @@ esp_err_t oe_pair_redeem(const char *server_url, const char *pair_code,
         .event_handler = http_evt,
         .user_data = &rb,
         .timeout_ms = 10000,
-        .crt_bundle_attach = NULL,
-        .skip_cert_common_name_check = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     esp_http_client_set_header(c, "Content-Type", "application/json");

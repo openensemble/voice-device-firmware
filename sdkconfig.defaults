@@ -51,6 +51,11 @@ CONFIG_TFLITE_MICRO_ENABLED=y
 # Log level: info at runtime, warn on networking spam
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
+# Verify HTTPS/WSS servers against the built-in Mozilla CA bundle.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_OE_DEFAULT_HEADPHONE_MODE=y
+
 # USB-Serial-JTAG only (no USB-OTG — XVF3800 is on I²S, not USB host)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
@@ -59,7 +64,8 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # needs ~18 runs minimum; 32 leaves headroom for the sibling .json plus
 # fragmentation when slots are swapped repeatedly.
 CONFIG_SPIFFS_GC_MAX_RUNS=32
-CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP is not set
 
 # Voice devices are mains-powered and must respond to mDNS/AirPlay TCP at any
 # time. The default IDF behavior puts the Wi-Fi radio into low-power mode

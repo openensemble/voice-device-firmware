@@ -25,6 +25,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "oe_client.h"
 #include "audio_io.h"
 #include "mp3_decode.h"
@@ -70,14 +71,26 @@ typedef struct {
     esp_timer_handle_t timer;
     alarm_state_t state;
     int64_t fired_at_us;      // esp_timer_get_time when fire began
+    uint8_t ring_refs;        // ring_task snapshots holding audio_mp3 alive
+    bool delete_pending;      // remove once ring_refs drains to zero
 } alarm_entry_t;
 
 static alarm_entry_t s_alarms[ALARM_MAX];
 static SemaphoreHandle_t s_mutex;
 static SemaphoreHandle_t s_ring_signal;
+static QueueHandle_t s_event_q;
 
 static alarm_speaking_cb_t s_speaking_cb = NULL;
 static alarm_amp_cb_t      s_amp_cb      = NULL;
+
+typedef enum {
+    ALARM_EVT_FIRED = 1,
+} alarm_event_type_t;
+
+typedef struct {
+    alarm_event_type_t type;
+    char id[40];
+} alarm_event_t;
 
 // Pre-built chime PCM. Either the procedural two-tone (B5→E6) built at
 // init, or PCM decoded from a user-uploaded MP3 at /storage/chime.mp3.
@@ -87,6 +100,29 @@ static int16_t *s_chime_pcm = NULL;
 static size_t   s_chime_pcm_total = 0;  // interleaved sample count (frames*2)
 static uint32_t s_chime_rate = 16000;
 static bool     s_chime_is_custom = false;
+// The chime buffer the ring task is currently reading inside play_chime()
+// (NULL when not playing), plus a swapped-out buffer whose free was deferred
+// because it was in use. audio_io_write_pcm() reads s_chime_pcm for the whole
+// (potentially blocking) push, so a concurrent chime swap must not free it out
+// from under the ring task — free_chime_buf_locked() hands the old buffer here
+// instead, and play_chime() frees it once the write returns. Guarded by s_mutex.
+static int16_t *s_chime_playing = NULL;
+static int16_t *s_chime_free_pending = NULL;
+
+// Free a chime PCM buffer, or defer the free if the ring task is mid-play on
+// it (play_chime marks it via s_chime_playing). Caller MUST hold s_mutex.
+static void free_chime_buf_locked(int16_t *buf)
+{
+    if (!buf) return;
+    if (buf == s_chime_playing) {
+        if (s_chime_free_pending && s_chime_free_pending != buf) {
+            heap_caps_free(s_chime_free_pending);
+        }
+        s_chime_free_pending = buf;
+    } else {
+        heap_caps_free(buf);
+    }
+}
 
 void alarm_set_speaking_callback(alarm_speaking_cb_t cb) { s_speaking_cb = cb; }
 void alarm_set_amp_callback(alarm_amp_cb_t cb)           { s_amp_cb = cb; }
@@ -106,7 +142,8 @@ static bool wallclock_ready(void)
 static alarm_entry_t *find_by_id_locked(const char *id)
 {
     for (int i = 0; i < ALARM_MAX; ++i) {
-        if (s_alarms[i].used && strcmp(s_alarms[i].id, id) == 0) return &s_alarms[i];
+        if (s_alarms[i].used && !s_alarms[i].delete_pending &&
+            strcmp(s_alarms[i].id, id) == 0) return &s_alarms[i];
     }
     return NULL;
 }
@@ -127,6 +164,11 @@ static void free_entry_locked(alarm_entry_t *e)
         esp_timer_delete(e->timer);
         e->timer = NULL;
     }
+    if (e->ring_refs > 0) {
+        e->delete_pending = true;
+        e->state = ALARM_STATE_ARMED;
+        return;
+    }
     if (e->audio_mp3) {
         heap_caps_free(e->audio_mp3);
         e->audio_mp3 = NULL;
@@ -141,19 +183,36 @@ static void free_entry_locked(alarm_entry_t *e)
 // Audio buffer is intentionally NOT persisted — RAM-only by design.
 static esp_err_t nvs_save(void)
 {
+    typedef struct {
+        char id[40];
+        char label[64];
+        char type[16];
+        int64_t trigger_at_ms;
+    } alarm_persist_t;
+
+    alarm_persist_t snap[ALARM_MAX] = {0};
+    uint8_t count = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < ALARM_MAX; ++i) {
+        if (!s_alarms[i].used || s_alarms[i].delete_pending) continue;
+        strncpy(snap[count].id, s_alarms[i].id, sizeof(snap[count].id) - 1);
+        strncpy(snap[count].label, s_alarms[i].label, sizeof(snap[count].label) - 1);
+        strncpy(snap[count].type, s_alarms[i].type, sizeof(snap[count].type) - 1);
+        snap[count].trigger_at_ms = s_alarms[i].trigger_at_ms;
+        count++;
+    }
+    xSemaphoreGive(s_mutex);
+
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
 
     size_t cap = 1;
-    uint8_t count = 0;
-    for (int i = 0; i < ALARM_MAX; ++i) {
-        if (!s_alarms[i].used) continue;
-        cap += 1 + strlen(s_alarms[i].id);
-        cap += 2 + strlen(s_alarms[i].label);
-        cap += 1 + strlen(s_alarms[i].type);
+    for (int i = 0; i < count; ++i) {
+        cap += 1 + strlen(snap[i].id);
+        cap += 2 + strlen(snap[i].label);
+        cap += 1 + strlen(snap[i].type);
         cap += 8;
-        count++;
     }
     if (count == 0) {
         // No alarms — remove the blob entirely
@@ -166,15 +225,14 @@ static esp_err_t nvs_save(void)
     if (!buf) { nvs_close(h); return ESP_ERR_NO_MEM; }
     uint8_t *p = buf;
     *p++ = count;
-    for (int i = 0; i < ALARM_MAX; ++i) {
-        if (!s_alarms[i].used) continue;
-        size_t idl = strlen(s_alarms[i].id);
-        size_t lbl = strlen(s_alarms[i].label);
-        size_t tpl = strlen(s_alarms[i].type);
-        *p++ = (uint8_t)idl; memcpy(p, s_alarms[i].id, idl); p += idl;
-        *p++ = (uint8_t)(lbl & 0xff); *p++ = (uint8_t)(lbl >> 8); memcpy(p, s_alarms[i].label, lbl); p += lbl;
-        *p++ = (uint8_t)tpl; memcpy(p, s_alarms[i].type, tpl); p += tpl;
-        memcpy(p, &s_alarms[i].trigger_at_ms, 8); p += 8;
+    for (int i = 0; i < count; ++i) {
+        size_t idl = strlen(snap[i].id);
+        size_t lbl = strlen(snap[i].label);
+        size_t tpl = strlen(snap[i].type);
+        *p++ = (uint8_t)idl; memcpy(p, snap[i].id, idl); p += idl;
+        *p++ = (uint8_t)(lbl & 0xff); *p++ = (uint8_t)(lbl >> 8); memcpy(p, snap[i].label, lbl); p += lbl;
+        *p++ = (uint8_t)tpl; memcpy(p, snap[i].type, tpl); p += tpl;
+        memcpy(p, &snap[i].trigger_at_ms, 8); p += 8;
     }
     e = nvs_set_blob(h, NVS_KEY, buf, p - buf);
     if (e == ESP_OK) e = nvs_commit(h);
@@ -240,15 +298,31 @@ static void timer_cb(void *arg)
 {
     alarm_entry_t *e = (alarm_entry_t *)arg;
     if (!e) return;
+    bool should_ring = false;
+    alarm_event_t ev = { .type = ALARM_EVT_FIRED };
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (e->used) {
+    if (e->used && !e->delete_pending) {
         e->state = ALARM_STATE_FIRING;
         e->fired_at_us = esp_timer_get_time();
         ESP_LOGI(TAG, "alarm fired: id=%s label=%s", e->id, e->label);
-        oe_ws_send_alarm_fired(e->id);
-        xSemaphoreGive(s_ring_signal);
+        strncpy(ev.id, e->id, sizeof(ev.id) - 1);
+        should_ring = true;
     }
     xSemaphoreGive(s_mutex);
+    if (should_ring) {
+        if (s_event_q) xQueueSend(s_event_q, &ev, 0);
+        xSemaphoreGive(s_ring_signal);
+    }
+}
+
+static void alarm_event_task(void *arg)
+{
+    (void)arg;
+    alarm_event_t ev;
+    while (1) {
+        if (xQueueReceive(s_event_q, &ev, portMAX_DELAY) != pdTRUE) continue;
+        if (ev.type == ALARM_EVT_FIRED) oe_ws_send_alarm_fired(ev.id);
+    }
 }
 
 // Caller holds s_mutex.
@@ -389,14 +463,16 @@ static esp_err_t try_load_custom_chime(void)
     heap_caps_free(mp3);
     if (e != ESP_OK) return e;
 
-    // Replace any existing chime (procedural or previous custom).
-    if (s_chime_pcm) {
-        heap_caps_free(s_chime_pcm);
-    }
+    // Replace any existing chime (procedural or previous custom). Swap under
+    // the mutex; free_chime_buf_locked defers the free if the ring task is
+    // mid-play on the old buffer.
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    free_chime_buf_locked(s_chime_pcm);
     s_chime_pcm = pcm;
     s_chime_pcm_total = samples;
     s_chime_rate = rate;
     s_chime_is_custom = true;
+    xSemaphoreGive(s_mutex);
     ESP_LOGI(TAG, "custom chime loaded: %u samples @ %u Hz from %s",
              (unsigned)samples, (unsigned)rate, CUSTOM_CHIME_PATH);
     return ESP_OK;
@@ -452,8 +528,26 @@ static void build_chime_pcm(void)
 
 static void play_chime(void)
 {
-    if (!s_chime_pcm) return;
-    audio_io_write_pcm(s_chime_pcm, s_chime_pcm_total, s_chime_rate);
+    // Snapshot + mark the buffer in-use under the lock so a concurrent chime
+    // swap defers its free (free_chime_buf_locked) instead of pulling it out
+    // from under the blocking write below. Release any deferred buffer once
+    // the write returns and we're no longer reading it.
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int16_t *chime = s_chime_pcm;
+    size_t   total = s_chime_pcm_total;
+    uint32_t rate  = s_chime_rate;
+    s_chime_playing = chime;
+    xSemaphoreGive(s_mutex);
+
+    if (chime) audio_io_write_pcm(chime, total, rate);
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_chime_playing = NULL;
+    if (s_chime_free_pending) {
+        heap_caps_free(s_chime_free_pending);
+        s_chime_free_pending = NULL;
+    }
+    xSemaphoreGive(s_mutex);
 }
 
 // Streaming MP3→PCM relay: each decoded chunk is fed directly to audio_io,
@@ -504,12 +598,15 @@ static void ring_task(void *arg)
             // the actual playback happens outside the mutex (decode + I2S
             // writes take ~3-5 s per alarm and we don't want to block
             // alarm_arm / alarm_disarm / alarm_stop for that long).
-            struct { uint8_t *mp3; size_t len; bool used; } snap[ALARM_MAX] = {0};
+            struct { alarm_entry_t *entry; uint8_t *mp3; size_t len; bool used; } snap[ALARM_MAX] = {0};
             int firing_count = 0;
             int64_t earliest_us = INT64_MAX;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             for (int i = 0; i < ALARM_MAX; ++i) {
-                if (!s_alarms[i].used || s_alarms[i].state != ALARM_STATE_FIRING) continue;
+                if (!s_alarms[i].used || s_alarms[i].delete_pending ||
+                    s_alarms[i].state != ALARM_STATE_FIRING) continue;
+                s_alarms[i].ring_refs++;
+                snap[i].entry = &s_alarms[i];
                 snap[i].mp3  = s_alarms[i].audio_mp3;
                 snap[i].len  = s_alarms[i].audio_mp3_len;
                 snap[i].used = true;
@@ -523,6 +620,15 @@ static void ring_task(void *arg)
             int64_t age_us = esp_timer_get_time() - earliest_us;
             if (age_us > (int64_t)HARD_STOP_MS * 1000) {
                 ESP_LOGW(TAG, "alarm hard-stop cap reached, stopping ring");
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                for (int i = 0; i < ALARM_MAX; ++i) {
+                    if (!snap[i].entry) continue;
+                    if (snap[i].entry->ring_refs > 0) snap[i].entry->ring_refs--;
+                    if (snap[i].entry->ring_refs == 0 && snap[i].entry->delete_pending) {
+                        free_entry_locked(snap[i].entry);
+                    }
+                }
+                xSemaphoreGive(s_mutex);
                 alarm_stop(NULL);
                 break;
             }
@@ -539,6 +645,16 @@ static void ring_task(void *arg)
                     play_mp3_buf(snap[i].mp3, snap[i].len);
                 }
             }
+
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            for (int i = 0; i < ALARM_MAX; ++i) {
+                if (!snap[i].entry) continue;
+                if (snap[i].entry->ring_refs > 0) snap[i].entry->ring_refs--;
+                if (snap[i].entry->ring_refs == 0 && snap[i].entry->delete_pending) {
+                    free_entry_locked(snap[i].entry);
+                }
+            }
+            xSemaphoreGive(s_mutex);
 
             // play_chime + play_mp3_buf queue PCM into the audio_io ring-
             // buffer and return immediately; DMA drains it in parallel with
@@ -566,7 +682,8 @@ static void deferred_schedule_task(void *arg)
     ESP_LOGI(TAG, "wall-clock acquired; scheduling persisted alarms");
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < ALARM_MAX; ++i) {
-        if (s_alarms[i].used && s_alarms[i].state == ALARM_STATE_ARMED && !s_alarms[i].timer) {
+        if (s_alarms[i].used && !s_alarms[i].delete_pending &&
+            s_alarms[i].state == ALARM_STATE_ARMED && !s_alarms[i].timer) {
             schedule_locked(&s_alarms[i]);
         }
     }
@@ -578,7 +695,8 @@ esp_err_t alarm_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
     s_ring_signal = xSemaphoreCreateBinary();
-    if (!s_mutex || !s_ring_signal) return ESP_ERR_NO_MEM;
+    s_event_q = xQueueCreate(8, sizeof(alarm_event_t));
+    if (!s_mutex || !s_ring_signal || !s_event_q) return ESP_ERR_NO_MEM;
 
     build_chime_pcm();
     // If a user-uploaded chime is on disk, decode + install it (replaces the
@@ -588,6 +706,7 @@ esp_err_t alarm_init(void)
     nvs_load();
 
     xTaskCreate(ring_task, "alarm_ring", 4096, NULL, 5, NULL);
+    xTaskCreate(alarm_event_task, "alarm_evt", 4096, NULL, 4, NULL);
     xTaskCreate(deferred_schedule_task, "alarm_sched", 3072, NULL, 4, NULL);
 
     int armed = 0;
@@ -644,15 +763,20 @@ esp_err_t alarm_arm(const char *id, const char *label,
 esp_err_t alarm_disarm(const char *id)
 {
     if (!id) return ESP_ERR_INVALID_ARG;
+    char ack_id[40] = {0};
+    bool was_firing = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     alarm_entry_t *e = find_by_id_locked(id);
     if (!e) {
         xSemaphoreGive(s_mutex);
         return ESP_ERR_NOT_FOUND;
     }
+    was_firing = e->state == ALARM_STATE_FIRING;
+    strncpy(ack_id, e->id, sizeof(ack_id) - 1);
     free_entry_locked(e);
     xSemaphoreGive(s_mutex);
     nvs_save();
+    if (was_firing) oe_ws_send_alarm_acked(ack_id);
     ESP_LOGI(TAG, "alarm disarmed: id=%s", id);
     return ESP_OK;
 }
@@ -660,17 +784,22 @@ esp_err_t alarm_disarm(const char *id)
 void alarm_stop(const char *id)
 {
     bool changed = false;
+    char ack_ids[ALARM_MAX][40] = {0};
+    int ack_count = 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < ALARM_MAX; ++i) {
         if (!s_alarms[i].used) continue;
+        if (s_alarms[i].delete_pending) continue;
         if (s_alarms[i].state != ALARM_STATE_FIRING) continue;
         if (id && strcmp(s_alarms[i].id, id) != 0) continue;
         ESP_LOGI(TAG, "alarm_stop: id=%s", s_alarms[i].id);
+        strncpy(ack_ids[ack_count++], s_alarms[i].id, sizeof(ack_ids[0]) - 1);
         free_entry_locked(&s_alarms[i]);
         changed = true;
     }
     xSemaphoreGive(s_mutex);
     if (changed) nvs_save();
+    for (int i = 0; i < ack_count; ++i) oe_ws_send_alarm_acked(ack_ids[i]);
 }
 
 bool alarm_is_firing(void)
@@ -678,25 +807,52 @@ bool alarm_is_firing(void)
     bool firing = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < ALARM_MAX; ++i) {
-        if (s_alarms[i].used && s_alarms[i].state == ALARM_STATE_FIRING) { firing = true; break; }
+        if (s_alarms[i].used && !s_alarms[i].delete_pending &&
+            s_alarms[i].state == ALARM_STATE_FIRING) { firing = true; break; }
     }
     xSemaphoreGive(s_mutex);
     return firing;
 }
 
+// Re-report every currently-ringing alarm to the server. alarm_fired is
+// fire-and-forget (sent once from the timer path), so if the WS was down at
+// the fire instant the server never learned the alarm rang and later
+// false-alerts "didn't fire". main.c calls this on WS (re)connect; it's
+// idempotent server-side (markAlarmFired). We snapshot under the lock and
+// enqueue onto s_event_q — the WS send happens in alarm_event_task, never
+// under the mutex (same rule as the fire path).
+void alarm_resend_fired(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < ALARM_MAX; ++i) {
+        if (s_alarms[i].used && !s_alarms[i].delete_pending &&
+            s_alarms[i].state == ALARM_STATE_FIRING) {
+            alarm_event_t ev = { .type = ALARM_EVT_FIRED };
+            strncpy(ev.id, s_alarms[i].id, sizeof(ev.id) - 1);
+            ev.id[sizeof(ev.id) - 1] = '\0';
+            if (s_event_q) xQueueSend(s_event_q, &ev, 0);
+        }
+    }
+    xSemaphoreGive(s_mutex);
+}
+
 bool alarm_handle_local_dismiss(void)
 {
     bool any = false;
+    char ack_ids[ALARM_MAX][40] = {0};
+    int ack_count = 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < ALARM_MAX; ++i) {
-        if (!s_alarms[i].used || s_alarms[i].state != ALARM_STATE_FIRING) continue;
+        if (!s_alarms[i].used || s_alarms[i].delete_pending ||
+            s_alarms[i].state != ALARM_STATE_FIRING) continue;
         any = true;
         ESP_LOGI(TAG, "alarm local dismiss: id=%s", s_alarms[i].id);
-        oe_ws_send_alarm_acked(s_alarms[i].id);
+        strncpy(ack_ids[ack_count++], s_alarms[i].id, sizeof(ack_ids[0]) - 1);
         free_entry_locked(&s_alarms[i]);
     }
     xSemaphoreGive(s_mutex);
     if (any) nvs_save();
+    for (int i = 0; i < ack_count; ++i) oe_ws_send_alarm_acked(ack_ids[i]);
     return any;
 }
 
@@ -719,11 +875,9 @@ esp_err_t alarm_set_custom_chime(uint8_t *mp3, size_t mp3_len)
     if (!mp3 || !mp3_len) {
         unlink(CUSTOM_CHIME_PATH);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        if (s_chime_pcm) {
-            heap_caps_free(s_chime_pcm);
-            s_chime_pcm = NULL;
-            s_chime_pcm_total = 0;
-        }
+        free_chime_buf_locked(s_chime_pcm);
+        s_chime_pcm = NULL;
+        s_chime_pcm_total = 0;
         build_chime_pcm();
         xSemaphoreGive(s_mutex);
         ESP_LOGI(TAG, "custom chime cleared; reverted to procedural");
@@ -762,10 +916,11 @@ esp_err_t alarm_set_custom_chime(uint8_t *mp3, size_t mp3_len)
     unlink(CUSTOM_CHIME_PATH);
     rename(tmp_path, CUSTOM_CHIME_PATH);
 
-    // Swap into live state under the mutex so a concurrent ring cycle can't
-    // read the buffer mid-free.
+    // Swap into live state under the mutex. free_chime_buf_locked defers the
+    // old buffer's free if the ring task is mid-play on it, so a chime upload
+    // during an active ring can't pull PCM out from under play_chime().
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_chime_pcm) heap_caps_free(s_chime_pcm);
+    free_chime_buf_locked(s_chime_pcm);
     s_chime_pcm = pcm;
     s_chime_pcm_total = samples;
     s_chime_rate = rate;

@@ -328,6 +328,18 @@ esp_err_t wakeword_load_slot(wakeword_t *ww, uint8_t slot) {
     }
 
     ww->model->log_model_config();
+    int8_t zero_features[PREPROCESSOR_FEATURE_SIZE] = {0};
+    if (!ww->model->perform_streaming_inference(zero_features)) {
+        ESP_LOGE(TAG, "slot %u model validation failed", slot);
+        ww->model->unload_model();
+        ww->model.reset();
+        heap_caps_free(ww->model_buf);
+        ww->model_buf = nullptr;
+        ww->model_len = 0;
+        xSemaphoreGive(ww->model_mutex);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ww->model->reset_probabilities();
     ww->active_slot = slot;
     ESP_LOGI(TAG, "slot %u loaded (%u bytes)", slot, (unsigned) ww->model_len);
     xSemaphoreGive(ww->model_mutex);

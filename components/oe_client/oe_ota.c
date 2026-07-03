@@ -32,12 +32,15 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "cJSON.h"
+#include "esp_partition.h"
+#include "mbedtls/sha256.h"
 
 static const char *TAG = "oe_ota";
 
@@ -91,8 +94,7 @@ static char *fetch_manifest(const char *server_url)
     esp_http_client_config_t cfg = {
         .url = url,
         .timeout_ms = 8000,
-        .skip_cert_common_name_check = true,
-        .crt_bundle_attach = NULL,  // self-signed OE installs use http; lan
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) return NULL;
@@ -137,7 +139,8 @@ static char *fetch_manifest(const char *server_url)
 // Pull the "version" string and the firmware app's "file" field out of the
 // manifest. Returns true on success; *out_version and *out_file are
 // strdup'd, caller frees both.
-static bool parse_manifest(const char *body, char **out_version, char **out_file)
+static bool parse_manifest(const char *body, char **out_version, char **out_file,
+                           char **out_sha256)
 {
     cJSON *j = cJSON_Parse(body);
     if (!j) return false;
@@ -146,6 +149,7 @@ static bool parse_manifest(const char *body, char **out_version, char **out_file
     const cJSON *jparts = cJSON_GetObjectItem(j, "parts");
     if (!cJSON_IsString(jver) || !cJSON_IsArray(jparts)) goto out;
     char *appfile = NULL;
+    char *appsha = NULL;
     cJSON *p = NULL;
     cJSON_ArrayForEach(p, jparts) {
         const cJSON *jname = cJSON_GetObjectItem(p, "name");
@@ -153,16 +157,62 @@ static bool parse_manifest(const char *body, char **out_version, char **out_file
         if (cJSON_IsString(jname) && cJSON_IsString(jfile) &&
             strcmp(jname->valuestring, "app") == 0) {
             appfile = strdup(jfile->valuestring);
+            const cJSON *jsha = cJSON_GetObjectItem(p, "sha256");
+            if (cJSON_IsString(jsha)) appsha = strdup(jsha->valuestring);
             break;
         }
     }
     if (!appfile) goto out;
     *out_version = strdup(jver->valuestring);
     *out_file = appfile;
+    *out_sha256 = appsha;   // may be NULL (older manifest w/o hashes → skip verify)
     ok = true;
 out:
     cJSON_Delete(j);
     return ok;
+}
+
+// Compute SHA-256 over the first `len` bytes of `part` and compare to the
+// 64-char hex `expected_hex`. Returns true on match. If `expected_hex` is
+// NULL or not 64 hex chars, returns true — an older manifest without a hash
+// keeps the prior (unverified) behavior. A definitive mismatch or a read
+// failure returns false so the caller aborts the OTA: we never bless a boot
+// image whose bytes we couldn't confirm.
+static bool ota_partition_sha256_ok(const esp_partition_t *part, size_t len,
+                                    const char *expected_hex)
+{
+    if (!expected_hex || strlen(expected_hex) != 64) return true;  // no hash → skip
+    uint8_t want[32];
+    for (int i = 0; i < 32; ++i) {
+        char c1 = expected_hex[i * 2], c2 = expected_hex[i * 2 + 1];
+        int hi = (c1 >= '0' && c1 <= '9') ? c1 - '0' :
+                 (c1 >= 'a' && c1 <= 'f') ? c1 - 'a' + 10 :
+                 (c1 >= 'A' && c1 <= 'F') ? c1 - 'A' + 10 : -1;
+        int lo = (c2 >= '0' && c2 <= '9') ? c2 - '0' :
+                 (c2 >= 'a' && c2 <= 'f') ? c2 - 'a' + 10 :
+                 (c2 >= 'A' && c2 <= 'F') ? c2 - 'A' + 10 : -1;
+        if (hi < 0 || lo < 0) return false;   // non-hex → treat as mismatch
+        want[i] = (uint8_t)((hi << 4) | lo);
+    }
+    uint8_t *buf = malloc(4096);
+    if (!buf) return false;
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);   // 0 = SHA-256 (not SHA-224)
+    bool ok = true;
+    for (size_t off = 0; off < len; ) {
+        size_t chunk = len - off;
+        if (chunk > 4096) chunk = 4096;
+        if (esp_partition_read(part, off, buf, chunk) != ESP_OK) { ok = false; break; }
+        mbedtls_sha256_update(&ctx, buf, chunk);
+        off += chunk;
+    }
+    uint8_t got[32];
+    if (ok) mbedtls_sha256_finish(&ctx, got);
+    mbedtls_sha256_free(&ctx);
+    free(buf);
+    if (!ok) return false;
+    return memcmp(got, want, sizeof(want)) == 0;
 }
 
 static void ota_task(void *arg)
@@ -170,6 +220,7 @@ static void ota_task(void *arg)
     char *manifest_body = NULL;
     char *target_version = NULL;
     char *app_file = NULL;
+    char *app_sha256 = NULL;
     const esp_app_desc_t *running = esp_app_get_description();
     const char *running_ver = running && running->version[0] ? running->version : "0.0.0";
 
@@ -180,7 +231,7 @@ static void ota_task(void *arg)
         oe_ws_send_ota_progress("error", 0, 0, NULL, "manifest_fetch_failed");
         goto done;
     }
-    if (!parse_manifest(manifest_body, &target_version, &app_file)) {
+    if (!parse_manifest(manifest_body, &target_version, &app_file, &app_sha256)) {
         oe_ws_send_ota_progress("error", 0, 0, NULL, "manifest_parse_failed");
         goto done;
     }
@@ -197,8 +248,8 @@ static void ota_task(void *arg)
     esp_http_client_config_t http_cfg = {
         .url = bin_url,
         .timeout_ms = 30000,
-        .skip_cert_common_name_check = true,
         .keep_alive_enable = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_https_ota_config_t ota_cfg = {
         .http_config = &http_cfg,
@@ -240,6 +291,22 @@ static void ota_task(void *arg)
         esp_https_ota_abort(handle);
         goto done;
     }
+
+    // Verify the written image against the manifest SHA-256 BEFORE finish()
+    // switches the boot partition. Mismatch → abort, boot partition untouched
+    // (fail-safe). Skipped only if the manifest carries no hash (back-compat).
+    {
+        const esp_partition_t *upd = esp_ota_get_next_update_partition(NULL);
+        size_t img_len = (size_t) esp_https_ota_get_image_len_read(handle);
+        if (!upd || !ota_partition_sha256_ok(upd, img_len, app_sha256)) {
+            ESP_LOGE(TAG, "OTA image sha256 verification failed — aborting");
+            oe_ws_send_ota_progress("error", 0, 0, target_version, "sha256_mismatch");
+            esp_https_ota_abort(handle);
+            goto done;
+        }
+        if (app_sha256) ESP_LOGI(TAG, "OTA image sha256 verified");
+    }
+
     oe_ws_send_ota_progress("applying", (uint32_t)(total > 0 ? total : 0),
                             (uint32_t)(total > 0 ? total : 0), target_version, NULL);
     e = esp_https_ota_finish(handle);
@@ -259,6 +326,7 @@ done:
     free(manifest_body);
     free(target_version);
     free(app_file);
+    free(app_sha256);
     s_in_flight = false;
     vTaskDelete(NULL);
 }

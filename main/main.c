@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -265,6 +266,8 @@ static uint8_t     s_default_cutoff[WW_NUM_SLOTS] = {0};
 static volatile bool s_stream_active  = false;   // between tts_audio_begin and finalize
 static volatile bool s_stream_end_req = false;   // tts_audio_end received; finalize task drains
 static uint8_t       s_pcm_frame[4096];          // base64 decode scratch (WS callback is single-threaded)
+static volatile bool s_ws_connected = false;
+static volatile bool s_ota_marked_valid = false;
 
 // THINKING-state gate. Set when VAD ends and we ship the utterance to STT/LLM;
 // cleared the instant the TTS worker enters SPEAKING (so barge-in during TTS
@@ -279,6 +282,7 @@ static volatile bool s_awaiting_reply = false;
 // arrives (WS dropped mid-turn / server hang) instead of staying deaf to every
 // wake until reboot. 0 = not armed.
 static volatile int64_t s_awaiting_since_us = 0;
+static portMUX_TYPE s_time_mux = portMUX_INITIALIZER_UNLOCKED;
 // Watchdog ceiling. Generous so a slow-but-valid delegated LLM reply (observed
 // up to ~50s) is never cut off; the OE_WS_EVT_DISCONNECTED handler clears the
 // gate instantly in the common dead-socket case, so this only backstops a live
@@ -340,6 +344,37 @@ typedef struct {
 
 static char s_token_accum[2048];
 static size_t s_token_accum_len = 0;
+static SemaphoreHandle_t s_token_mutex = NULL;
+
+static int64_t get_awaiting_since_us(void)
+{
+    portENTER_CRITICAL(&s_time_mux);
+    int64_t v = s_awaiting_since_us;
+    portEXIT_CRITICAL(&s_time_mux);
+    return v;
+}
+
+static void set_awaiting_since_us(int64_t v)
+{
+    portENTER_CRITICAL(&s_time_mux);
+    s_awaiting_since_us = v;
+    portEXIT_CRITICAL(&s_time_mux);
+}
+
+static int64_t get_followup_until_us(void)
+{
+    portENTER_CRITICAL(&s_time_mux);
+    int64_t v = s_followup_until_us;
+    portEXIT_CRITICAL(&s_time_mux);
+    return v;
+}
+
+static void set_followup_until_us(int64_t v)
+{
+    portENTER_CRITICAL(&s_time_mux);
+    s_followup_until_us = v;
+    portEXIT_CRITICAL(&s_time_mux);
+}
 
 static void set_ui_state(ui_state_t s) { leds_buttons_set_state(s); }
 
@@ -464,20 +499,63 @@ static void portal_submit_cb(const captive_form_result_t *r, void *user)
     }
 }
 
-static void flush_token_to_sentence_queue(void)
+static void token_lock(void)
+{
+    if (s_token_mutex) xSemaphoreTake(s_token_mutex, portMAX_DELAY);
+}
+
+static void token_unlock(void)
+{
+    if (s_token_mutex) xSemaphoreGive(s_token_mutex);
+}
+
+static void flush_token_to_sentence_queue_locked(void)
 {
     if (s_token_accum_len == 0) return;
+    if (!s_sentence_q) {
+        s_token_accum_len = 0;
+        s_token_accum[0] = 0;
+        return;
+    }
     sentence_t s;
     size_t take = s_token_accum_len < SENTENCE_MAX - 1 ? s_token_accum_len : SENTENCE_MAX - 1;
     memcpy(s.text, s_token_accum, take);
     s.text[take] = 0;
     xQueueSend(s_sentence_q, &s, pdMS_TO_TICKS(100));
     s_token_accum_len = 0;
+    s_token_accum[0] = 0;
+}
+
+static void flush_token_to_sentence_queue(void)
+{
+    token_lock();
+    flush_token_to_sentence_queue_locked();
+    token_unlock();
+}
+
+static void reset_token_accum(void)
+{
+    token_lock();
+    s_token_accum_len = 0;
+    s_token_accum[0] = 0;
+    token_unlock();
+}
+
+static bool token_accum_empty(void)
+{
+    token_lock();
+    bool empty = s_token_accum_len == 0;
+    token_unlock();
+    return empty;
 }
 
 static void accumulate_token(const char *tok, size_t len)
 {
-    if (s_token_accum_len + len + 1 > sizeof(s_token_accum)) flush_token_to_sentence_queue();
+    if (!tok || len == 0) return;
+    if (len >= sizeof(s_token_accum)) len = sizeof(s_token_accum) - 1;
+
+    token_lock();
+    if (s_token_accum_len + len + 1 > sizeof(s_token_accum)) flush_token_to_sentence_queue_locked();
     memcpy(s_token_accum + s_token_accum_len, tok, len);
     s_token_accum_len += len;
     s_token_accum[s_token_accum_len] = 0;
@@ -492,13 +570,14 @@ static void accumulate_token(const char *tok, size_t len)
             memcpy(s.text, s_token_accum, take);
             s.text[take] = 0;
             xQueueSend(s_sentence_q, &s, pdMS_TO_TICKS(100));
-            size_t rest = s_token_accum_len - (i + 2);
+            size_t rest = s_token_accum_len >= (i + 2) ? s_token_accum_len - (i + 2) : 0;
             memmove(s_token_accum, s_token_accum + i + 2, rest);
             s_token_accum_len = rest;
             s_token_accum[s_token_accum_len] = 0;
-            i = 0;
+            i = (size_t)-1;
         }
     }
+    token_unlock();
 }
 
 // Helper for apply_ww_upload — open/write/close a SPIFFS file in one
@@ -834,16 +913,15 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
 {
     switch (evt->type) {
         case OE_WS_EVT_CONNECTED:
-            // First successful round-trip to the server proves this firmware
-            // image isn't fundamentally broken — bless it so IDF stops the
-            // boot-rollback timer that auto-fires on the next reboot.
-            // No-op once the running image is already marked valid.
-            oe_ota_mark_running_valid();
+            s_ws_connected = true;
             // Bring AirPlay 1 receiver online now that we have Wi-Fi + a
             // paired account. airplay_init is internally idempotent so
             // reconnects are safe. Service name uses the configured device
             // name so multiple devices show distinct entries in iOS.
             airplay_init(g_dev_config.device_name[0] ? g_dev_config.device_name : "OE Voice");
+            // Re-report any alarm still ringing. oe_ws.c sends {type:'auth'}
+            // before this event fires, so the session is established first.
+            alarm_resend_fired();
             break;
         case OE_WS_EVT_CHAT_TOKEN:
             xEventGroupSetBits(g_dev_events, DEV_EVT_CHAT_TOKEN);
@@ -857,13 +935,15 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // play and it will sit on xQueueReceive forever — leaving the
             // UI stuck in THINKING. Drop to IDLE here when the queue is
             // empty so the device looks responsive after a control intent.
-            if (uxQueueMessagesWaiting(s_sentence_q) == 0 && s_token_accum_len == 0) {
+            if (uxQueueMessagesWaiting(s_sentence_q) == 0 && token_accum_empty()) {
                 // No audio coming — re-open the wake-word feed now rather
                 // than waiting on a SPEAKING transition that will never
                 // happen. Keeps the device responsive after a voice-intent
                 // short-circuit or empty/error reply.
                 s_awaiting_reply = false;
+                set_awaiting_since_us(0);
                 set_ui_state(UI_STATE_IDLE);
+                airplay_resume();
             }
             xEventGroupSetBits(g_dev_events, DEV_EVT_CHAT_DONE);
             break;
@@ -905,14 +985,26 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             xEventGroupSetBits(g_dev_events, DEV_EVT_DUPLICATE_LOST);
             break;
         case OE_WS_EVT_DISCONNECTED:
+            s_ws_connected = false;
             // If a chat reply was pending when the socket died it will never
             // arrive — clear the THINKING gate now so the wake feed re-opens
             // instead of the device staying deaf until reboot.
             if (s_awaiting_reply) {
                 s_awaiting_reply = false;
-                s_awaiting_since_us = 0;
+                set_awaiting_since_us(0);
                 set_ui_state(UI_STATE_IDLE);
             }
+            if (s_stream_active || s_stream_end_req) {
+                for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
+                    if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
+                xvf3800_enable_amplifier(false);
+                airplay_note_amp_forced_off();
+                audio_io_stop_playback();
+                audio_io_flush_playback();
+                s_stream_active = false;
+                s_stream_end_req = false;
+            }
+            airplay_resume();
             xEventGroupSetBits(g_dev_events, DEV_EVT_NET_DOWN);
             break;
         case OE_WS_EVT_WW_UPLOAD:
@@ -1019,7 +1111,7 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                     ESP_LOGI(TAG, "follow-up window pending: %d ms (starts when TTS drains), slot=%u",
                              window_ms, (unsigned) s_followup_slot);
                 } else {
-                    s_followup_until_us = esp_timer_get_time() + (int64_t)window_ms * 1000;
+                    set_followup_until_us(esp_timer_get_time() + (int64_t)window_ms * 1000);
                     ESP_LOGI(TAG, "follow-up window armed: %d ms, slot=%u",
                              window_ms, (unsigned) s_followup_slot);
                 }
@@ -1083,11 +1175,20 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                     const char *mk = jm->valuestring;
                     if (s_ambient_active &&
                         strncmp(mk, s_ambient_cur_marker, sizeof(s_ambient_cur_marker) - 1) == 0) {
-                        // Redundant server auto-restore for the marker we're
-                        // ALREADY playing. The device pauses/resumes this stream
-                        // locally around each turn, so re-fetching it would just
-                        // tear down the live stream we still have open. Ignore.
-                        oe_udplog_send("[ambient] play_ambient ignored (same marker live)");
+                        // Same marker we already have open. We pause/resume this
+                        // stream locally around each turn, so we don't re-fetch.
+                        // But if we're currently PAUSED, treat the server's
+                        // restore as a recovery nudge and resume — this is the
+                        // only way the server can un-wedge ambient if a turn-end
+                        // failed to resume it. ambient_resume() no-ops if we're
+                        // not actually paused, so an in-flight live stream is
+                        // never disturbed.
+                        if (s_ambient_paused) {
+                            oe_udplog_send("[ambient] same-marker restore -> resume");
+                            ambient_resume();
+                        } else {
+                            oe_udplog_send("[ambient] play_ambient ignored (same marker live)");
+                        }
                     } else {
                         // New / different marker → hand it to the single ambient
                         // task and interrupt any current playback to switch.
@@ -1124,11 +1225,18 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                     char clean[OE_DEVICE_NAME_MAX];
                     strncpy(clean, jn->valuestring, sizeof(clean) - 1);
                     clean[sizeof(clean) - 1] = '\0';
-                    nvs_creds_set_device_name(clean);
-                    strncpy(g_dev_config.device_name, clean, sizeof(g_dev_config.device_name) - 1);
-                    g_dev_config.device_name[sizeof(g_dev_config.device_name) - 1] = '\0';
-                    airplay_set_name(clean);
-                    ESP_LOGI(TAG, "device renamed to \"%s\"", clean);
+                    // No-op if unchanged. The server reconciles device state on
+                    // every reconnect (re-sends set_device_name), so an
+                    // unconditional NVS write would wear flash on a device that
+                    // reconnects often (e.g. flapping Wi-Fi). Only persist +
+                    // refresh mDNS on an actual change.
+                    if (strcmp(clean, g_dev_config.device_name) != 0) {
+                        nvs_creds_set_device_name(clean);
+                        strncpy(g_dev_config.device_name, clean, sizeof(g_dev_config.device_name) - 1);
+                        g_dev_config.device_name[sizeof(g_dev_config.device_name) - 1] = '\0';
+                        airplay_set_name(clean);
+                        ESP_LOGI(TAG, "device renamed to \"%s\"", clean);
+                    }
                 }
                 cJSON_Delete(j);
             }
@@ -1140,9 +1248,15 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 cJSON *je = cJSON_GetObjectItem(j, "enabled");
                 bool enabled = cJSON_IsTrue(je) ||
                                (cJSON_IsNumber(je) && je->valueint != 0);
+                // Apply always (cheap GPIO/state, no flash), but only persist on
+                // an actual change: the server re-sends this on every reconnect
+                // (state reconcile), so an unconditional NVS write would wear
+                // flash on a device that reconnects often.
+                bool hp_changed = (enabled != xvf3800_get_headphone_mode());
                 xvf3800_set_headphone_mode(enabled);
-                nvs_creds_set_headphone_mode(enabled ? 1 : 0);
-                ESP_LOGI(TAG, "headphone mode: %s", enabled ? "on" : "off");
+                if (hp_changed) nvs_creds_set_headphone_mode(enabled ? 1 : 0);
+                ESP_LOGI(TAG, "headphone mode: %s%s", enabled ? "on" : "off",
+                         hp_changed ? "" : " (unchanged)");
                 cJSON_Delete(j);
             }
             break;
@@ -1261,16 +1375,19 @@ static void stream_finalize_task(void *arg)
             for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                 if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
             xvf3800_enable_amplifier(false);
+            airplay_note_amp_forced_off();
             s_stream_active = false;
             int64_t now_us = esp_timer_get_time();
+            int64_t followup_until = get_followup_until_us();
             // Playback has drained — START any deferred follow-up window now, at
             // the instant the assistant stops talking, so the full answer window
             // is available regardless of how long the streamed reply ran.
             if (s_followup_pending_ms > 0) {
-                s_followup_until_us = now_us + (int64_t)s_followup_pending_ms * 1000;
+                followup_until = now_us + (int64_t)s_followup_pending_ms * 1000;
+                set_followup_until_us(followup_until);
                 s_followup_pending_ms = 0;
             }
-            if (s_followup_until_us > now_us) set_ui_state(UI_STATE_LISTENING);
+            if (followup_until > now_us) set_ui_state(UI_STATE_LISTENING);
             else                              set_ui_state(UI_STATE_IDLE);
             airplay_resume();
             xEventGroupSetBits(g_dev_events, DEV_EVT_TTS_DONE);
@@ -1319,13 +1436,15 @@ static void tts_worker_task(void *arg)
                 if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
             }
             xvf3800_enable_amplifier(false);
+            airplay_note_amp_forced_off();
             // If the server armed a follow-up window before/during TTS,
             // sit in LISTENING instead of IDLE so capture_and_drive_task's
             // VAD-start path can fire without requiring the wake word.
             int64_t now_us = esp_timer_get_time();
-            if (s_followup_until_us > now_us) {
+            int64_t followup_until = get_followup_until_us();
+            if (followup_until > now_us) {
                 ESP_LOGI(TAG, "tts drained -> LISTENING (follow-up window: %lldms left)",
-                         (long long)((s_followup_until_us - now_us) / 1000));
+                         (long long)((followup_until - now_us) / 1000));
                 set_ui_state(UI_STATE_LISTENING);
             } else {
                 ESP_LOGI(TAG, "tts queue drained -> idle");
@@ -1433,8 +1552,9 @@ static void capture_and_drive_task(void *arg)
         // (reply spoken, STT failed, empty reply, watchdog) — they all land
         // back here at full idle, where the rain should pick back up.
         if (s_ambient_paused && !in_utterance && !s_awaiting_reply && !s_stream_active &&
-            s_followup_until_us == 0 &&
-            uxQueueMessagesWaiting(s_sentence_q) == 0 && s_token_accum_len == 0) {
+            get_followup_until_us() == 0 &&
+            !alarm_is_firing() &&
+            uxQueueMessagesWaiting(s_sentence_q) == 0 && token_accum_empty()) {
             ambient_resume();
         }
 
@@ -1451,13 +1571,15 @@ static void capture_and_drive_task(void *arg)
             // device to every wake until reboot. After a bounded wait, give up
             // and re-open the wake feed.
             int64_t now_us = esp_timer_get_time();
-            if (s_awaiting_since_us != 0 &&
-                now_us - s_awaiting_since_us > (int64_t) AWAITING_REPLY_TIMEOUT_MS * 1000) {
+            int64_t awaiting_since = get_awaiting_since_us();
+            if (awaiting_since != 0 &&
+                now_us - awaiting_since > (int64_t) AWAITING_REPLY_TIMEOUT_MS * 1000) {
                 ESP_LOGW(TAG, "awaiting-reply watchdog fired (%dms, no reply) — re-opening wake feed",
                          AWAITING_REPLY_TIMEOUT_MS);
                 s_awaiting_reply = false;
-                s_awaiting_since_us = 0;
+                set_awaiting_since_us(0);
                 set_ui_state(UI_STATE_IDLE);
+                airplay_resume();
                 // fall through — resume wake inference this frame
             } else {
                 // Drain the frame so it doesn't pile up in the I²S DMA buffer,
@@ -1473,17 +1595,18 @@ static void capture_and_drive_task(void *arg)
             // last reply ended with a "?", treat any voice activity in this
             // frame as a wake fire so the user can answer without saying
             // the wake word again. Window expires silently if no speech detected.
-            if (s_followup_until_us > 0) {
+            int64_t followup_until = get_followup_until_us();
+            if (followup_until > 0) {
                 int64_t now_us = esp_timer_get_time();
-                if (now_us >= s_followup_until_us) {
-                    s_followup_until_us = 0;
+                if (now_us >= followup_until) {
+                    set_followup_until_us(0);
                     // Window expired without speech — drop back to IDLE.
                     set_ui_state(UI_STATE_IDLE);
                 } else if (frame_is_speech(frame, n)) {
                     ESP_LOGI(TAG, "follow-up: VAD-start (slot=%u), bypassing wake-word",
                              (unsigned) s_followup_slot);
                     s_active_slot = s_followup_slot;
-                    s_followup_until_us = 0;
+                    set_followup_until_us(0);
                     // Fall through into the wake-fire actions below by
                     // emulating a committed pending_slot. The block right
                     // after sets fired/in_utterance based on this state.
@@ -1535,13 +1658,13 @@ static void capture_and_drive_task(void *arg)
                     // genuine fire) on a different wake-word during the
                     // window should still route the answer to the user
                     // who asked the question.
-                    if (s_followup_until_us > esp_timer_get_time() &&
+                    if (get_followup_until_us() > esp_timer_get_time() &&
                         s_active_slot != s_followup_slot) {
                         ESP_LOGI(TAG, "follow-up: slot %u wake fired, overriding to slot %u",
                                  (unsigned) s_active_slot, (unsigned) s_followup_slot);
                         s_active_slot = s_followup_slot;
                     }
-                    s_followup_until_us = 0;  // window closes once we commit
+                    set_followup_until_us(0);  // window closes once we commit
                     pending_slot = -1; pending_prob = 0; pending_age = 0;
                 } else {
                     pending_age++;
@@ -1565,6 +1688,10 @@ static void capture_and_drive_task(void *arg)
                 // capture for this wake. No STT roundtrip means dismiss
                 // still works when the server is unreachable.
                 if (alarm_is_firing()) {
+                    if (s_ambient_active) {
+                        s_ambient_paused = true;
+                        oe_udplog_send("[ambient] PAUSE (alarm dismiss)");
+                    }
                     if (audio_io_playback_active()) {
                         audio_io_stop_playback();
                         audio_io_flush_playback();
@@ -1606,7 +1733,7 @@ static void capture_and_drive_task(void *arg)
                     // it again right after the user's new utterance — making
                     // barge-in look broken (the original reply keeps going).
                     xQueueReset(s_sentence_q);
-                    s_token_accum_len = 0;
+                    reset_token_accum();
                     xEventGroupSetBits(g_dev_events, DEV_EVT_BARGE_IN);
                 }
                 vad_reset(s_vad);
@@ -1636,7 +1763,7 @@ static void capture_and_drive_task(void *arg)
                 // Close the wake-word feed until SPEAKING starts (or the
                 // reply path errors back to IDLE) — see s_awaiting_reply.
                 s_awaiting_reply = true;
-                s_awaiting_since_us = esp_timer_get_time();  // arm watchdog
+                set_awaiting_since_us(esp_timer_get_time());  // arm watchdog
                 xEventGroupSetBits(g_dev_events, DEV_EVT_VAD_END);
 
                 char transcript[512] = {0};
@@ -1653,7 +1780,7 @@ static void capture_and_drive_task(void *arg)
                     // received from the prior chat is discarded; the new
                     // chat's tokens populate a clean accumulator.
                     xQueueReset(s_sentence_q);
-                    s_token_accum_len = 0;
+                    reset_token_accum();
                     // s_active_slot was set when this utterance's wake word
                     // fired. Server uses it to look up slot_agent_map[N].
                     oe_ws_send_chat(g_dev_config.default_agent_id, transcript,
@@ -1663,7 +1790,9 @@ static void capture_and_drive_task(void *arg)
                     // re-open the wake-word feed immediately rather than
                     // leaving the mic gated until something clears the flag.
                     s_awaiting_reply = false;
+                    set_awaiting_since_us(0);
                     set_ui_state(UI_STATE_IDLE);
+                    airplay_resume();
                 }
                 s_capture_used = 0;
             }
@@ -1771,7 +1900,7 @@ static void ambient_task(void *arg)
         // tts_worker_task for the audio_io ringbuffer. Capped; bail on a
         // stop or a newer request.
         for (int i = 0; i < 50; ++i) {
-            if (uxQueueMessagesWaiting(s_sentence_q) == 0 && s_token_accum_len == 0) break;
+            if (uxQueueMessagesWaiting(s_sentence_q) == 0 && token_accum_empty()) break;
             if (s_ambient_stop || ambient_preempted()) break;
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -1830,6 +1959,7 @@ static void ambient_task(void *arg)
         for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i)
             if (s_ww[i]) wakeword_notify_speaking_ended(s_ww[i]);
         xvf3800_enable_amplifier(false);
+        airplay_note_amp_forced_off();
         if (s_pre_ambient_volume >= 0) {
             audio_io_set_volume((uint8_t)s_pre_ambient_volume);
             s_pre_ambient_volume = -1;
@@ -1888,6 +2018,10 @@ static void chime_upload_worker(void *arg)
 // dismiss path), they just steady the slot's internal state.
 static void alarm_speaking_cb(bool speaking)
 {
+    if (speaking && s_ambient_active) {
+        s_ambient_paused = true;
+        oe_udplog_send("[ambient] PAUSE (alarm)");
+    }
     for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i) {
         if (!s_ww[i]) continue;
         if (speaking) wakeword_notify_speaking_began(s_ww[i]);
@@ -1898,6 +2032,7 @@ static void alarm_speaking_cb(bool speaking)
 static void alarm_amp_cb(bool enable)
 {
     xvf3800_enable_amplifier(enable);
+    if (!enable) airplay_note_amp_forced_off();
 }
 
 // Human-readable last-reset cause, sent in the [boot] UDP line. PANIC /
@@ -1955,9 +2090,26 @@ static void boot_operational(void)
     // (audio still reaches the 3.5 mm jack which taps the DAC before
     // the speaker amp).
     uint8_t saved_hp = 0;
-    if (nvs_creds_get_headphone_mode(&saved_hp) == ESP_OK && saved_hp) {
-        xvf3800_set_headphone_mode(true);
-        ESP_LOGI(TAG, "headphone mode restored: on");
+    esp_err_t hp_e = nvs_creds_get_headphone_mode(&saved_hp);
+    if (hp_e == ESP_OK) {
+        xvf3800_set_headphone_mode(saved_hp != 0);
+        ESP_LOGI(TAG, "headphone mode restored: %s", saved_hp ? "on" : "off");
+    } else {
+        // First boot, no server-sent preference yet. Default is a build-time
+        // choice: line-out/headphone ON for external-amp boards (mics stay
+        // live because amp_en is never asserted), OFF for onboard-speaker
+        // boards (amp must be asserted to hear anything). A disabled bool
+        // Kconfig emits no #define, so this must be #ifdef, not a plain read
+        // of CONFIG_OE_DEFAULT_HEADPHONE_MODE — the latter fails to compile
+        // when the option is off.
+#ifdef CONFIG_OE_DEFAULT_HEADPHONE_MODE
+        const bool default_hp = true;
+#else
+        const bool default_hp = false;
+#endif
+        xvf3800_set_headphone_mode(default_hp);
+        nvs_creds_set_headphone_mode(default_hp ? 1 : 0);
+        ESP_LOGI(TAG, "headphone mode defaulted: %s", default_hp ? "on" : "off");
     }
 
     char ssid[64] = {0};
@@ -2044,6 +2196,8 @@ static void boot_operational(void)
     }
 
     s_sentence_q = xQueueCreate(16, sizeof(sentence_t));
+    s_token_mutex = xSemaphoreCreateMutex();
+    if (!s_token_mutex) { ESP_LOGE(TAG, "token mutex alloc"); esp_restart(); }
     s_capture_buf = malloc(CAPTURE_BUFFER_SAMPLES * sizeof(int16_t));
     if (!s_capture_buf) { ESP_LOGE(TAG, "capture buf alloc"); esp_restart(); }
 
@@ -2137,6 +2291,10 @@ static void heartbeat_task(void *arg)
             const uint32_t cap_total = audio_io_get_capture_samples_total();
             const uint32_t cap_sps = (cap_total - prev_cap_samples) / 10u;
             prev_cap_samples = cap_total;
+            if (!s_ota_marked_valid && s_ws_connected && cap_sps > 0) {
+                oe_ota_mark_running_valid();
+                s_ota_marked_valid = true;
+            }
             char hbline[160];
             // pcm_drop is the running total of playback samples lost to a
             // full ring (audio_io_write_pcm). Nonzero = audible skip

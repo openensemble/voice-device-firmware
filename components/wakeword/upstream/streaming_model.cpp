@@ -90,6 +90,7 @@ bool StreamingModel::load_model_() {
         this->tensor_arena_, this->tensor_arena_size_, this->mrv_);
     if (this->interpreter_->AllocateTensors() != kTfLiteOk) {
       ESP_LOGE(TAG, "AllocateTensors failed");
+      this->interpreter_.reset();
       return false;
     }
 
@@ -98,19 +99,23 @@ bool StreamingModel::load_model_() {
         (input->dims->data[2] != PREPROCESSOR_FEATURE_SIZE)) {
       ESP_LOGE(TAG, "input tensor shape unexpected (size=%d, dims=[%d,%d,%d])",
                input->dims->size, input->dims->data[0], input->dims->data[1], input->dims->data[2]);
+      this->interpreter_.reset();
       return false;
     }
     if (input->type != kTfLiteInt8) {
       ESP_LOGE(TAG, "input tensor is not int8");
+      this->interpreter_.reset();
       return false;
     }
     TfLiteTensor *output = this->interpreter_->output(0);
     if ((output->dims->size != 2) || (output->dims->data[0] != 1) || (output->dims->data[1] != 1)) {
       ESP_LOGE(TAG, "output tensor dim not 1x1");
+      this->interpreter_.reset();
       return false;
     }
     if (output->type != kTfLiteUInt8) {
       ESP_LOGE(TAG, "output tensor not uint8");
+      this->interpreter_.reset();
       return false;
     }
   }

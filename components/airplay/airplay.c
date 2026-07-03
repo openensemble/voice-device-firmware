@@ -190,11 +190,6 @@ static bool on_cmd(raop_event_t event, va_list args)
                 xvf3800_enable_amplifier(false);
                 atomic_store(&s_amp_on, false);
             }
-            if (s_rtp_buffer) {
-                heap_caps_free(s_rtp_buffer);
-                s_rtp_buffer = NULL;
-                s_rtp_buffer_size = 0;
-            }
             break;
 
         case RAOP_VOLUME: {
@@ -284,6 +279,12 @@ void airplay_deinit(void)
     atomic_store(&s_streaming, false);
     atomic_store(&s_paused_for_wake, false);
     atomic_store(&s_paused_by_user, false);
+    atomic_store(&s_amp_on, false);
+    if (s_rtp_buffer) {
+        heap_caps_free(s_rtp_buffer);
+        s_rtp_buffer = NULL;
+        s_rtp_buffer_size = 0;
+    }
 }
 
 void airplay_pause(void)
@@ -297,8 +298,15 @@ void airplay_pause(void)
 void airplay_resume(void)
 {
     if (!atomic_load(&s_streaming)) return;
+    atomic_store(&s_amp_on, false);
     atomic_store(&s_paused_for_wake, false);
+    audio_io_start_playback();
     ESP_LOGI(TAG, "resumed after wake");
+}
+
+void airplay_note_amp_forced_off(void)
+{
+    atomic_store(&s_amp_on, false);
 }
 
 void airplay_stop(void)
@@ -308,6 +316,7 @@ void airplay_stop(void)
     atomic_store(&s_streaming, false);
     atomic_store(&s_paused_for_wake, false);
     atomic_store(&s_paused_by_user, false);
+    atomic_store(&s_amp_on, false);
     audio_io_flush_playback();
 }
 

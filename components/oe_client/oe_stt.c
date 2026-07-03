@@ -4,11 +4,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "oe_stt";
+
+static void build_api_url(char *out, size_t out_len, const char *server_url, const char *path)
+{
+    size_t n = strnlen(server_url, OE_URL_BUF);
+    while (n > 0 && server_url[n - 1] == '/') n--;
+    snprintf(out, out_len, "%.*s%s", (int)n, server_url, path);
+}
 
 #define MP_BOUNDARY "----oevdfilewavboundary7f3"
 
@@ -87,7 +95,7 @@ esp_err_t oe_stt_post(const char *server_url, const char *token,
     memcpy(body + off, epilogue, epilogue_len);            off += epilogue_len;
 
     char url[OE_URL_BUF + 16];
-    snprintf(url, sizeof(url), "%s/api/stt", server_url);
+    build_api_url(url, sizeof(url), server_url, "/api/stt");
 
     char resp[1024];
     resp_buf_t rb = { .buf = resp, .len = 0, .cap = sizeof(resp) };
@@ -98,7 +106,7 @@ esp_err_t oe_stt_post(const char *server_url, const char *token,
         .event_handler = http_evt,
         .user_data = &rb,
         .timeout_ms = 30000,
-        .skip_cert_common_name_check = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) {

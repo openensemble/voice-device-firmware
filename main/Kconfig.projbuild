@@ -1,0 +1,12 @@
+menu "OpenEnsemble voice device"
+
+config OE_DEFAULT_HEADPHONE_MODE
+    bool "Default first-boot headphone/line-out mode"
+    default n
+    help
+        Enable headphone/line-out mode on first boot before the server sends a
+        saved preference. This keeps the external speaker amplifier disabled for
+        hardware that uses the XVF DAC line-out, but should stay off for units
+        that rely on the onboard speaker amplifier.
+
+endmenu

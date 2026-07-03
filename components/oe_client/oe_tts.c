@@ -5,11 +5,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "oe_tts";
+
+static void build_api_url(char *out, size_t out_len, const char *server_url, const char *path)
+{
+    size_t n = strnlen(server_url, OE_URL_BUF);
+    while (n > 0 && server_url[n - 1] == '/') n--;
+    snprintf(out, out_len, "%.*s%s", (int)n, server_url, path);
+}
 
 // Monotonic byte counter across every oe_tts_post invocation. The heartbeat
 // ambient-stats log samples this each tick and computes the delta to derive
@@ -91,7 +99,7 @@ esp_err_t oe_tts_post(const char *server_url, const char *token,
     if (!state.dec) { free(body_str); return ESP_ERR_NO_MEM; }
 
     char url[OE_URL_BUF + 16];
-    snprintf(url, sizeof(url), "%s/api/tts", server_url);
+    build_api_url(url, sizeof(url), server_url, "/api/tts");
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -117,7 +125,7 @@ esp_err_t oe_tts_post(const char *server_url, const char *token,
         .keep_alive_idle = 60,
         .keep_alive_interval = 30,
         .keep_alive_count = 3,
-        .skip_cert_common_name_check = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
 
@@ -205,7 +213,7 @@ esp_err_t oe_alarm_fetch_audio(const char *server_url, const char *token,
 
     raw_collect_t r = {0};
     char url[OE_URL_BUF + 16];
-    snprintf(url, sizeof(url), "%s/api/tts", server_url);
+    build_api_url(url, sizeof(url), server_url, "/api/tts");
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -213,7 +221,7 @@ esp_err_t oe_alarm_fetch_audio(const char *server_url, const char *token,
         .event_handler = http_raw_evt,
         .user_data = &r,
         .timeout_ms = 30000,
-        .skip_cert_common_name_check = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     char auth[OE_TOKEN_BUF + 16];

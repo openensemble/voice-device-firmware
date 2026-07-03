@@ -39,6 +39,10 @@ void airplay_pause(void);
 void airplay_resume(void);
 void airplay_stop(void);
 
+// Main firmware may force the shared XVF amp off after TTS/alarm/ambient audio.
+// Tell AirPlay so its lazy amp latch re-enables the speaker on the next RTP PCM.
+void airplay_note_amp_forced_off(void);
+
 // Send a DACP remote-control command back to the source (iPhone / iPad / Mac
 // running the AirPlay session). The raop_sink library uses the active-remote
 // token captured at RTSP setup to POST /ctrl-int/1/<cmd> at the source's

@@ -58,6 +58,12 @@ void alarm_stop(const char *id);
 // this to decide whether to treat a wake fire as a local dismiss.
 bool alarm_is_firing(void);
 
+// Re-send alarm_fired for every currently-ringing alarm. Call on WS
+// (re)connect: alarm_fired is fire-and-forget, so a WS blip at the fire
+// instant otherwise leaves the server thinking the alarm never rang.
+// Idempotent server-side.
+void alarm_resend_fired(void);
+
 // Local dismiss path — invoked by the wake handler when wake fires while
 // alarm_is_firing() is true. Stops the ring, sends alarm_acked over WS,
 // removes the alarm(s) from NVS, and suppresses the normal STT/utterance

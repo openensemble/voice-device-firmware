@@ -21,6 +21,7 @@
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -28,6 +29,17 @@ static const char *TAG = "xvf_ctrl";
 
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
+static SemaphoreHandle_t s_xmos_mutex = NULL;
+
+static void xmos_lock(void)
+{
+    if (s_xmos_mutex) xSemaphoreTakeRecursive(s_xmos_mutex, portMAX_DELAY);
+}
+
+static void xmos_unlock(void)
+{
+    if (s_xmos_mutex) xSemaphoreGiveRecursive(s_xmos_mutex);
+}
 
 // ── Low-level I²C transactions ─────────────────────────────────────────────
 
@@ -40,34 +52,40 @@ esp_err_t xvf3800_xmos_write(uint8_t resid, uint8_t cmd, const uint8_t *data, ui
     buf[1] = cmd;
     buf[2] = len;
     if (len > 0 && data) memcpy(buf + 3, data, len);
-    return i2c_master_transmit(s_dev, buf, 3 + len, pdMS_TO_TICKS(200));
+    xmos_lock();
+    esp_err_t e = i2c_master_transmit(s_dev, buf, 3 + len, pdMS_TO_TICKS(200));
+    xmos_unlock();
+    return e;
 }
 
 esp_err_t xvf3800_xmos_read(uint8_t resid, uint8_t cmd, uint8_t *out, uint8_t len)
 {
     if (!s_dev) return ESP_ERR_INVALID_STATE;
+    if ((size_t)len + 1 > 33) return ESP_ERR_INVALID_SIZE;
     // Bit 0x80 in the cmd byte marks this as a read; without it the XVF
     // treats the I²C write as a malformed write-command and rejects the
     // subsequent read with a non-zero status byte. The length byte is the
     // TOTAL bytes the host will read back, which is len data + 1 status byte.
     uint8_t tx[3] = { resid, (uint8_t)(cmd | XVF_CMD_READ_BIT), (uint8_t)(len + 1) };
+    xmos_lock();
     esp_err_t e = i2c_master_transmit(s_dev, tx, sizeof(tx), pdMS_TO_TICKS(200));
-    if (e != ESP_OK) return e;
+    if (e != ESP_OK) { xmos_unlock(); return e; }
     // Short delay lets the XMOS firmware queue the response. Mirrors the
     // 5 ms wait in the third-party reference; without it the read can race
     // and return stale data.
     vTaskDelay(pdMS_TO_TICKS(5));
 
     uint8_t rx[1 + 32];
-    if ((size_t)len + 1 > sizeof(rx)) return ESP_ERR_INVALID_SIZE;
     e = i2c_master_receive(s_dev, rx, 1 + len, pdMS_TO_TICKS(200));
-    if (e != ESP_OK) return e;
+    if (e != ESP_OK) { xmos_unlock(); return e; }
     if (rx[0] != 0) {
         ESP_LOGW(TAG, "xmos read resid=%u cmd=%u status=0x%02x (non-zero = command rejected)",
                  resid, cmd, rx[0]);
+        xmos_unlock();
         return ESP_FAIL;
     }
     if (out && len) memcpy(out, rx + 1, len);
+    xmos_unlock();
     return ESP_OK;
 }
 
@@ -75,6 +93,10 @@ esp_err_t xvf3800_xmos_read(uint8_t resid, uint8_t cmd, uint8_t *out, uint8_t le
 
 esp_err_t xvf3800_init(void)
 {
+    if (!s_xmos_mutex) {
+        s_xmos_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!s_xmos_mutex) return ESP_ERR_NO_MEM;
+    }
     // The Seeed XVF3800+XIAO carrier doesn't expose a reset GPIO to the
     // XIAO, so we don't manipulate one. Bus alone.
     i2c_master_bus_config_t bus_cfg = {
@@ -254,12 +276,13 @@ esp_err_t xvf3800_dfu_apply(const uint8_t *bin, size_t len,
     if (!s_dev) return ESP_ERR_INVALID_STATE;
 
     ESP_LOGI(TAG, "DFU: starting (%u bytes)", (unsigned)len);
+    xmos_lock();
 
     uint8_t alt = XVF_DFU_ALT_UPGRADE;
     esp_err_t e = xvf3800_xmos_write(XVF_RESID_DFU_CONTROLLER, XVF_CMD_DFU_SETALTERNATE, &alt, 1);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "DFU: SETALTERNATE failed: %s", esp_err_to_name(e));
-        return e;
+        goto out;
     }
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -272,14 +295,14 @@ esp_err_t xvf3800_dfu_apply(const uint8_t *bin, size_t len,
         e = xvf_dfu_dnload_block(bin + offset, (uint8_t)chunk);
         if (e != ESP_OK) {
             ESP_LOGE(TAG, "DFU: DNLOAD failed at offset %u: %s", (unsigned)offset, esp_err_to_name(e));
-            return e;
+            goto out;
         }
         offset += chunk;
 
         e = xvf_dfu_wait_idle(XVF_DFU_STATUS_TIMEOUT_MS);
         if (e != ESP_OK) {
             ESP_LOGE(TAG, "DFU: wait-idle failed at offset %u: %s", (unsigned)offset, esp_err_to_name(e));
-            return e;
+            goto out;
         }
 
         int64_t now = esp_timer_get_time();
@@ -293,12 +316,12 @@ esp_err_t xvf3800_dfu_apply(const uint8_t *bin, size_t len,
     e = xvf_dfu_dnload_block(NULL, 0);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "DFU: final empty DNLOAD failed: %s", esp_err_to_name(e));
-        return e;
+        goto out;
     }
     e = xvf_dfu_wait_idle(XVF_DFU_STATUS_TIMEOUT_MS);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "DFU: manifest wait failed: %s", esp_err_to_name(e));
-        return e;
+        goto out;
     }
     ESP_LOGI(TAG, "DFU: manifest complete, rebooting XVF...");
 
@@ -318,11 +341,15 @@ esp_err_t xvf3800_dfu_apply(const uint8_t *bin, size_t len,
         if (ver[0] != expected_major || ver[1] != expected_minor || ver[2] != expected_patch) {
             ESP_LOGE(TAG, "DFU: version mismatch: got %u.%u.%u expected %u.%u.%u",
                      ver[0], ver[1], ver[2], expected_major, expected_minor, expected_patch);
-            return ESP_FAIL;
+            e = ESP_FAIL;
+            goto out;
         }
         ESP_LOGI(TAG, "DFU: success, XVF now running %u.%u.%u", ver[0], ver[1], ver[2]);
     }
-    return ESP_OK;
+    e = ESP_OK;
+out:
+    xmos_unlock();
+    return e;
 }
 
 // ── UI-pattern → effect+color mapping ─────────────────────────────────────
