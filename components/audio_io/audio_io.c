@@ -17,11 +17,25 @@ static i2s_chan_handle_t s_rx = NULL;
 static i2s_chan_handle_t s_tx = NULL;
 
 static RingbufHandle_t s_capture_rb = NULL;
-static RingbufHandle_t s_playback_rb = NULL;
+static RingbufHandle_t s_playback_rb = NULL;   // MUSIC lane: ambient / AirPlay / alarms
+static RingbufHandle_t s_speech_rb  = NULL;    // SPEECH lane: TTS replies / announcements
 
 static volatile bool s_playback_active = false;
 static volatile bool s_capture_active = false;
-static volatile bool s_flush_req = false;
+static volatile bool s_flush_music_req = false;
+static volatile bool s_flush_speech_req = false;
+
+// ── Ducking mixer state ──────────────────────────────────────────────────────
+// While the speech lane has audio queued (plus a short hangover so inter-
+// sentence gaps don't pump), the music bed's gain ramps toward DUCK_GAIN;
+// otherwise it ramps back to unity. Q15 fixed point, stepped per output
+// frame inside playback_task — attack ≈ 270 ms, release ≈ 550 ms at 48 kHz.
+#define DUCK_GAIN_Q15        3277     // ≈ 10 % of unity (field: 20 % was overpowering under speech)
+#define DUCK_ATTACK_STEP     2        // q15 per frame down  (~270 ms full swing)
+#define DUCK_RELEASE_STEP    1        // q15 per frame up    (~550 ms full swing)
+#define DUCK_HANGOVER_US     350000   // keep ducked briefly after speech drains
+static int32_t  s_duck_gain_q15 = 32768;
+static int64_t  s_speech_last_seen_us = 0;
 
 // Monotonic count of 16 kHz mono samples pushed into the capture ringbuffer.
 // The [hb] heartbeat in main.c prints the per-interval delta as cap_sps —
@@ -105,6 +119,9 @@ static void reset_44k_resampler(void)
 // below — internal SRAM is too tight to absorb another 128 KB at this
 // stage of boot (wake-word model + decoder + drive/capture tasks).
 #define PLAYBACK_RB_BYTES (256 * 1024)
+// Speech lane ring. Sized like the music lane so LEAD_MS reasoning on the
+// server (voice-tts-stream.mjs) holds unchanged for TTS frames. PSRAM.
+#define SPEECH_RB_BYTES (256 * 1024)
 
 static void capture_task(void *arg)
 {
@@ -216,82 +233,106 @@ uint32_t audio_io_get_playback_drop_samples(void) {
     return s_playback_drop_samples;
 }
 
-static void drain_playback_ringbuffer(void)
+static void drain_ringbuffer(RingbufHandle_t rb)
 {
-    if (!s_playback_rb) return;
+    if (!rb) return;
     size_t item_size = 0;
     void *p = NULL;
-    while ((p = xRingbufferReceive(s_playback_rb, &item_size, 0)) != NULL) {
-        vRingbufferReturnItem(s_playback_rb, p);
+    while ((p = xRingbufferReceive(rb, &item_size, 0)) != NULL) {
+        vRingbufferReturnItem(rb, p);
     }
 }
 
+// Pull up to `want_bytes` from a ring into `dst` (non-blocking). Returns
+// bytes copied. ReceiveUpTo may return less than asked even when more is
+// queued (wrap point) — loop until the ring is dry or dst is full.
+static size_t rb_pull(RingbufHandle_t rb, uint8_t *dst, size_t want_bytes)
+{
+    size_t got = 0;
+    while (got < want_bytes) {
+        size_t item_size = 0;
+        uint8_t *p = (uint8_t *)xRingbufferReceiveUpTo(rb, &item_size, 0, want_bytes - got);
+        if (!p || item_size == 0) { if (p) vRingbufferReturnItem(rb, p); break; }
+        memcpy(dst + got, p, item_size);
+        got += item_size;
+        vRingbufferReturnItem(rb, p);
+    }
+    return got;
+}
+
+// ── Ducking mixer ────────────────────────────────────────────────────────────
+// Two lanes → one I²S stream. Speech plays at full level; the music bed is
+// scaled by a per-frame-ramped duck gain so the assistant talking over
+// ambient/AirPlay sounds like a car radio dipping under navigation prompts —
+// smooth down (~270 ms), speak, smooth back up (~550 ms) — instead of the
+// old hard pause/cut.
 static void playback_task(void *arg)
 {
-    const size_t bus_chunk_samples = TX_DMA_SAMPLES * AUDIO_BUS_CHANNELS;
-    const size_t bus_chunk_bytes = bus_chunk_samples * sizeof(int32_t);
-    int32_t *bus_buf = heap_caps_malloc(bus_chunk_bytes, MALLOC_CAP_DMA);
-    if (!bus_buf) {
+    const size_t chunk_frames  = TX_DMA_SAMPLES;                       // 480 frames = 10 ms
+    const size_t chunk_samples = chunk_frames * AUDIO_BUS_CHANNELS;    // int16 count
+    const size_t chunk_bytes   = chunk_samples * sizeof(int16_t);
+    int32_t *bus_buf   = heap_caps_malloc(chunk_samples * sizeof(int32_t), MALLOC_CAP_DMA);
+    int16_t *music_buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_8BIT);
+    int16_t *speech_buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_8BIT);
+    if (!bus_buf || !music_buf || !speech_buf) {
         ESP_LOGE(TAG, "playback_task: malloc fail");
         vTaskDelete(NULL);
         return;
     }
 
-    // Ringbuffer now holds interleaved stereo samples at BUS rate (48 kHz int16).
-    // The
-    // upsample/downsample of source-rate audio happens at the call-site in
-    // audio_io_write_pcm — that way music sources at 48 kHz can push 1:1
-    // without going through a quality-lossy 16 kHz intermediate, while
-    // 16 kHz TTS sources still play correctly. playback_task here just
-    // scales each L/R sample and pushes it to I2S at 1:1 bus rate.
     while (1) {
-        if (s_flush_req) {
-            s_flush_req = false;
-            drain_playback_ringbuffer();
-        }
+        if (s_flush_music_req)  { s_flush_music_req = false;  drain_ringbuffer(s_playback_rb); }
+        if (s_flush_speech_req) { s_flush_speech_req = false; drain_ringbuffer(s_speech_rb); }
         if (!s_playback_active || !s_tx) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
-        // Pause: stall here without consuming the ringbuffer. Resuming
-        // simply clears the flag and we pick up at the next ringbuffer
-        // slot. Sleep at the wake-word frame cadence so resume latency
-        // is sub-100 ms.
+        // Pause: stall here without consuming either ring. Resuming simply
+        // clears the flag and we pick up where we stopped.
         if (s_paused) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        size_t item_size = 0;
-        int16_t *pcm = (int16_t *)xRingbufferReceiveUpTo(
-            s_playback_rb, &item_size, pdMS_TO_TICKS(50), TX_DMA_SAMPLES * sizeof(int16_t));
 
-        if (!pcm || item_size == 0) {
-            if (pcm) vRingbufferReturnItem(s_playback_rb, pcm);
+        size_t music_bytes  = rb_pull(s_playback_rb, (uint8_t *)music_buf, chunk_bytes);
+        size_t speech_bytes = rb_pull(s_speech_rb,  (uint8_t *)speech_buf, chunk_bytes);
+        if (music_bytes == 0 && speech_bytes == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+        const size_t music_samples  = music_bytes / sizeof(int16_t);
+        const size_t speech_samples = speech_bytes / sizeof(int16_t);
+        const size_t out_samples    = music_samples > speech_samples ? music_samples : speech_samples;
 
-        // Ringbuffer is interleaved L/R int16 at bus rate. Each int16
-        // becomes one int32 bus slot (shift << 16 to fill the upper bits
-        // for 24-bit-in-32 MSB-justified Philips). Alternation of L/R
-        // in the rb maps 1:1 to alternation of L/R slots on the bus.
-        // No mono mirroring — true stereo reaches the 3.5 mm jack.
-        //
-        // Software volume: scale each int16 by s_volume_pct / 100 before
-        // the int32 shift. Linear scaling — not perceptual, but the
-        // XVF DAC + downstream amp curve already imposes a non-linear
-        // response so the perceived loudness vs slider position is
-        // close enough to natural. Sub-10% will start to sound quantized
-        // (loss of effective bit depth), which is fine since at that
-        // level you almost can't hear it anyway.
+        // Duck target: speech queued now, or drained less than the hangover
+        // ago (so 50 ms inter-frame gaps in a paced TTS stream don't pump).
+        int64_t now_us = esp_timer_get_time();
+        if (speech_samples > 0) s_speech_last_seen_us = now_us;
+        const bool duck = speech_samples > 0 ||
+                          (s_speech_last_seen_us != 0 &&
+                           now_us - s_speech_last_seen_us < DUCK_HANGOVER_US);
+        const int32_t target = duck ? DUCK_GAIN_Q15 : 32768;
+
         const uint8_t vol = s_volume_pct;  // snapshot — runtime updates race-safe
-        const size_t in_samples = item_size / sizeof(int16_t);
+        int32_t g = s_duck_gain_q15;
         size_t out_idx = 0;
-        for (size_t i = 0; i < in_samples && out_idx < bus_chunk_samples; ++i) {
-            int32_t v = ((int32_t)pcm[i] * vol) / 100;
+        for (size_t i = 0; i < out_samples; ++i) {
+            // Ramp once per FRAME (every other sample — L then R share a gain
+            // step) toward the target.
+            if ((i & 1) == 0) {
+                if (g > target) { g -= DUCK_ATTACK_STEP; if (g < target) g = target; }
+                else if (g < target) { g += DUCK_RELEASE_STEP; if (g > target) g = target; }
+            }
+            int32_t m  = i < music_samples  ? music_buf[i]  : 0;
+            int32_t sp = i < speech_samples ? speech_buf[i] : 0;
+            int32_t mixed = ((m * g) >> 15) + sp;
+            int32_t v = (mixed * vol) / 100;
+            if (v >  INT16_MAX) v = INT16_MAX;
+            if (v < INT16_MIN) v = INT16_MIN;
             bus_buf[out_idx++] = v << 16;
         }
-        vRingbufferReturnItem(s_playback_rb, pcm);
+        s_duck_gain_q15 = g;
 
         size_t bw;
         i2s_channel_write(s_tx, bus_buf, out_idx * sizeof(int32_t), &bw, pdMS_TO_TICKS(100));
@@ -356,7 +397,9 @@ esp_err_t audio_io_init(void)
     // for 48k stereo 16-bit), so the latency penalty is negligible.
     s_playback_rb = xRingbufferCreateWithCaps(PLAYBACK_RB_BYTES, RINGBUF_TYPE_BYTEBUF,
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_capture_rb || !s_playback_rb) return ESP_ERR_NO_MEM;
+    s_speech_rb = xRingbufferCreateWithCaps(SPEECH_RB_BYTES, RINGBUF_TYPE_BYTEBUF,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_capture_rb || !s_playback_rb || !s_speech_rb) return ESP_ERR_NO_MEM;
 
     esp_err_t err = bring_up_full_duplex();
     if (err != ESP_OK) {
@@ -412,24 +455,41 @@ esp_err_t audio_io_pause_playback(void)  { s_paused = true;  return ESP_OK; }
 esp_err_t audio_io_resume_playback(void) { s_paused = false; return ESP_OK; }
 bool      audio_io_is_paused(void)       { return s_paused; }
 
-// Send one chunk to the playback ring, counting (instead of hiding) a loss.
+// Send one chunk to a playback ring, counting (instead of hiding) a loss.
 // Deliberately no retry: write_pcm runs on latency-sensitive tasks
 // (websocket_task for TTS, the AirPlay receiver for music), and the 200 ms
 // timeout already gives the drain task ample room. If it still expires,
 // blocking longer only trades an audible skip for delayed pongs — count the
 // loss so pcm_drop= in [hb] surfaces it, and let server pacing take the blame.
-static bool rb_send_playback(const void *data, size_t bytes)
+// Thread-local target ring for the shared resample body below: set by the
+// two public entry points before dispatching. Writers are single-threaded
+// per lane (websocket_task/tts_worker → speech; ambient/AirPlay → music),
+// and the two lanes never share a resampler branch that keeps cross-call
+// state except the 44.1 k one, which is AirPlay-only (music).
+static bool rb_send_to(RingbufHandle_t rb, const void *data, size_t bytes)
 {
-    if (xRingbufferSend(s_playback_rb, data, bytes, pdMS_TO_TICKS(200)) == pdTRUE) return true;
+    if (xRingbufferSend(rb, data, bytes, pdMS_TO_TICKS(200)) == pdTRUE) return true;
     s_playback_drop_samples += bytes / sizeof(int16_t);
     ESP_LOGW(TAG, "playback rb full: dropped %u samples (pcm_drop total %u)",
              (unsigned)(bytes / sizeof(int16_t)), (unsigned)s_playback_drop_samples);
     return false;
 }
 
+static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t samples, uint32_t source_rate);
+
 size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate)
 {
-    if (!s_playback_rb) return 0;
+    return write_pcm_to(s_playback_rb, pcm_stereo, samples, source_rate);
+}
+
+size_t audio_io_write_speech_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate)
+{
+    return write_pcm_to(s_speech_rb, pcm_stereo, samples, source_rate);
+}
+
+static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t samples, uint32_t source_rate)
+{
+    if (!rb) return 0;
     // Ringbuffer holds STEREO INTERLEAVED L/R int16 samples at BUS rate
     // (48 kHz). Callers (mp3_decode, etc.) always pass interleaved stereo
     // — for mono sources mp3_decode duplicates L=R before calling here.
@@ -449,7 +509,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
 
     if (source_rate == AUDIO_BUS_SAMPLE_RATE) {
         // 48 kHz native stereo — push straight to bus rb.
-        return rb_send_playback(pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
+        return rb_send_to(rb, pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
     }
 
     if (source_rate == 16000) {
@@ -478,7 +538,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            rb_send_playback(buf, bi * sizeof(int16_t));
+            rb_send_to(rb, buf, bi * sizeof(int16_t));
             total_written += bi;
             in_base += chunk_in;
         }
@@ -529,7 +589,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
                 out[out_idx++] = o_r;
                 phase += PHASE_STEP_44K;
                 if (out_idx >= (sizeof(out) / sizeof(out[0]))) {
-                    rb_send_playback(out, out_idx * sizeof(int16_t));
+                    rb_send_to(rb, out, out_idx * sizeof(int16_t));
                     total_written += out_idx;
                     out_idx = 0;
                 }
@@ -540,7 +600,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
         }
 
         if (out_idx > 0) {
-            rb_send_playback(out, out_idx * sizeof(int16_t));
+            rb_send_to(rb, out, out_idx * sizeof(int16_t));
             total_written += out_idx;
         }
         s_44k_prev_l = prev_l;
@@ -569,7 +629,7 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            rb_send_playback(buf, bi * sizeof(int16_t));
+            rb_send_to(rb, buf, bi * sizeof(int16_t));
             total_written += bi;
             in_base += chunk_in;
         }
@@ -579,13 +639,14 @@ size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t so
     // Unknown source rate — fall back to 1:1 push (will sound wrong unless
     // it happens to be 48 kHz). Log so future-us notices.
     ESP_LOGW(TAG, "audio_io_write_pcm: unhandled source_rate=%u, pushing 1:1", (unsigned) source_rate);
-    return rb_send_playback(pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
+    return rb_send_to(rb, pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
 }
 
 void audio_io_flush_playback(void)
 {
     if (!s_playback_rb) return;
-    s_flush_req = true;
+    s_flush_music_req = true;
+    s_flush_speech_req = true;
     // OE 2026-05-27: reset the 44.1→48 kHz fractional resampler state
     // so a fresh AirPlay stream (or post-pause resume) doesn't linear-
     // interpolate between a stale prev_l/prev_r and the new first
@@ -597,9 +658,27 @@ void audio_io_flush_playback(void)
     reset_44k_resampler();
 }
 
+void audio_io_flush_speech(void)
+{
+    if (!s_speech_rb) return;
+    s_flush_speech_req = true;
+}
+
 bool audio_io_playback_active(void) { return s_playback_active; }
 
+// SPEECH lane — every existing caller (TTS drain in stream_finalize_task,
+// the stall watchdog, LEAD_MS sizing) reasons about the assistant's speech.
 void audio_io_get_playback_buf_stats(uint32_t *used_bytes, uint32_t *capacity_bytes) {
+    if (capacity_bytes) *capacity_bytes = SPEECH_RB_BYTES;
+    if (used_bytes) {
+        if (!s_speech_rb) { *used_bytes = 0; return; }
+        size_t free_bytes = xRingbufferGetCurFreeSize(s_speech_rb);
+        *used_bytes = (free_bytes > SPEECH_RB_BYTES) ? 0 : (uint32_t)(SPEECH_RB_BYTES - free_bytes);
+    }
+}
+
+// MUSIC lane — ambient-stats heartbeat underrun telemetry.
+void audio_io_get_music_buf_stats(uint32_t *used_bytes, uint32_t *capacity_bytes) {
     if (capacity_bytes) *capacity_bytes = PLAYBACK_RB_BYTES;
     if (used_bytes) {
         if (!s_playback_rb) { *used_bytes = 0; return; }

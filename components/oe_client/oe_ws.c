@@ -74,7 +74,9 @@ static void handle_message(const char *data, size_t len)
         if (cJSON_IsString(jp) && jp->valuestring)
             emit_turn(OE_WS_EVT_TTS_AUDIO, jp->valuestring, strlen(jp->valuestring), j);
     } else if (strcmp(type, "tts_audio_end") == 0) {
-        emit_turn(OE_WS_EVT_TTS_AUDIO_END, NULL, 0, j);
+        // Raw JSON up to main.c — it parses the optional `pending` flag
+        // (burst-close on an open turn → waiting-LED instead of idle).
+        emit_turn(OE_WS_EVT_TTS_AUDIO_END, data, len, j);
     } else if (strcmp(type, "duplicate_suppressed") == 0) {
         emit(OE_WS_EVT_DUPLICATE_SUPPRESSED, NULL, 0);
     } else if (strcmp(type, "error") == 0) {
@@ -296,7 +298,7 @@ bool oe_ws_connected(void)
     return s_ws && esp_websocket_client_is_connected(s_ws);
 }
 
-esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id)
+esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id, bool barge_in)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
@@ -311,6 +313,8 @@ esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_s
     // Device-minted turn correlation id. Older servers ignore it; newer ones
     // echo it on every event of this turn so stale-turn events are droppable.
     if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
+    // Speech-barge turn: transcript may be prefixed with reply bleed.
+    if (barge_in) cJSON_AddBoolToObject(o, "barge", true);
     // Opt into server-side TTS streaming: the server segments + synthesizes +
     // pushes PCM audio frames instead of raw tokens (this firmware plays them).
     cJSON_AddBoolToObject(o, "tts_stream", true);

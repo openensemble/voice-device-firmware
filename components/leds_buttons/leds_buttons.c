@@ -26,6 +26,7 @@ static xvf_led_pattern_t ui_to_xvf(ui_state_t s)
         case UI_STATE_THINKING:  return XVF_LED_PATTERN_THINKING;
         case UI_STATE_SPEAKING:  return XVF_LED_PATTERN_SPEAKING;
         case UI_STATE_AMBIENT:   return XVF_LED_PATTERN_OFF;
+        case UI_STATE_WAITING:   return XVF_LED_PATTERN_WAITING;
         case UI_STATE_MUTED:     return XVF_LED_PATTERN_MUTE;
         case UI_STATE_ERROR:     return XVF_LED_PATTERN_ERROR;
     }
@@ -53,6 +54,7 @@ static const char *state_name(ui_state_t s) {
         case UI_STATE_THINKING:  return "THINKING";
         case UI_STATE_SPEAKING:  return "SPEAKING";
         case UI_STATE_AMBIENT:   return "AMBIENT";
+        case UI_STATE_WAITING:   return "WAITING";
         case UI_STATE_MUTED:     return "MUTED";
         case UI_STATE_ERROR:     return "ERROR";
     }

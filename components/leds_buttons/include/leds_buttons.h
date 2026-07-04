@@ -15,6 +15,7 @@ typedef enum {
     // ring is wrong for "I'm playing thunderstorm sounds while you sleep."
     // Rendered as LEDs off; ambient is its own audible feedback.
     UI_STATE_AMBIENT,
+    UI_STATE_WAITING,
     UI_STATE_MUTED,
     UI_STATE_ERROR,
 } ui_state_t;

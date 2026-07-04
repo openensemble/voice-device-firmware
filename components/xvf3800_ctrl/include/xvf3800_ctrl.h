@@ -85,6 +85,11 @@ typedef enum {
     XVF_LED_PATTERN_SPEAKING,
     XVF_LED_PATTERN_MUTE,
     XVF_LED_PATTERN_ERROR,
+    // Background work in progress (open turn waiting on a delegation/slow
+    // tool): rotating rainbow ring — visually distinct from THINKING's
+    // breathing pulse, and animated autonomously by the XVF so the wait
+    // costs zero ongoing I2C traffic while the mic is live.
+    XVF_LED_PATTERN_WAITING,
 } xvf_led_pattern_t;
 
 esp_err_t xvf3800_init(void);
@@ -96,6 +101,7 @@ esp_err_t xvf3800_xmos_read(uint8_t resid, uint8_t cmd, uint8_t *out, uint8_t le
 // Convenience wrappers built on the low-level ops.
 esp_err_t xvf3800_set_led_effect(xvf_led_effect_t effect);
 esp_err_t xvf3800_set_led_brightness(uint8_t brightness);
+esp_err_t xvf3800_set_led_speed(uint8_t speed);
 esp_err_t xvf3800_set_led_color(uint32_t rgb);
 esp_err_t xvf3800_set_led_doa_colors(uint32_t base_rgb, uint32_t doa_rgb);
 esp_err_t xvf3800_enable_amplifier(bool enable);

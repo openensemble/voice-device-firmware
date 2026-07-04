@@ -142,7 +142,10 @@ bool      oe_ws_connected(void);
 // turn_id: device-minted correlation id for this turn (NULL/"" = omit —
 // pre-turn-id behavior). The server adopts it and echoes it on every event
 // belonging to the turn; a stop must carry the id of the turn being stopped.
-esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id);
+// barge_in: true when this utterance interrupted our own reply (stage-C
+// commit). The transcript may carry a prefix of reply bleed from the barge
+// pre-roll, so the server relaxes its bare-word intent anchors ("stop").
+esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id, bool barge_in);
 esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id);
 
 // Speech barge-in flow control (send ONLY when server_caps.tts_pause).

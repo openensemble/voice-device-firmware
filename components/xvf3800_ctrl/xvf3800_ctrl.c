@@ -146,6 +146,11 @@ esp_err_t xvf3800_set_led_brightness(uint8_t brightness)
     return xvf3800_xmos_write(XVF_RESID_GPO, XVF_CMD_LED_BRIGHTNESS, &brightness, 1);
 }
 
+esp_err_t xvf3800_set_led_speed(uint8_t speed)
+{
+    return xvf3800_xmos_write(XVF_RESID_GPO, XVF_CMD_LED_SPEED, &speed, 1);
+}
+
 esp_err_t xvf3800_set_led_color(uint32_t rgb)
 {
     // The XVF3800 expects BGR byte order with a padding byte, per the
@@ -402,6 +407,13 @@ esp_err_t xvf3800_set_led_pattern(xvf_led_pattern_t pattern)
             xvf3800_set_led_brightness(120);
             xvf3800_set_led_color(XVF_RGB(0xFF, 0x00, 0x00));   // red
             return xvf3800_set_led_effect(XVF_LED_EFFECT_SINGLE);
+
+        case XVF_LED_PATTERN_WAITING:
+            // Rotating rainbow — "working on it in the background". The XVF
+            // animates this itself; one command, no continuous I2C.
+            xvf3800_set_led_brightness(160);
+            xvf3800_set_led_speed(6);   // field: 5 spun ~20% too slow
+            return xvf3800_set_led_effect(XVF_LED_EFFECT_RAINBOW);
 
         case XVF_LED_PATTERN_ERROR:
             xvf3800_set_led_brightness(180);

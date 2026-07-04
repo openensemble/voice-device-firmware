@@ -48,8 +48,19 @@ esp_err_t audio_io_stop_playback(void);
 // int16 count (frames * 2). Mono callers should duplicate L=R before calling
 // (mp3_decode does this internally for mono MP3s). source_rate is the input
 // sample rate (Hz) — function upsamples to 48 kHz internally for the bus.
+//
+// TWO output lanes since 0.2.68 (ducking mixer):
+//   audio_io_write_pcm        → MUSIC lane (ambient, AirPlay, alarms) — the
+//                               continuous "bed".
+//   audio_io_write_speech_pcm → SPEECH lane (TTS replies, announcements).
+// playback_task mixes them: while speech is queued the music bed's gain
+// ramps down smoothly (~300 ms) to a duck level, speech plays on top at
+// full volume, and the bed swells back (~700 ms) once speech drains. No
+// more hard pause/cut when the assistant talks over ambient or AirPlay.
 size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate);
-void audio_io_flush_playback(void);
+size_t audio_io_write_speech_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate);
+void audio_io_flush_playback(void);        // flushes BOTH lanes
+void audio_io_flush_speech(void);          // speech lane only (barge/abort paths)
 bool audio_io_playback_active(void);
 
 // Software playback volume (0-100 %, linear). Applied per-sample inside
@@ -86,9 +97,10 @@ uint32_t audio_io_get_capture_samples_total(void);
 // nonzero means server pacing outran the ring (see rb_send_playback).
 uint32_t audio_io_get_playback_drop_samples(void);
 
-// Playback ringbuffer telemetry. *used returns bytes currently queued
-// (decoder-produced PCM waiting for I²S to drain), *capacity returns the
-// ringbuffer's total size. Used by the ambient-stats heartbeat to
-// surface "is the speaker about to underrun" without exposing internal
-// xRingbuffer state.
+// Ring telemetry per lane. audio_io_get_playback_buf_stats reports the
+// SPEECH lane — its callers (TTS drain in stream_finalize_task, the stall
+// watchdog, LEAD_MS sizing) all reason about the assistant's own speech.
+// audio_io_get_music_buf_stats reports the MUSIC lane (ambient-stats
+// heartbeat underrun telemetry).
 void audio_io_get_playback_buf_stats(uint32_t *used_bytes, uint32_t *capacity_bytes);
+void audio_io_get_music_buf_stats(uint32_t *used_bytes, uint32_t *capacity_bytes);
