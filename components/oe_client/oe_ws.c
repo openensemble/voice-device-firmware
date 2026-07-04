@@ -88,6 +88,9 @@ static void handle_message(const char *data, size_t len)
         emit(OE_WS_EVT_SERVER_CAPS, data, len);
     } else if (strcmp(type, "set_conversation_mode") == 0) {
         emit(OE_WS_EVT_SET_CONVERSATION_MODE, data, len);
+    } else if (strcmp(type, "ui_wait") == 0) {
+        // Raw JSON up to main.c — it parses `on` and owns the LED state.
+        emit(OE_WS_EVT_UI_WAIT, data, len);
     } else if (strcmp(type, "ww_upload") == 0) {
         // Pass the raw JSON message up to main.c — it owns the SPIFFS
         // writer + the wakeword_t array. Keeping the parse + b64 decode

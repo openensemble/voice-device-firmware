@@ -118,6 +118,12 @@ typedef enum {
     // the server reconciles it on every connect, and conversation features
     // are meaningless without a live server anyway.
     OE_WS_EVT_SET_CONVERSATION_MODE,
+    // { type:'ui_wait', on } — server hint that background work for this
+    // device is in flight OUTSIDE any turn (delegated task after the ack
+    // reply ended; result arrives later as an announcement). LED-only:
+    // main.c shows the WAITING rainbow while otherwise idle, mic untouched.
+    // Raw JSON payload. Re-sent ~10s by the server while work is pending.
+    OE_WS_EVT_UI_WAIT,
 } oe_ws_event_t;
 
 typedef struct {

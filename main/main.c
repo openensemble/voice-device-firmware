@@ -1278,6 +1278,31 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             }
             break;
         }
+        case OE_WS_EVT_UI_WAIT: {
+            // { type:'ui_wait', on } — background work is running for this
+            // device outside any turn (e.g. a delegated task after the ack
+            // reply finished; the result arrives later as an announcement).
+            // LED-only, exactly like the burst-close WAITING state: the mic
+            // stays fully open and an active turn's UI always wins — only
+            // flip the ring when the device is otherwise idle. The server
+            // re-asserts every ~10s while work is pending, so a wake/reply
+            // that clears this locally gets the spinner back afterwards.
+            cJSON *j = cJSON_ParseWithLength(evt->text, evt->text_len);
+            if (j) {
+                bool on = cJSON_IsTrue(cJSON_GetObjectItem(j, "on"));
+                cJSON_Delete(j);
+                bool turn_busy = s_stream_active || s_awaiting_reply ||
+                                 s_in_utterance || get_followup_until_us() != 0;
+                if (on) {
+                    s_wait_led_until_us = esp_timer_get_time() + WAIT_LED_TIMEOUT_US;
+                    if (!turn_busy) set_ui_state(UI_STATE_WAITING);
+                } else if (s_wait_led_until_us != 0) {
+                    s_wait_led_until_us = 0;
+                    if (!turn_busy) set_ui_state(UI_STATE_IDLE);
+                }
+            }
+            break;
+        }
         case OE_WS_EVT_DISCONNECTED:
             s_ws_connected = false;
             s_wait_led_until_us = 0;
