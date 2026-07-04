@@ -120,8 +120,7 @@ static void on_pcm(const u8_t *data, size_t len, u32_t playtime)
 
 /* ------------------------------------------------------------------------ */
 /* Control event path: SETUP/PLAY/STOP transitions flip our streaming flag */
-/* and post FreeRTOS event bits. main.c watches DEV_EVT_AIRPLAY_PLAY to    */
-/* know when to politely lower wake-word sensitivity.                      */
+/* (airplay_is_streaming), which main.c and agc_freeze_task poll directly. */
 /* ------------------------------------------------------------------------ */
 static bool on_cmd(raop_event_t event, va_list args)
 {

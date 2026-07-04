@@ -16,9 +16,8 @@
  *   airplay_is_streaming()    — true while iOS is actively pushing.
  *   airplay_deinit()          — full tear-down.
  *
- * Events propagated to FreeRTOS event group `g_dev_events`:
- *   DEV_EVT_AIRPLAY_PLAY   — iOS started a stream
- *   DEV_EVT_AIRPLAY_STOP   — iOS stopped a stream
+ * Stream start/stop is observable via airplay_is_streaming(); there is no
+ * event-group side channel (the old g_dev_events layer was removed 2026-07-04).
  *
  * License: MIT.
  */

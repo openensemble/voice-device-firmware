@@ -189,7 +189,19 @@ esp_err_t xvf3800_enable_amplifier(bool enable)
     // 3.5 mm jack since it taps the DAC before the speaker amp.
     if (enable && s_headphone_mode) return ESP_OK;
     uint8_t data[2] = { 31, enable ? 0 : 1 };
-    return xvf3800_xmos_write(XVF_RESID_GPO, XVF_CMD_GPO_WRITE, data, 2);
+    esp_err_t e = xvf3800_xmos_write(XVF_RESID_GPO, XVF_CMD_GPO_WRITE, data, 2);
+    if (e != ESP_OK) {
+        // Retry once, then log loudly. Callers ignore this return, and a
+        // silently-failed disable leaves the XVF AEC treating the speaker as
+        // active — mic sensitivity stays suppressed until the next toggle.
+        e = xvf3800_xmos_write(XVF_RESID_GPO, XVF_CMD_GPO_WRITE, data, 2);
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "amp_en=%d write failed twice (%s)%s",
+                     enable ? 1 : 0, esp_err_to_name(e),
+                     enable ? "" : " — mic may stay AEC-suppressed");
+        }
+    }
+    return e;
 }
 
 void xvf3800_set_headphone_mode(bool enabled)

@@ -39,6 +39,7 @@
 static const char *TAG = "main";
 
 #include "esp_system.h"
+#include "esp_random.h"
 
 // Embedded known-good XVF firmware (formatBCE HA v1.0.7 — what was working
 // yesterday morning before today's regression chasing). Pushed to the XMOS
@@ -225,9 +226,7 @@ static void agc_freeze_task(void *arg)
     vTaskDelete(NULL);
 }
 
-dev_state_t g_dev_state = DEV_STATE_BOOT;
 dev_config_t g_dev_config = {0};
-EventGroupHandle_t g_dev_events = NULL;
 
 // Wake-word slots loaded concurrently. The wakewords SPIFFS partition is built
 // from firmware/wakewords/slot{0..N}.tflite + slot{0..N}.json — fresh flash
@@ -266,6 +265,114 @@ static uint8_t     s_default_cutoff[WW_NUM_SLOTS] = {0};
 static volatile bool s_stream_active  = false;   // between tts_audio_begin and finalize
 static volatile bool s_stream_end_req = false;   // tts_audio_end received; finalize task drains
 static uint8_t       s_pcm_frame[4096];          // base64 decode scratch (WS callback is single-threaded)
+// Liveness timestamp for the streamed-TTS path: last tts_audio_begin/tts_audio
+// arrival (esp_timer us). stream_finalize_task's stall watchdog uses it to
+// tear down a SPEAKING state whose tts_audio_end never arrives (server crash
+// mid-stream on a healthy socket). Without this, s_stream_active had NO
+// timeout: amp stayed on (AEC suppressing the mic) and every non-owner wake
+// slot stayed gated forever.
+static volatile int64_t s_last_tts_frame_us = 0;
+// 20 s, not lower: a slow cloned-voice sentence can legitimately gap frames
+// for several seconds with the ring drained (synth latency), and firing early
+// truncates the reply — frames that arrive after teardown are dropped because
+// s_stream_active is false. Dead-Pocket is already handled promptly by the
+// server's fatal-synth bail; this is the backstop for a crashed/hung server.
+#define TTS_STREAM_STALL_TIMEOUT_MS 20000
+// True while capture_and_drive_task is recording a command utterance. File
+// scope (not a task-local) so ws_event_cb can refuse to treat a stale `done`
+// from an aborted turn as turn-terminal while the user is mid-command — the
+// old behavior IDLE'd the UI and airplay_resume()'d over the user's speech.
+static volatile bool s_in_utterance = false;
+
+// ── Turn correlation ids ─────────────────────────────────────────────────────
+// Minted at every wake/follow-up commit, sent in `chat`, echoed back by the
+// server on token/done/tts_audio_*/await_followup/error. Events carrying a
+// DIFFERENT turn_id belong to an aborted/prior turn and are dropped. Events
+// with NO turn_id (older server) are always accepted — never drop on missing.
+// Written only by capture_and_drive_task; read by websocket_task. 16-byte
+// writes aren't atomic, but the reader tolerates a torn read as at worst one
+// mis-dropped/mis-accepted frame during the commit instant.
+static char     s_turn_id[24] = "";
+static char     s_turn_prefix[5] = "0000";   // 4 hex chars from esp_random at boot
+static uint32_t s_turn_counter = 0;
+
+static void mint_turn_id(void)
+{
+    snprintf(s_turn_id, sizeof(s_turn_id), "%s-%lu",
+             s_turn_prefix, (unsigned long)(++s_turn_counter));
+}
+
+// True when the event names a turn that is NOT the device's current one.
+// Missing turn_id (NULL/empty, i.e. older server) always passes.
+static bool evt_turn_stale(const oe_ws_payload_t *evt)
+{
+    if (!evt->turn_id || !evt->turn_id[0]) return false;
+    if (!s_turn_id[0]) return true;   // we have no live turn — event is from a past life
+    return strcmp(evt->turn_id, s_turn_id) != 0;
+}
+
+// Server capability flags, learned from `server_caps` after auth and reset on
+// disconnect (the next server may be older). Gate every NEW device→server
+// message type on these so a firmware upgrade never breaks against an old
+// server. turn_id fields on chat/stop are NOT gated — old servers ignore
+// unknown fields harmlessly.
+static volatile bool s_caps_tts_pause  = false;
+static volatile bool s_caps_stt_stream = false;
+
+// ── Speech barge-in (conversation mode): pause-then-verify ──────────────────
+// While the device speaks a streamed reply, a burst of mic energy PAUSES
+// playback locally (one call — the speaker mutes before any network hop) and
+// drops amp_en so the XVF AEC stops suppressing the mic. With the room now
+// quiet and the mic hot, we require sustained speech to confirm; a false
+// alarm (dish clatter, TV transient) resumes the reply where it paused. A
+// confirmed barge captures a normal utterance — and even then the reply is
+// only flushed once STT proves the interjection real (a cough or "um" costs
+// a ~1-3 s pause, never the rest of the reply). Every state has a local
+// deadline: this converges with zero network.
+//
+// Tunables. BARGE_SETTLE_MS covers the unknown mic-gain step response after
+// amp-off — the [barge] UDP telemetry is the measuring instrument; adjust
+// after reading real kitchen logs.
+#define BARGE_CONSEC_FRAMES     2      // 80 ms frames above trigger to become a candidate
+#define BARGE_FLOOR_MULT        4      // trigger = max(floor*MULT, VOICE_ENERGY_THRESHOLD)
+#define BARGE_SETTLE_MS         150    // ignore first ms after amp-off (gain settling)
+#define BARGE_CONFIRM_SPEECH_MS 350    // cumulative speech to confirm a real barge
+#define BARGE_VERIFY_WINDOW_MS  1000   // candidate → confirm deadline, else resume
+typedef enum { BARGE_NONE = 0, BARGE_VERIFYING } barge_state_t;
+static barge_state_t     s_barge_state = BARGE_NONE;
+static int               s_barge_consec = 0;
+static int64_t           s_barge_started_us = 0;
+static uint32_t          s_barge_speech_ms = 0;
+static uint32_t          s_speak_floor = 0;         // EMA of frame energy during SPEAKING
+static bool              s_barge_capture = false;   // current utterance came from a confirmed barge
+// True between our audio_io_pause_playback() and the resume/commit. Suspends
+// the tts stall watchdog (the server pacer is deliberately stalled) and marks
+// that WE own the pause flag (AirPlay's user-pause must not be clobbered).
+static volatile bool     s_paused_for_barge = false;
+static volatile bool     s_conversation_mode = false;
+
+// ── Streaming STT session (gated on server_caps.stt_stream) ─────────────────
+// Wake/follow-up captures stream frames to the server as they arrive (upload
+// overlaps speech; no 30 s blocking POST on this task). The capture buffer
+// keeps filling in parallel as the fallback: any send failure flips
+// s_stt_send_failed and VAD-end takes the buffered oe_stt_post road instead.
+// Barge captures NEVER stream — stage C needs the transcript on-device to
+// decide resume-vs-commit, so they always use the local HTTP path.
+static bool     s_stt_streaming = false;
+static bool     s_stt_send_failed = false;
+static uint32_t s_stt_seq = 0;
+
+// Mean-square frame energy (same metric as the VAD's threshold comparisons).
+static inline uint32_t frame_energy(const int16_t *samples, size_t n)
+{
+    if (n == 0) return 0;
+    uint64_t sum_sq = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int32_t s = samples[i];
+        sum_sq += (uint64_t)(s * s);
+    }
+    return (uint32_t)(sum_sq / n);
+}
 static volatile bool s_ws_connected = false;
 static volatile bool s_ota_marked_valid = false;
 
@@ -305,23 +412,58 @@ static volatile int     s_followup_pending_ms = 0;
 // false) wake fire on a different slot — gets routed back to THIS slot
 // so the answer always lands on the user who asked the original turn.
 static volatile uint8_t s_followup_slot = 0;
-#define FOLLOWUP_ENERGY_THRESHOLD 800000   // same as VAD energy_threshold
+// Single speech-energy threshold (mean-square of int16 samples, ~-31 dBFS)
+// shared by the VAD config and frame_is_speech. These used to be two
+// literals ("800000, same as VAD") that could drift apart.
+#define VOICE_ENERGY_THRESHOLD 800000
 static vad_state_t *s_vad = NULL;
 static QueueHandle_t s_sentence_q = NULL;
+
+// Pre-roll: a rolling window of the most recent mic audio, kept while idle so
+// a follow-up answer captured via VAD-start (which by definition triggers
+// AFTER speech has begun) can prepend the onset instead of clipping the first
+// syllable. Reset every time a follow-up window arms so it can never contain
+// the tail of our own TTS. PSRAM; feature silently disabled if alloc fails.
+#define PREROLL_SAMPLES (16000 * 400 / 1000)   // 400 ms @ 16 kHz mono
+static int16_t *s_preroll_buf = NULL;
+static size_t   s_preroll_head = 0;     // next write index (circular)
+static size_t   s_preroll_filled = 0;   // valid samples, caps at PREROLL_SAMPLES
+
+static void preroll_reset(void)
+{
+    s_preroll_head = 0;
+    s_preroll_filled = 0;
+}
+
+static void preroll_append(const int16_t *samples, size_t n)
+{
+    if (!s_preroll_buf || n == 0) return;
+    for (size_t i = 0; i < n; ++i) {
+        s_preroll_buf[s_preroll_head] = samples[i];
+        s_preroll_head = (s_preroll_head + 1) % PREROLL_SAMPLES;
+    }
+    s_preroll_filled += n;
+    if (s_preroll_filled > PREROLL_SAMPLES) s_preroll_filled = PREROLL_SAMPLES;
+}
+
+// Copy the pre-roll (oldest → newest) into dst. Returns samples copied.
+static size_t preroll_copy_out(int16_t *dst, size_t max)
+{
+    if (!s_preroll_buf || s_preroll_filled == 0) return 0;
+    size_t n = s_preroll_filled < max ? s_preroll_filled : max;
+    size_t start = (s_preroll_head + PREROLL_SAMPLES - n) % PREROLL_SAMPLES;
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = s_preroll_buf[(start + i) % PREROLL_SAMPLES];
+    }
+    return n;
+}
 
 // Fast frame-level "is this speech?" check for follow-up start detection.
 // Mirrors the VAD's RMS comparison but stateless — we just need to know
 // if THIS frame is above the speech threshold.
 static inline bool frame_is_speech(const int16_t *samples, size_t n)
 {
-    if (n == 0) return false;
-    uint64_t sum_sq = 0;
-    for (size_t i = 0; i < n; ++i) {
-        int32_t s = samples[i];
-        sum_sq += (uint64_t)(s * s);
-    }
-    uint32_t rms = (uint32_t)(sum_sq / n);
-    return rms > FOLLOWUP_ENERGY_THRESHOLD;
+    return frame_energy(samples, n) > VOICE_ENERGY_THRESHOLD;
 }
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -924,10 +1066,18 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             alarm_resend_fired();
             break;
         case OE_WS_EVT_CHAT_TOKEN:
-            xEventGroupSetBits(g_dev_events, DEV_EVT_CHAT_TOKEN);
+            if (evt_turn_stale(evt)) break;
             accumulate_token(evt->text, evt->text_len);
             break;
         case OE_WS_EVT_CHAT_DONE:
+            if (evt_turn_stale(evt)) break;
+            // A `done` while the user is mid-command is NOT ours to act on —
+            // it's the tail of an aborted turn (stop-ack, superseded streamer)
+            // racing the new turn. Acting on it used to IDLE the UI and
+            // airplay_resume() over the user's speech (repro: wake during
+            // AirPlay → barge-in pauses music + sends stop → server acks with
+            // a bare done → music resumed mid-dictation).
+            if (s_in_utterance) break;
             flush_token_to_sentence_queue();
             // If the reply produced no audio (e.g. server-side voice-intent
             // router short-circuited a "volume up" / "pause" without
@@ -942,18 +1092,31 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 // short-circuit or empty/error reply.
                 s_awaiting_reply = false;
                 set_awaiting_since_us(0);
-                set_ui_state(UI_STATE_IDLE);
+                // A follow-up window deferred behind this (audio-less) reply
+                // arms now — there is no drain event coming to arm it.
+                if (s_followup_pending_ms > 0) {
+                    set_followup_until_us(esp_timer_get_time() +
+                                          (int64_t)s_followup_pending_ms * 1000);
+                    s_followup_pending_ms = 0;
+                    preroll_reset();
+                    set_ui_state(UI_STATE_LISTENING);
+                } else {
+                    set_ui_state(UI_STATE_IDLE);
+                }
                 airplay_resume();
             }
-            xEventGroupSetBits(g_dev_events, DEV_EVT_CHAT_DONE);
             break;
         case OE_WS_EVT_TTS_AUDIO_BEGIN:
             // Server-side streaming: about to receive synthesized PCM frames.
             // Enter SPEAKING once; the legacy per-sentence path isn't used.
+            // Stale-turn begin (aborted reply racing a barge-in) must not
+            // re-enter SPEAKING mid-capture of the new turn.
+            if (evt_turn_stale(evt)) break;
             if (!leds_buttons_is_muted() && !s_stream_active) {
                 s_stream_active  = true;
                 s_stream_end_req = false;
                 s_awaiting_reply = false;
+                s_last_tts_frame_us = esp_timer_get_time();
                 set_ui_state(UI_STATE_SPEAKING);
                 for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                     if (s_ww[_i]) wakeword_notify_speaking_began(s_ww[_i]);
@@ -969,7 +1132,9 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // and it (a) double-expanded the already-stereo frames (half-
             // speed audio) and (b) blew the 4 KB websocket_task stack — the
             // panic-on-every-reply bug fixed in 0.2.61.
+            if (evt_turn_stale(evt)) break;
             if (s_stream_active && evt->text && evt->text_len) {
+                s_last_tts_frame_us = esp_timer_get_time();
                 size_t olen = 0;
                 if (mbedtls_base64_decode(s_pcm_frame, sizeof(s_pcm_frame), &olen,
                         (const unsigned char *)evt->text, evt->text_len) == 0 && olen >= 2) {
@@ -979,13 +1144,79 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             break;
         case OE_WS_EVT_TTS_AUDIO_END:
             // All audio sent — finalize task drains the ring, then idles.
+            if (evt_turn_stale(evt)) break;
             if (s_stream_active) s_stream_end_req = true;
             break;
         case OE_WS_EVT_DUPLICATE_SUPPRESSED:
-            xEventGroupSetBits(g_dev_events, DEV_EVT_DUPLICATE_LOST);
+            // Server suppressed the chat as a duplicate — no reply is coming.
+            // Clearing the THINKING gate here used to be missing, leaving the
+            // wake feed closed for the full 90 s watchdog.
+            if (s_awaiting_reply) {
+                s_awaiting_reply = false;
+                set_awaiting_since_us(0);
+                set_ui_state(UI_STATE_IDLE);
+                airplay_resume();
+            }
             break;
+        case OE_WS_EVT_ERROR:
+            // Server-side turn error (or transport error). If a reply was
+            // pending, it is not coming — re-open the wake feed instead of
+            // sitting deaf until the 90 s watchdog. The streaming path
+            // usually converts errors to spoken fallback + done server-side;
+            // this handles the bare-error paths (validation, caps, shutdown).
+            if (evt_turn_stale(evt)) break;
+            if (s_awaiting_reply && !s_stream_active) {
+                ESP_LOGW(TAG, "server error while awaiting reply%s%.*s — back to IDLE",
+                         evt->text ? ": " : "",
+                         evt->text ? (int)(evt->text_len < 96 ? evt->text_len : 96) : 0,
+                         evt->text ? evt->text : "");
+                s_awaiting_reply = false;
+                set_awaiting_since_us(0);
+                s_followup_pending_ms = 0;
+                set_ui_state(UI_STATE_IDLE);
+                airplay_resume();
+            }
+            break;
+        case OE_WS_EVT_SERVER_CAPS: {
+            // { type:'server_caps', turn_ids, tts_pause, stt_stream } — what
+            // the connected server understands. Gates every NEW device→server
+            // message so this firmware stays compatible with older servers.
+            cJSON *j = cJSON_ParseWithLength(evt->text, evt->text_len);
+            if (j) {
+                s_caps_tts_pause  = cJSON_IsTrue(cJSON_GetObjectItem(j, "tts_pause"));
+                s_caps_stt_stream = cJSON_IsTrue(cJSON_GetObjectItem(j, "stt_stream"));
+                ESP_LOGI(TAG, "server caps: tts_pause=%d stt_stream=%d",
+                         (int)s_caps_tts_pause, (int)s_caps_stt_stream);
+                cJSON_Delete(j);
+            }
+            break;
+        }
+        case OE_WS_EVT_SET_CONVERSATION_MODE: {
+            cJSON *j = cJSON_ParseWithLength(evt->text, evt->text_len);
+            if (j) {
+                cJSON *je = cJSON_GetObjectItem(j, "enabled");
+                bool en = cJSON_IsTrue(je) || (cJSON_IsNumber(je) && je->valueint != 0);
+                if (en != s_conversation_mode) {
+                    s_conversation_mode = en;
+                    ESP_LOGI(TAG, "conversation mode: %s", en ? "on" : "off");
+                }
+                cJSON_Delete(j);
+            }
+            break;
+        }
         case OE_WS_EVT_DISCONNECTED:
             s_ws_connected = false;
+            // Forget capabilities — the socket may reconnect to an older
+            // server (rollback) that doesn't understand the newer messages.
+            s_caps_tts_pause  = false;
+            s_caps_stt_stream = false;
+            // A barge verify in flight loses its server: release OUR pause on
+            // the playback engine so the stream teardown below fully cleans up.
+            if (s_paused_for_barge) {
+                s_paused_for_barge = false;
+                s_barge_state = BARGE_NONE;
+                audio_io_resume_playback();
+            }
             // If a chat reply was pending when the socket died it will never
             // arrive — clear the THINKING gate now so the wake feed re-opens
             // instead of the device staying deaf until reboot.
@@ -994,6 +1225,7 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 set_awaiting_since_us(0);
                 set_ui_state(UI_STATE_IDLE);
             }
+            s_followup_pending_ms = 0;
             if (s_stream_active || s_stream_end_req) {
                 for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                     if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
@@ -1005,7 +1237,6 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 s_stream_end_req = false;
             }
             airplay_resume();
-            xEventGroupSetBits(g_dev_events, DEV_EVT_NET_DOWN);
             break;
         case OE_WS_EVT_WW_UPLOAD:
             apply_ww_upload(evt->text, evt->text_len);
@@ -1100,18 +1331,38 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // short reply that already drained), arm immediately.
             cJSON *j = cJSON_ParseWithLength(evt->text, evt->text_len);
             if (j) {
+                // Raw-JSON message — turn check happens here, not in oe_ws.c.
+                // A follow-up window for an aborted/prior turn must not open.
+                const cJSON *jturn = cJSON_GetObjectItem(j, "turn_id");
+                if (cJSON_IsString(jturn) && jturn->valuestring[0] &&
+                    (!s_turn_id[0] || strcmp(jturn->valuestring, s_turn_id) != 0)) {
+                    cJSON_Delete(j);
+                    break;
+                }
                 const cJSON *jw = cJSON_GetObjectItem(j, "windowMs");
                 int window_ms = (cJSON_IsNumber(jw) && jw->valueint > 0) ? jw->valueint : 5000;
                 // Lock the slot of the turn that opened this follow-up so a
                 // false-fire on a different wake-word can't reroute the
                 // answer to a different user.
                 s_followup_slot = s_active_slot;
-                if (s_stream_active) {
+                // Defer whenever ANY part of the reply is still in flight —
+                // not just when PCM is already streaming. The old
+                // s_stream_active-only check armed the window immediately for
+                // short replies (synth hadn't produced the first frame yet)
+                // and for the legacy token/done path (sentences still queued),
+                // so the window burned down DURING the spoken reply and could
+                // expire before the user was even asked the question.
+                bool reply_in_flight = s_stream_active || s_awaiting_reply ||
+                                       uxQueueMessagesWaiting(s_sentence_q) > 0 ||
+                                       !token_accum_empty();
+                if (reply_in_flight) {
                     s_followup_pending_ms = window_ms;
-                    ESP_LOGI(TAG, "follow-up window pending: %d ms (starts when TTS drains), slot=%u",
+                    ESP_LOGI(TAG, "follow-up window pending: %d ms (starts when reply drains), slot=%u",
                              window_ms, (unsigned) s_followup_slot);
                 } else {
                     set_followup_until_us(esp_timer_get_time() + (int64_t)window_ms * 1000);
+                    preroll_reset();
+                    set_ui_state(UI_STATE_LISTENING);
                     ESP_LOGI(TAG, "follow-up window armed: %d ms, slot=%u",
                              window_ms, (unsigned) s_followup_slot);
                 }
@@ -1387,10 +1638,42 @@ static void stream_finalize_task(void *arg)
                 set_followup_until_us(followup_until);
                 s_followup_pending_ms = 0;
             }
-            if (followup_until > now_us) set_ui_state(UI_STATE_LISTENING);
-            else                              set_ui_state(UI_STATE_IDLE);
+            if (followup_until > now_us) {
+                // Window opens on clean mic audio only — the reply's tail
+                // must not ride into the answer capture as pre-roll.
+                preroll_reset();
+                set_ui_state(UI_STATE_LISTENING);
+            } else {
+                set_ui_state(UI_STATE_IDLE);
+            }
             airplay_resume();
-            xEventGroupSetBits(g_dev_events, DEV_EVT_TTS_DONE);
+        } else if (s_stream_active && !s_stream_end_req && !s_paused_for_barge) {
+            // Stall watchdog: tts_audio_begin arrived but the stream went
+            // silent with no tts_audio_end and the ring has fully drained.
+            // Without this there was NO timeout on SPEAKING — a server crash
+            // mid-stream on a healthy socket left the amp on (AEC suppressing
+            // the mic) and every non-owner wake slot gated forever. Use the
+            // same teardown as the WS-disconnect path. Suspended while a
+            // barge verify holds the pacer paused (frames stop on purpose).
+            int64_t last = s_last_tts_frame_us;
+            uint32_t used = 0, cap = 0;
+            audio_io_get_playback_buf_stats(&used, &cap);
+            if (last != 0 && used == 0 &&
+                esp_timer_get_time() - last > (int64_t)TTS_STREAM_STALL_TIMEOUT_MS * 1000) {
+                ESP_LOGW(TAG, "tts stream stalled (%d ms, ring empty, no end) — tearing down SPEAKING",
+                         TTS_STREAM_STALL_TIMEOUT_MS);
+                oe_udplog_send("[tts] stream stall watchdog fired");
+                for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
+                    if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
+                xvf3800_enable_amplifier(false);
+                airplay_note_amp_forced_off();
+                audio_io_stop_playback();
+                audio_io_flush_playback();
+                s_stream_active = false;
+                s_followup_pending_ms = 0;
+                set_ui_state(UI_STATE_IDLE);
+                airplay_resume();
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(30));
     }
@@ -1442,9 +1725,17 @@ static void tts_worker_task(void *arg)
             // VAD-start path can fire without requiring the wake word.
             int64_t now_us = esp_timer_get_time();
             int64_t followup_until = get_followup_until_us();
+            // Deferred window (reply was still in flight when await_followup
+            // arrived) starts NOW, at drain — mirror of stream_finalize_task.
+            if (s_followup_pending_ms > 0) {
+                followup_until = now_us + (int64_t)s_followup_pending_ms * 1000;
+                set_followup_until_us(followup_until);
+                s_followup_pending_ms = 0;
+            }
             if (followup_until > now_us) {
                 ESP_LOGI(TAG, "tts drained -> LISTENING (follow-up window: %lldms left)",
                          (long long)((followup_until - now_us) / 1000));
+                preroll_reset();
                 set_ui_state(UI_STATE_LISTENING);
             } else {
                 ESP_LOGI(TAG, "tts queue drained -> idle");
@@ -1453,7 +1744,6 @@ static void tts_worker_task(void *arg)
             // Reply finished — let the AirPlay session resume pushing
             // PCM. No-op if there's no active stream.
             airplay_resume();
-            xEventGroupSetBits(g_dev_events, DEV_EVT_TTS_DONE);
         }
     }
 }
@@ -1477,12 +1767,35 @@ static void mute_change_cb(bool muted)
         // Cancel any in-flight server-pushed TTS stream (server halts on stop).
         s_stream_active  = false;
         s_stream_end_req = false;
-        oe_ws_send_stop(g_dev_config.default_agent_id);
+        oe_ws_send_stop(g_dev_config.default_agent_id, s_turn_id);
         // Hard-drop any AirPlay session — physically muting a speaker
         // should disconnect the iOS sender, not just gag the output.
         airplay_stop();
     }
-    xEventGroupSetBits(g_dev_events, DEV_EVT_MUTE_TOGGLE);
+}
+
+// Stage-C gate for a confirmed speech barge: is this transcript an actual
+// interjection, or just a vocal tic / breath the local verify let through?
+// Fillers resume the paused reply instead of killing it.
+static bool transcript_is_filler(const char *t)
+{
+    // Normalize: keep letters only, lowercase.
+    char norm[24];
+    size_t k = 0;
+    for (const char *p = t; *p && k < sizeof(norm) - 1; ++p) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c >= 'a' && c <= 'z') norm[k++] = c;
+    }
+    norm[k] = 0;
+    if (k <= 2) return true;   // "uh", "mm", stray phonemes
+    static const char *kFillers[] = {
+        "umm", "uhh", "hmm", "mhm", "huh", "ahh", "ohh", "err", "hmmm",
+    };
+    for (size_t i = 0; i < sizeof(kFillers) / sizeof(kFillers[0]); ++i) {
+        if (strcmp(norm, kFillers[i]) == 0) return true;
+    }
+    return false;
 }
 
 static void capture_and_drive_task(void *arg)
@@ -1506,7 +1819,7 @@ static void capture_and_drive_task(void *arg)
     //     speech follows, close LISTENING without posting empty audio to STT.
     //   max_utterance_ms unchanged at 15 s — hard ceiling.
     vad_config_t vcfg = {
-        .energy_threshold = 800000,
+        .energy_threshold = VOICE_ENERGY_THRESHOLD,
         .silence_ms_to_end = 500,
         .no_speech_ms_to_end = 5000,
         .max_utterance_ms = 15000,
@@ -1514,7 +1827,7 @@ static void capture_and_drive_task(void *arg)
     };
     s_vad = vad_create(&vcfg);
 
-    bool in_utterance = false;
+    s_in_utterance = false;
     // Log-once guard for the capture-buffer saturation warning below —
     // without it a saturated utterance would warn on every remaining frame.
     bool capture_sat_logged = false;
@@ -1549,12 +1862,18 @@ static void capture_and_drive_task(void *arg)
         size_t n = audio_io_read_frame(frame, WW_FRAME_SAMPLES, 200);
         if (n < WW_FRAME_SAMPLES) continue;
 
+        // Keep the pre-roll ring warm while not capturing, so a follow-up
+        // VAD-start can prepend the speech onset it (by definition) missed.
+        // Reset at every window-arm point, so by the time a window is open
+        // this only ever holds post-reply room audio, never our own TTS.
+        if (!s_in_utterance) preroll_append(frame, n);
+
         // Resume paused ambient once the turn is COMPLETELY over: not capturing
         // a command, not waiting on a reply, no TTS streaming/queued, and no
         // follow-up window open. This single check covers every turn-end path
         // (reply spoken, STT failed, empty reply, watchdog) — they all land
         // back here at full idle, where the rain should pick back up.
-        if (s_ambient_paused && !in_utterance && !s_awaiting_reply && !s_stream_active &&
+        if (s_ambient_paused && !s_in_utterance && !s_awaiting_reply && !s_stream_active &&
             get_followup_until_us() == 0 &&
             !alarm_is_firing() &&
             uxQueueMessagesWaiting(s_sentence_q) == 0 && token_accum_empty()) {
@@ -1567,7 +1886,7 @@ static void capture_and_drive_task(void *arg)
         // stock hey_computer) re-arms LISTENING on near-silence — see the
         // 28754 ms entry in the 2026-05-15 trace. Resumes feeding the moment
         // tts_worker_task transitions to SPEAKING.
-        if (s_awaiting_reply && !in_utterance) {
+        if (s_awaiting_reply && !s_in_utterance) {
             // Watchdog: a normal reply clears s_awaiting_reply (TTS begin /
             // chat done / STT fail). If the WS dropped mid-turn or the server
             // went silent, nothing clears it and this gate would deafen the
@@ -1581,6 +1900,7 @@ static void capture_and_drive_task(void *arg)
                          AWAITING_REPLY_TIMEOUT_MS);
                 s_awaiting_reply = false;
                 set_awaiting_since_us(0);
+                s_followup_pending_ms = 0;   // reply died — no window to defer
                 set_ui_state(UI_STATE_IDLE);
                 airplay_resume();
                 // fall through — resume wake inference this frame
@@ -1593,7 +1913,11 @@ static void capture_and_drive_task(void *arg)
             }
         }
 
-        if (!in_utterance) {
+        if (!s_in_utterance) {
+            // Set when THIS frame's fire came from the follow-up VAD-start
+            // path — the only fire type that prepends pre-roll (a wake-word
+            // fire must NOT: pre-roll would include the wake phrase itself).
+            bool fired_from_followup = false;
             // Follow-up listening: if the server armed a window after its
             // last reply ended with a "?", treat any voice activity in this
             // frame as a wake fire so the user can answer without saying
@@ -1616,6 +1940,106 @@ static void capture_and_drive_task(void *arg)
                     pending_slot = s_followup_slot;
                     pending_prob = 255;
                     pending_age = 1;
+                    fired_from_followup = true;
+                }
+            }
+
+            // ── Speech barge-in (conversation mode): pause-then-verify ──────
+            // Runs only while OUR streamed reply plays. Ambient/AirPlay keep
+            // the wake word as their barge path — their audio isn't a
+            // conversation. See the barge_state_t block at file scope for the
+            // three-stage design (candidate → local verify → STT commit).
+            if (s_conversation_mode && s_stream_active) {
+                if (s_barge_state == BARGE_NONE && !s_paused_for_barge) {
+                    uint32_t fe = frame_energy(frame, n);
+                    // Rolling floor: EMA (α=1/8) of the reply+room energy as
+                    // heard by the AEC-suppressed mic. The trigger is
+                    // relative to it so pre-existing noise (TV) is absorbed
+                    // into the baseline instead of firing candidates.
+                    s_speak_floor = s_speak_floor
+                        ? s_speak_floor - s_speak_floor / 8 + fe / 8 : fe;
+                    uint64_t trigger = (uint64_t)s_speak_floor * BARGE_FLOOR_MULT;
+                    if (trigger < VOICE_ENERGY_THRESHOLD) trigger = VOICE_ENERGY_THRESHOLD;
+                    if ((uint64_t)fe > trigger) {
+                        if (++s_barge_consec >= BARGE_CONSEC_FRAMES) {
+                            s_barge_consec = 0;
+                            // Mute FIRST (local, ~instant): pausing playback
+                            // + dropping amp_en is what un-suppresses the mic
+                            // for the verify. Then stall the server pacer.
+                            // (The WS send can block up to 1 s worst-case on
+                            // this task — the audible pause already happened,
+                            // and verify timing keys off s_barge_started_us.)
+                            audio_io_pause_playback();
+                            xvf3800_enable_amplifier(false);
+                            s_paused_for_barge = true;
+                            s_barge_state = BARGE_VERIFYING;
+                            s_barge_started_us = esp_timer_get_time();
+                            s_barge_speech_ms = 0;
+                            set_ui_state(UI_STATE_LISTENING);
+                            if (s_caps_tts_pause) oe_ws_send_tts_pause(s_turn_id);
+                            char bl[96];
+                            snprintf(bl, sizeof(bl), "[barge] candidate fe=%u floor=%u",
+                                     (unsigned)fe, (unsigned)s_speak_floor);
+                            ESP_LOGI(TAG, "%s", bl); oe_udplog_send(bl);
+                        }
+                    } else {
+                        s_barge_consec = 0;
+                    }
+                } else if (s_barge_state == BARGE_VERIFYING) {
+                    int64_t now_us = esp_timer_get_time();
+                    uint32_t since_ms = (uint32_t)((now_us - s_barge_started_us) / 1000);
+                    // Skip the settle window: the mic gain steps up when
+                    // amp_en drops and the first frames read artificially
+                    // hot/cold. BARGE_SETTLE_MS is provisional — the [barge]
+                    // logs measure the real step response in the field.
+                    if (since_ms > BARGE_SETTLE_MS && frame_is_speech(frame, n)) {
+                        s_barge_speech_ms += (uint32_t)((n * 1000) / 16000);
+                    }
+                    if (s_barge_speech_ms >= BARGE_CONFIRM_SPEECH_MS) {
+                        // Confirmed speech — capture it as an utterance. The
+                        // paused reply is DELIBERATELY kept (not flushed):
+                        // stage C below only kills it if STT proves the
+                        // interjection real, so a cough costs a short pause,
+                        // never the rest of the answer.
+                        oe_udplog_send("[barge] speech confirmed — capturing");
+                        s_barge_state = BARGE_NONE;
+                        s_barge_capture = true;
+                        vad_reset(s_vad);
+                        // Pre-roll = the verify-window audio (all post-pause,
+                        // speaker silent) so STT hears the interjection from
+                        // its first word. Confirm takes ≥500 ms and pre-roll
+                        // holds 400 ms — never includes pre-pause reply bleed.
+                        s_capture_used = preroll_copy_out(s_capture_buf, PREROLL_SAMPLES);
+                        capture_sat_logged = false;
+                        s_in_utterance = true;
+                        // Slot stays s_active_slot (the turn owner). Turn id
+                        // is minted at stage-C commit; until then pause/
+                        // resume flow control still names the CURRENT turn.
+                    } else if (since_ms >= BARGE_VERIFY_WINDOW_MS) {
+                        // False alarm — resume the reply where it paused.
+                        char bl[64];
+                        snprintf(bl, sizeof(bl), "[barge] false alarm (%ums speech) — resume",
+                                 (unsigned)s_barge_speech_ms);
+                        ESP_LOGI(TAG, "%s", bl); oe_udplog_send(bl);
+                        s_barge_state = BARGE_NONE;
+                        s_paused_for_barge = false;
+                        xvf3800_enable_amplifier(true);
+                        audio_io_resume_playback();
+                        set_ui_state(UI_STATE_SPEAKING);
+                        if (s_caps_tts_pause) oe_ws_send_tts_resume(s_turn_id);
+                    }
+                }
+            } else if (s_barge_state != BARGE_NONE || s_paused_for_barge || s_speak_floor != 0) {
+                // Stream ended (teardown, server pause-abort, mode toggle)
+                // while the machine was engaged — reset, and critically
+                // release OUR playback pause: a stranded s_paused flag would
+                // silently stall every future TTS reply (ring fills, drops).
+                s_barge_state = BARGE_NONE;
+                s_barge_consec = 0;
+                s_speak_floor = 0;
+                if (s_paused_for_barge) {
+                    s_paused_for_barge = false;
+                    audio_io_resume_playback();
                 }
             }
 
@@ -1675,6 +2099,15 @@ static void capture_and_drive_task(void *arg)
             }
 
             if (fired) {
+                // A wake fire supersedes any speech-barge verify in flight:
+                // release OUR playback pause so the barge-in cleanup below
+                // (stop/flush) owns the audio engine outright.
+                if (s_paused_for_barge) {
+                    s_paused_for_barge = false;
+                    s_barge_state = BARGE_NONE;
+                    s_barge_capture = false;
+                    audio_io_resume_playback();
+                }
                 // Visual ack FIRST. Everything below this point — barge-in
                 // cleanup, WS stop send, ringbuffer flush — has variable
                 // latency (the WS send is the main offender, ~50-500 ms
@@ -1729,7 +2162,7 @@ static void capture_and_drive_task(void *arg)
                     // The server halts the push on the stop below.
                     s_stream_active  = false;
                     s_stream_end_req = false;
-                    oe_ws_send_stop(g_dev_config.default_agent_id);
+                    oe_ws_send_stop(g_dev_config.default_agent_id, s_turn_id);
                     // Drain queued TTS sentences and partial-token accumulator.
                     // Without this, tts_worker_task will pull whatever was
                     // buffered from the just-aborted reply and start speaking
@@ -1737,18 +2170,58 @@ static void capture_and_drive_task(void *arg)
                     // barge-in look broken (the original reply keeps going).
                     xQueueReset(s_sentence_q);
                     reset_token_accum();
-                    xEventGroupSetBits(g_dev_events, DEV_EVT_BARGE_IN);
                 }
+                // New turn starts here. Mint AFTER the barge-in block above —
+                // its stop frame must carry the OLD turn's id (the turn being
+                // stopped), not this new one's.
+                mint_turn_id();
                 vad_reset(s_vad);
                 s_capture_used = 0;
                 capture_sat_logged = false;
-                in_utterance = true;
-                xEventGroupSetBits(g_dev_events, DEV_EVT_WAKE_DETECTED);
+                if (fired_from_followup) {
+                    // Prepend the pre-roll (oldest→newest) so the onset of the
+                    // answer — which necessarily happened BEFORE this frame
+                    // crossed the energy threshold — reaches STT instead of
+                    // being clipped. Buffer headroom is guaranteed: capture is
+                    // 16 s for a 15 s VAD ceiling, pre-roll is 0.4 s.
+                    s_capture_used = preroll_copy_out(s_capture_buf, PREROLL_SAMPLES);
+                }
+                // Streaming STT: open the server-side session and ship any
+                // pre-rolled onset immediately. Failure at any point just
+                // falls back to the buffered HTTP path at VAD-end.
+                s_stt_streaming = s_caps_stt_stream && oe_ws_connected();
+                s_stt_send_failed = false;
+                s_stt_seq = 0;
+                if (s_stt_streaming) {
+                    if (oe_ws_send_stt_begin(s_turn_id, s_active_slot,
+                                             s_active_wake_prob,
+                                             g_dev_config.default_agent_id) != ESP_OK) {
+                        s_stt_streaming = false;
+                    } else {
+                        for (size_t off = 0; off < s_capture_used && !s_stt_send_failed; off += WW_FRAME_SAMPLES) {
+                            size_t chunk = s_capture_used - off;
+                            if (chunk > WW_FRAME_SAMPLES) chunk = WW_FRAME_SAMPLES;
+                            if (oe_ws_send_stt_frame(s_capture_buf + off, chunk, s_stt_seq++) != ESP_OK) {
+                                s_stt_send_failed = true;
+                            }
+                        }
+                    }
+                }
+                s_in_utterance = true;
             }
         } else {
             if (s_capture_used + n < CAPTURE_BUFFER_SAMPLES) {
                 memcpy(s_capture_buf + s_capture_used, frame, n * sizeof(int16_t));
                 s_capture_used += n;
+                // Streaming STT: ship this frame now so the upload overlaps
+                // the user's speech. One failure flips to the HTTP fallback
+                // for the rest of the utterance (buffer keeps accumulating).
+                if (s_stt_streaming && !s_stt_send_failed) {
+                    if (oe_ws_send_stt_frame(frame, n, s_stt_seq++) != ESP_OK) {
+                        s_stt_send_failed = true;
+                        oe_udplog_send("[stt] frame send failed — buffered HTTP fallback armed");
+                    }
+                }
             } else if (!capture_sat_logged) {
                 // Saturated mid-utterance: STT will get a truncated question.
                 // Should be unreachable now that the buffer (16 s) exceeds
@@ -1761,10 +2234,29 @@ static void capture_and_drive_task(void *arg)
             vad_end_reason_t end_reason = VAD_END_NONE;
             vad_feed(s_vad, frame, n, &end_reason);
             if (end_reason != VAD_END_NONE) {
-                in_utterance = false;
-                xEventGroupSetBits(g_dev_events, DEV_EVT_VAD_END);
+                s_in_utterance = false;
 
                 if (end_reason == VAD_END_NO_SPEECH) {
+                    if (s_stt_streaming) {
+                        // Nothing worth transcribing — tell the server to
+                        // drop the accumulated session (it would TTL out
+                        // anyway; this is just prompt cleanup).
+                        s_stt_streaming = false;
+                        oe_ws_send_stt_abort(s_turn_id);
+                    }
+                    if (s_barge_capture) {
+                        // Confirmed energy but no sustained speech followed —
+                        // resume the paused reply where it left off.
+                        s_barge_capture = false;
+                        oe_udplog_send("[barge] no speech after confirm — resuming reply");
+                        s_paused_for_barge = false;
+                        xvf3800_enable_amplifier(true);
+                        audio_io_resume_playback();
+                        set_ui_state(UI_STATE_SPEAKING);
+                        if (s_caps_tts_pause) oe_ws_send_tts_resume(s_turn_id);
+                        s_capture_used = 0;
+                        continue;
+                    }
                     ESP_LOGI(TAG, "wake capture ended after %ums with no speech; skipping STT",
                              (unsigned)vad_elapsed_ms(s_vad));
                     oe_udplog_send("[voice] no speech after wake; skipping STT");
@@ -1780,11 +2272,71 @@ static void capture_and_drive_task(void *arg)
                 s_awaiting_reply = true;
                 set_awaiting_since_us(esp_timer_get_time());  // arm watchdog
 
+                // Streaming STT hand-off: every frame already reached the
+                // server; stt_end makes IT transcribe + dispatch the turn.
+                // The reply then arrives over the normal token/tts events
+                // (guarded by the same 90 s THINKING watchdog). Any earlier
+                // send failure — or a failed stt_end itself — falls through
+                // to the buffered HTTP path below; the server side of the
+                // half-sent session just TTLs out.
+                if (s_stt_streaming) {
+                    bool stream_clean = !s_stt_send_failed;
+                    s_stt_streaming = false;
+                    if (stream_clean &&
+                        oe_ws_send_stt_end(s_turn_id, (uint32_t)s_capture_used) == ESP_OK) {
+                        s_capture_used = 0;
+                        continue;
+                    }
+                    oe_udplog_send("[stt] stream fallback — posting buffered utterance");
+                }
+
                 char transcript[512] = {0};
-                if (oe_stt_post(g_dev_config.server_url, g_dev_config.token,
-                                s_capture_buf, s_capture_used,
-                                transcript, sizeof(transcript)) == ESP_OK &&
-                    transcript[0]) {
+                bool stt_ok = oe_stt_post(g_dev_config.server_url, g_dev_config.token,
+                                          s_capture_buf, s_capture_used,
+                                          transcript, sizeof(transcript)) == ESP_OK &&
+                              transcript[0];
+                const bool barge = s_barge_capture;
+                s_barge_capture = false;
+
+                if (barge && (!stt_ok || transcript_is_filler(transcript))) {
+                    // Stage C says NOT a real interjection (empty transcript /
+                    // vocal tic) — the reply we kept paused resumes intact.
+                    // Total cost of the false positive: a few seconds' pause.
+                    char bl[96];
+                    snprintf(bl, sizeof(bl), "[barge] not real (\"%.32s\") — resuming reply",
+                             stt_ok ? transcript : "");
+                    ESP_LOGI(TAG, "%s", bl); oe_udplog_send(bl);
+                    s_awaiting_reply = false;
+                    set_awaiting_since_us(0);
+                    s_paused_for_barge = false;
+                    xvf3800_enable_amplifier(true);
+                    audio_io_resume_playback();
+                    set_ui_state(UI_STATE_SPEAKING);
+                    if (s_caps_tts_pause) oe_ws_send_tts_resume(s_turn_id);
+                    s_capture_used = 0;
+                    continue;
+                }
+
+                if (stt_ok) {
+                    if (barge) {
+                        // Stage-C commit: the interjection is real — NOW kill
+                        // the paused reply and stop its turn server-side. The
+                        // stop names the OLD turn; the chat below carries a
+                        // freshly minted one.
+                        oe_udplog_send("[barge] interjection real — interrupting reply");
+                        s_paused_for_barge = false;
+                        audio_io_resume_playback();   // release pause flag before stop
+                        audio_io_stop_playback();
+                        audio_io_flush_playback();
+                        s_stream_active  = false;
+                        s_stream_end_req = false;
+                        for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
+                            if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
+                        oe_ws_send_stop(g_dev_config.default_agent_id, s_turn_id);
+                        mint_turn_id();
+                        // amp stays off (dropped at the pause); the next
+                        // tts_audio_begin re-enables it for the new reply.
+                    }
                     // Final-second cleanup: tokens from the just-aborted
                     // chat can keep arriving for up to ~2 s after barge-in
                     // (server's WS send buffer + Node's net layer). Without
@@ -1797,8 +2349,22 @@ static void capture_and_drive_task(void *arg)
                     reset_token_accum();
                     // s_active_slot was set when this utterance's wake word
                     // fired. Server uses it to look up slot_agent_map[N].
-                    oe_ws_send_chat(g_dev_config.default_agent_id, transcript,
-                                    s_active_slot, s_active_wake_prob);
+                    esp_err_t ce = oe_ws_send_chat(g_dev_config.default_agent_id, transcript,
+                                                   s_active_slot, s_active_wake_prob, s_turn_id);
+                    if (ce != ESP_OK) {
+                        // Send failed (WS send timeout / socket flapping):
+                        // no reply is coming, so re-open the wake feed NOW.
+                        // Ignoring this return used to leave the THINKING
+                        // gate armed for the full 90 s watchdog — and the
+                        // user's utterance silently vanished with the UI
+                        // stuck on THINKING.
+                        ESP_LOGE(TAG, "chat send failed (%s) — turn dropped", esp_err_to_name(ce));
+                        oe_udplog_send("[voice] chat send failed — turn dropped, back to IDLE");
+                        s_awaiting_reply = false;
+                        set_awaiting_since_us(0);
+                        set_ui_state(UI_STATE_IDLE);
+                        airplay_resume();
+                    }
                 } else {
                     // STT failed / empty transcript — no reply is coming, so
                     // re-open the wake-word feed immediately rather than
@@ -2214,6 +2780,17 @@ static void boot_operational(void)
     if (!s_token_mutex) { ESP_LOGE(TAG, "token mutex alloc"); esp_restart(); }
     s_capture_buf = malloc(CAPTURE_BUFFER_SAMPLES * sizeof(int16_t));
     if (!s_capture_buf) { ESP_LOGE(TAG, "capture buf alloc"); esp_restart(); }
+    // Pre-roll ring (12.8 KB). PSRAM preferred; internal fallback; NULL is
+    // fine — preroll_* helpers no-op and follow-up capture just loses onsets.
+    s_preroll_buf = heap_caps_malloc(PREROLL_SAMPLES * sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_preroll_buf) s_preroll_buf = malloc(PREROLL_SAMPLES * sizeof(int16_t));
+    if (!s_preroll_buf) ESP_LOGW(TAG, "preroll alloc failed — follow-up onset capture disabled");
+
+    // Per-boot turn-id prefix: distinguishes this boot's turns from a
+    // pre-reboot turn's stale events still queued server-side.
+    snprintf(s_turn_prefix, sizeof(s_turn_prefix), "%04x",
+             (unsigned)(esp_random() & 0xFFFF));
 
     oe_ws_start(g_dev_config.server_url, g_dev_config.token, ws_event_cb, NULL);
 
@@ -2406,9 +2983,6 @@ static void boot_provisioning(void)
 
 void app_main(void)
 {
-    g_dev_events = xEventGroupCreate();
-    g_dev_state = DEV_STATE_BOOT;
-
     nvs_creds_init();
     esp_netif_init();
     esp_event_loop_create_default();

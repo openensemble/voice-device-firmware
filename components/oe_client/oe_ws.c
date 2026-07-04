@@ -23,7 +23,19 @@ static size_t s_msg_accum_cap = 0;
 static void emit(oe_ws_event_t t, const char *text, size_t len)
 {
     if (!s_cb) return;
-    oe_ws_payload_t p = { .type = t, .text = text, .text_len = len };
+    oe_ws_payload_t p = { .type = t, .text = text, .text_len = len, .turn_id = NULL };
+    s_cb(&p, s_cb_user);
+}
+
+// emit + the message's turn_id (NULL when the server didn't include one).
+static void emit_turn(oe_ws_event_t t, const char *text, size_t len, const cJSON *j)
+{
+    if (!s_cb) return;
+    const cJSON *jt = cJSON_GetObjectItem(j, "turn_id");
+    oe_ws_payload_t p = {
+        .type = t, .text = text, .text_len = len,
+        .turn_id = (cJSON_IsString(jt) && jt->valuestring[0]) ? jt->valuestring : NULL,
+    };
     s_cb(&p, s_cb_user);
 }
 
@@ -51,25 +63,29 @@ static void handle_message(const char *data, size_t len)
     } else if (strcmp(type, "token") == 0) {
         const cJSON *jtxt = cJSON_GetObjectItem(j, "text");
         if (jtxt && cJSON_IsString(jtxt)) {
-            emit(OE_WS_EVT_CHAT_TOKEN, jtxt->valuestring, strlen(jtxt->valuestring));
+            emit_turn(OE_WS_EVT_CHAT_TOKEN, jtxt->valuestring, strlen(jtxt->valuestring), j);
         }
     } else if (strcmp(type, "done") == 0) {
-        emit(OE_WS_EVT_CHAT_DONE, NULL, 0);
+        emit_turn(OE_WS_EVT_CHAT_DONE, NULL, 0, j);
     } else if (strcmp(type, "tts_audio_begin") == 0) {
-        emit(OE_WS_EVT_TTS_AUDIO_BEGIN, NULL, 0);
+        emit_turn(OE_WS_EVT_TTS_AUDIO_BEGIN, NULL, 0, j);
     } else if (strcmp(type, "tts_audio") == 0) {
         const cJSON *jp = cJSON_GetObjectItem(j, "pcm_b64");
         if (cJSON_IsString(jp) && jp->valuestring)
-            emit(OE_WS_EVT_TTS_AUDIO, jp->valuestring, strlen(jp->valuestring));
+            emit_turn(OE_WS_EVT_TTS_AUDIO, jp->valuestring, strlen(jp->valuestring), j);
     } else if (strcmp(type, "tts_audio_end") == 0) {
-        emit(OE_WS_EVT_TTS_AUDIO_END, NULL, 0);
+        emit_turn(OE_WS_EVT_TTS_AUDIO_END, NULL, 0, j);
     } else if (strcmp(type, "duplicate_suppressed") == 0) {
         emit(OE_WS_EVT_DUPLICATE_SUPPRESSED, NULL, 0);
     } else if (strcmp(type, "error") == 0) {
         const cJSON *jmsg = cJSON_GetObjectItem(j, "message");
         if (jmsg && cJSON_IsString(jmsg)) {
-            emit(OE_WS_EVT_ERROR, jmsg->valuestring, strlen(jmsg->valuestring));
+            emit_turn(OE_WS_EVT_ERROR, jmsg->valuestring, strlen(jmsg->valuestring), j);
         }
+    } else if (strcmp(type, "server_caps") == 0) {
+        emit(OE_WS_EVT_SERVER_CAPS, data, len);
+    } else if (strcmp(type, "set_conversation_mode") == 0) {
+        emit(OE_WS_EVT_SET_CONVERSATION_MODE, data, len);
     } else if (strcmp(type, "ww_upload") == 0) {
         // Pass the raw JSON message up to main.c — it owns the SPIFFS
         // writer + the wakeword_t array. Keeping the parse + b64 decode
@@ -280,7 +296,7 @@ bool oe_ws_connected(void)
     return s_ws && esp_websocket_client_is_connected(s_ws);
 }
 
-esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob)
+esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
@@ -292,6 +308,9 @@ esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_s
     cJSON_AddNumberToObject(o, "wake_slot", wake_slot);
     cJSON_AddNumberToObject(o, "wake_avg_prob", wake_avg_prob);
     cJSON_AddStringToObject(o, "source", "voice-device");
+    // Device-minted turn correlation id. Older servers ignore it; newer ones
+    // echo it on every event of this turn so stale-turn events are droppable.
+    if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
     // Opt into server-side TTS streaming: the server segments + synthesizes +
     // pushes PCM audio frames instead of raw tokens (this firmware plays them).
     cJSON_AddBoolToObject(o, "tts_stream", true);
@@ -300,13 +319,90 @@ esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_s
     return err;
 }
 
-esp_err_t oe_ws_send_stop(const char *agent_id)
+esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "stop");
     // Omitted when empty — the server falls back to the user's coordinator.
     if (agent_id && agent_id[0]) cJSON_AddStringToObject(o, "agent", agent_id);
+    // Id of the turn being stopped (NOT a new turn's id) so the server can
+    // ignore a stale stop that races a newer turn on the same socket.
+    if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
+    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    cJSON_Delete(o);
+    return err;
+}
+
+static esp_err_t send_tts_flow(const char *type, const char *turn_id)
+{
+    if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", type);
+    if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
+    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    cJSON_Delete(o);
+    return err;
+}
+
+esp_err_t oe_ws_send_tts_pause(const char *turn_id)  { return send_tts_flow("tts_pause",  turn_id); }
+esp_err_t oe_ws_send_tts_resume(const char *turn_id) { return send_tts_flow("tts_resume", turn_id); }
+
+esp_err_t oe_ws_send_stt_begin(const char *turn_id, uint8_t wake_slot,
+                               uint8_t wake_avg_prob, const char *agent_id)
+{
+    if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "stt_begin");
+    if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
+    cJSON_AddNumberToObject(o, "wake_slot", wake_slot);
+    cJSON_AddNumberToObject(o, "wake_avg_prob", wake_avg_prob);
+    if (agent_id && agent_id[0]) cJSON_AddStringToObject(o, "agent", agent_id);
+    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    cJSON_Delete(o);
+    return err;
+}
+
+// Binary frame: 'OEA1' + u32 LE seq + payload. Static buffer is safe — only
+// the capture/drive task streams frames, one at a time.
+esp_err_t oe_ws_send_stt_frame(const int16_t *samples, size_t n_samples, uint32_t seq)
+{
+    static uint8_t buf[8 + OE_STT_FRAME_MAX_SAMPLES * sizeof(int16_t)];
+    if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    if (!samples || n_samples == 0 || n_samples > OE_STT_FRAME_MAX_SAMPLES) return ESP_ERR_INVALID_ARG;
+    buf[0] = 'O'; buf[1] = 'E'; buf[2] = 'A'; buf[3] = '1';
+    buf[4] = (uint8_t)(seq & 0xFF);
+    buf[5] = (uint8_t)((seq >> 8) & 0xFF);
+    buf[6] = (uint8_t)((seq >> 16) & 0xFF);
+    buf[7] = (uint8_t)((seq >> 24) & 0xFF);
+    memcpy(buf + 8, samples, n_samples * sizeof(int16_t));
+    // Short timeout: at the 80 ms frame cadence a congested socket must fail
+    // fast so the caller can flip to the buffered-HTTP fallback rather than
+    // stalling the capture loop (the 16 KB capture ring only holds ~0.5 s).
+    int rc = esp_websocket_client_send_bin(s_ws, (const char *)buf,
+                                           8 + n_samples * sizeof(int16_t),
+                                           pdMS_TO_TICKS(150));
+    return rc < 0 ? ESP_FAIL : ESP_OK;
+}
+
+esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples)
+{
+    if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "stt_end");
+    if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
+    cJSON_AddNumberToObject(o, "samples", total_samples);
+    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(2000));
+    cJSON_Delete(o);
+    return err;
+}
+
+esp_err_t oe_ws_send_stt_abort(const char *turn_id)
+{
+    if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "stt_abort");
+    if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
     esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
     cJSON_Delete(o);
     return err;

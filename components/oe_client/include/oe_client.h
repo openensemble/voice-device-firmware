@@ -107,12 +107,29 @@ typedef enum {
     OE_WS_EVT_TTS_AUDIO_BEGIN,
     OE_WS_EVT_TTS_AUDIO,
     OE_WS_EVT_TTS_AUDIO_END,
+    // { type:'server_caps', turn_ids, tts_pause, stt_stream } — sent once
+    // after auth. Raw JSON payload; main.c stores the capability flags so
+    // newer device→server messages are only sent to servers that understand
+    // them. Flags reset on disconnect (the next server may be older).
+    OE_WS_EVT_SERVER_CAPS,
+    // { type:'set_conversation_mode', enabled } — per-device toggle from
+    // Settings. Enables the speech barge-in VAD during SPEAKING (main.c
+    // pause-then-verify state machine). Raw JSON payload. Not persisted:
+    // the server reconciles it on every connect, and conversation features
+    // are meaningless without a live server anyway.
+    OE_WS_EVT_SET_CONVERSATION_MODE,
 } oe_ws_event_t;
 
 typedef struct {
     oe_ws_event_t type;
     const char *text;
     size_t text_len;
+    // Optional turn correlation id echoed by the server on token/done/
+    // tts_audio_*/await_followup/error. NULL or empty when the server didn't
+    // send one (older server) — treat as "accept" for compatibility. main.c
+    // drops events whose turn_id mismatches the device's current turn, which
+    // kills the whole family of aborted-turn-events-race-the-next-turn bugs.
+    const char *turn_id;
 } oe_ws_payload_t;
 
 typedef void (*oe_ws_callback_t)(const oe_ws_payload_t *evt, void *user);
@@ -122,8 +139,35 @@ esp_err_t oe_ws_start(const char *server_url, const char *token,
 esp_err_t oe_ws_stop(void);
 bool      oe_ws_connected(void);
 
-esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob);
-esp_err_t oe_ws_send_stop(const char *agent_id);
+// turn_id: device-minted correlation id for this turn (NULL/"" = omit —
+// pre-turn-id behavior). The server adopts it and echoes it on every event
+// belonging to the turn; a stop must carry the id of the turn being stopped.
+esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id);
+esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id);
+
+// Speech barge-in flow control (send ONLY when server_caps.tts_pause).
+// tts_pause stalls the server's PCM pacer while the device verifies a
+// barge-in candidate; tts_resume un-stalls it after a false alarm. The
+// server auto-aborts the stream ~20 s after an unresumed pause, so a lost
+// resume degrades to a truncated reply, never a wedged pacer.
+esp_err_t oe_ws_send_tts_pause(const char *turn_id);
+esp_err_t oe_ws_send_tts_resume(const char *turn_id);
+
+// ── Streaming STT (send ONLY when server_caps.stt_stream) ──────────────────
+// Instead of buffering the whole utterance and blocking on one HTTP POST,
+// the capture loop streams each 80 ms frame as a binary WS frame ('OEA1'
+// magic + u32 LE seq + s16le mono 16 kHz PCM) between stt_begin and stt_end.
+// The server transcribes at stt_end and dispatches the turn itself — the
+// device goes straight to THINKING and the reply arrives over the normal
+// token / tts_audio_* events. stt_abort drops a no-speech capture. Any send
+// failure mid-utterance → caller falls back to the buffered oe_stt_post path
+// (the capture buffer is still filled in parallel precisely for this).
+#define OE_STT_FRAME_MAX_SAMPLES 1280
+esp_err_t oe_ws_send_stt_begin(const char *turn_id, uint8_t wake_slot,
+                               uint8_t wake_avg_prob, const char *agent_id);
+esp_err_t oe_ws_send_stt_frame(const int16_t *samples, size_t n_samples, uint32_t seq);
+esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples);
+esp_err_t oe_ws_send_stt_abort(const char *turn_id);
 
 // Tell the server the device tore down ambient playback on its own (e.g.
 // the user hit the physical mute button). Without this the server keeps its

@@ -2,8 +2,6 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 
 #define OE_WAKEWORD_SLOTS 4
 #define OE_AGENT_ID_MAX   64
@@ -11,18 +9,12 @@
 #define OE_URL_MAX        256
 #define OE_DEVICE_NAME_MAX 64
 
-typedef enum {
-    DEV_STATE_BOOT = 0,
-    DEV_STATE_PROVISION,
-    DEV_STATE_CONNECTING,
-    DEV_STATE_IDLE,
-    DEV_STATE_WAKE,
-    DEV_STATE_CAPTURE,
-    DEV_STATE_STT,
-    DEV_STATE_CHAT,
-    DEV_STATE_TTS,
-    DEV_STATE_ERROR,
-} dev_state_t;
+// NOTE: this header used to also declare a dev_state_t/g_dev_state enum and a
+// g_dev_events FreeRTOS event group with DEV_EVT_* bits. Nothing ever waited
+// on them — the live state machine is the ui_state_t LED state plus the
+// volatile flags in main.c (s_awaiting_reply, s_stream_active, s_in_utterance,
+// s_followup_until_us). Removed 2026-07-04; don't reintroduce a parallel
+// state layer here.
 
 typedef struct {
     char token[OE_TOKEN_MAX];
@@ -34,18 +26,4 @@ typedef struct {
     bool muted;
 } dev_config_t;
 
-extern dev_state_t g_dev_state;
 extern dev_config_t g_dev_config;
-
-#define DEV_EVT_WAKE_DETECTED    (1 << 0)
-#define DEV_EVT_VAD_END          (1 << 1)
-#define DEV_EVT_STT_DONE         (1 << 2)
-#define DEV_EVT_CHAT_TOKEN       (1 << 3)
-#define DEV_EVT_CHAT_DONE        (1 << 4)
-#define DEV_EVT_TTS_DONE         (1 << 5)
-#define DEV_EVT_MUTE_TOGGLE      (1 << 6)
-#define DEV_EVT_BARGE_IN         (1 << 7)
-#define DEV_EVT_NET_DOWN         (1 << 8)
-#define DEV_EVT_DUPLICATE_LOST   (1 << 9)
-
-extern EventGroupHandle_t g_dev_events;
