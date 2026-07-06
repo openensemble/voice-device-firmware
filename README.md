@@ -6,6 +6,13 @@ voice satellite: on-device wake words, far-field capture with hardware AEC,
 and a WebSocket link to your OE server, which does all the heavy lifting
 (STT, LLM, TTS).
 
+This is the device half of OpenEnsemble's voice system — a fully open,
+self-hosted alternative to an Alexa- or Google-Home-style smart speaker:
+open hardware, open firmware, and a server you run yourself. Prebuilt
+binaries ship with every OE install (with a browser-based flash wizard), so
+you only need this repo to hack on the firmware itself. Overview:
+[Voice devices](https://openensemble.github.io/openensemble/voice-devices).
+
 ## What it does
 
 - **Wake words on-device** — [microWakeWord](https://github.com/kahrendt/microWakeWord)
@@ -77,6 +84,13 @@ afterwards.
 | Managed components (TFLM, esp-nn, micro-speech features, libhelix-mp3, esp_websocket_client, mdns) | Pinned in `main/idf_component.yml`, fetched at configure time | Apache-2.0 / MIT |
 
 Everything else is original OpenEnsemble code.
+
+## Getting help
+
+Questions, build problems, or hardware ideas? Ask in
+[OpenEnsemble Discussions](https://github.com/openensemble/openensemble/discussions)
+— the server and firmware share one community. Bugs specific to this
+firmware are welcome in this repo's issues.
 
 ## License
 
