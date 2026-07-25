@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -22,8 +23,17 @@ static RingbufHandle_t s_speech_rb  = NULL;    // SPEECH lane: TTS replies / ann
 
 static volatile bool s_playback_active = false;
 static volatile bool s_capture_active = false;
-static volatile bool s_flush_music_req = false;
-static volatile bool s_flush_speech_req = false;
+// Flush requests are lane fences, not bare task hints. A request cancels
+// already-admitted writers, blocks later admissions, and remains asserted
+// until the playback task (or the acknowledged verify-gate owner) drains the
+// lane. This prevents a writer that was blocked on a full ring from refilling
+// it just after a destructive flush.
+static bool s_flush_music_req = false;
+static bool s_flush_speech_req = false;
+static bool s_flush_music_servicing = false;
+static bool s_flush_speech_servicing = false;
+static uint32_t s_flush_music_seq = 0;
+static uint32_t s_flush_speech_seq = 0;
 
 // ── Ducking mixer state ──────────────────────────────────────────────────────
 // While the speech lane has audio queued (plus a short hangover so inter-
@@ -60,11 +70,35 @@ static volatile uint32_t s_playback_drop_samples = 0;
 // by main.c on boot.
 static volatile uint8_t s_volume_pct = 80;
 
-// Pause flag — when true, playback_task stalls without draining the
-// ringbuffer or writing to I²S. Used by the voice control flow so a
-// "<wake word>, pause" doesn't lose the rest of the TTS queue (resume picks
-// up where we left off).
+// Normal pause flag — controlled by the existing pause/resume API. The
+// verify-gate hold below is deliberately independent: a user/RAOP resume
+// racing a provisional wake must not release audio before the gate verdict.
 static volatile bool s_paused = false;
+// Verify-gate state. Hold acquisition is a two-phase request/acknowledgement:
+// the playback task acknowledges only at its loop boundary, after any prior
+// dequeue/flush/I2S write has completed. The caller does not observe HELD
+// until that acknowledgement, so a successful return is a real quiescence
+// boundary rather than a racy volatile store.
+static portMUX_TYPE s_gate_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool         s_gate_requested = false;
+static bool         s_gate_held = false;
+static bool         s_playback_work_active = false;
+static uint32_t     s_gate_request_seq = 0;
+static uint32_t     s_gate_ack_seq = 0;
+
+// Writer fences for destructive verify/mute boundaries. Each admitted writer
+// snapshots its lane cancellation generation. Blocking or flushing a lane
+// advances that generation, and ring sends poll it in short intervals so an
+// old writer cannot remain stuck for the former 200 ms per chunk.
+static portMUX_TYPE s_music_writer_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool         s_music_writes_blocked = false;
+static uint32_t     s_music_writers = 0;
+static uint32_t     s_music_cancel_generation = 0;
+static SemaphoreHandle_t s_music_write_mutex = NULL;
+static portMUX_TYPE s_speech_writer_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool         s_speech_writes_blocked = false;
+static uint32_t     s_speech_writers = 0;
+static uint32_t     s_speech_cancel_generation = 0;
 
 static TaskHandle_t s_capture_task = NULL;
 static TaskHandle_t s_playback_task = NULL;
@@ -119,9 +153,15 @@ static void reset_44k_resampler(void)
 // below — internal SRAM is too tight to absorb another 128 KB at this
 // stage of boot (wake-word model + decoder + drive/capture tasks).
 #define PLAYBACK_RB_BYTES (256 * 1024)
-// Speech lane ring. Sized like the music lane so LEAD_MS reasoning on the
-// server (voice-tts-stream.mjs) holds unchanged for TTS frames. PSRAM.
-#define SPEECH_RB_BYTES (256 * 1024)
+// Speech lane ring. The server normally leads playback by ~1.1 s. A
+// verify-gated wake can then hold local drain for up to ~2.0 s while an
+// already-queued tts_pause crosses the network. 256 KB held only ~1.36 s
+// total and could overflow before a REJECT resumed the old reply, making the
+// supposedly reversible pause lossy. 768 KB is ~4.1 s at 48 kHz stereo:
+// enough for the normal lead plus the full local gate deadline with margin.
+// PSRAM; server pacing is unchanged, so this increases safety capacity rather
+// than normal reply latency.
+#define SPEECH_RB_BYTES (768 * 1024)
 
 static void capture_task(void *arg)
 {
@@ -260,6 +300,221 @@ static size_t rb_pull(RingbufHandle_t rb, uint8_t *dst, size_t want_bytes)
     return got;
 }
 
+#define AUDIO_GATE_ACK_TIMEOUT_MS 250
+#define WRITER_SEND_TIMEOUT_MS    200
+#define WRITER_CANCEL_POLL_MS       5
+#define FLUSH_SERVICE_MAX_PASSES    8
+
+typedef enum {
+    PLAYBACK_LANE_MUSIC = 0,
+    PLAYBACK_LANE_SPEECH,
+} playback_lane_t;
+
+typedef struct {
+    playback_lane_t lane;
+    uint32_t cancel_generation;
+} writer_ticket_t;
+
+static void notify_playback_task(void)
+{
+    TaskHandle_t task = s_playback_task;
+    if (task) xTaskNotifyGive(task);
+}
+
+static void playback_wait(uint32_t timeout_ms)
+{
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+}
+
+// Atomically admit one playback iteration against gate publication. Once work
+// is claimed, gate_hold may publish its request but must wait for work_release;
+// once the request is published, no later iteration can claim flush/dequeue/
+// I2S work.
+static bool playback_work_claim(void)
+{
+    portENTER_CRITICAL(&s_gate_mux);
+    const bool blocked = s_gate_requested || s_gate_held;
+    if (blocked) {
+        if (s_gate_requested) s_gate_ack_seq = s_gate_request_seq;
+    } else {
+        s_playback_work_active = true;
+    }
+    portEXIT_CRITICAL(&s_gate_mux);
+    return !blocked;
+}
+
+static void playback_work_release(void)
+{
+    portENTER_CRITICAL(&s_gate_mux);
+    s_playback_work_active = false;
+    if (s_gate_requested) s_gate_ack_seq = s_gate_request_seq;
+    portEXIT_CRITICAL(&s_gate_mux);
+}
+
+static bool lane_writer_enter(playback_lane_t lane, writer_ticket_t *ticket)
+{
+    bool admitted = false;
+    if (lane == PLAYBACK_LANE_MUSIC) {
+        portENTER_CRITICAL(&s_music_writer_mux);
+        if (!s_music_writes_blocked && !s_flush_music_req) {
+            s_music_writers++;
+            ticket->cancel_generation = s_music_cancel_generation;
+            admitted = true;
+        }
+        portEXIT_CRITICAL(&s_music_writer_mux);
+    } else {
+        portENTER_CRITICAL(&s_speech_writer_mux);
+        if (!s_speech_writes_blocked && !s_flush_speech_req) {
+            s_speech_writers++;
+            ticket->cancel_generation = s_speech_cancel_generation;
+            admitted = true;
+        }
+        portEXIT_CRITICAL(&s_speech_writer_mux);
+    }
+    ticket->lane = lane;
+    return admitted;
+}
+
+static void lane_writer_leave(const writer_ticket_t *ticket)
+{
+    if (ticket->lane == PLAYBACK_LANE_MUSIC) {
+        portENTER_CRITICAL(&s_music_writer_mux);
+        if (s_music_writers > 0) s_music_writers--;
+        portEXIT_CRITICAL(&s_music_writer_mux);
+    } else {
+        portENTER_CRITICAL(&s_speech_writer_mux);
+        if (s_speech_writers > 0) s_speech_writers--;
+        portEXIT_CRITICAL(&s_speech_writer_mux);
+    }
+    // A flush may be waiting for this final admitted writer to leave.
+    notify_playback_task();
+}
+
+static bool lane_writer_cancelled(const writer_ticket_t *ticket)
+{
+    bool cancelled;
+    if (ticket->lane == PLAYBACK_LANE_MUSIC) {
+        portENTER_CRITICAL(&s_music_writer_mux);
+        cancelled = s_music_writes_blocked || s_flush_music_req ||
+                    ticket->cancel_generation != s_music_cancel_generation;
+        portEXIT_CRITICAL(&s_music_writer_mux);
+    } else {
+        portENTER_CRITICAL(&s_speech_writer_mux);
+        cancelled = s_speech_writes_blocked || s_flush_speech_req ||
+                    ticket->cancel_generation != s_speech_cancel_generation;
+        portEXIT_CRITICAL(&s_speech_writer_mux);
+    }
+    return cancelled;
+}
+
+// All MUSIC producers share the stateful 44.1-kHz resampler. Serialize complete
+// callbacks so ambient/AirPlay/alarm cannot corrupt that state or interleave a
+// single callback's ring chunks. Mutex acquisition is cancellation-aware so a
+// destructive block still quiesces every counted writer promptly.
+static bool music_writer_lock(const writer_ticket_t *ticket)
+{
+    if (!s_music_write_mutex) return false;
+    TickType_t total_ticks = pdMS_TO_TICKS(WRITER_SEND_TIMEOUT_MS);
+    TickType_t slice_ticks = pdMS_TO_TICKS(WRITER_CANCEL_POLL_MS);
+    if (total_ticks == 0) total_ticks = 1;
+    if (slice_ticks == 0) slice_ticks = 1;
+    const TickType_t started = xTaskGetTickCount();
+
+    while (true) {
+        if (lane_writer_cancelled(ticket)) return false;
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= total_ticks) return false;
+        const TickType_t remaining = total_ticks - elapsed;
+        const TickType_t wait = remaining < slice_ticks ? remaining : slice_ticks;
+        if (xSemaphoreTake(s_music_write_mutex, wait) == pdTRUE) {
+            if (!lane_writer_cancelled(ticket)) return true;
+            xSemaphoreGive(s_music_write_mutex);
+            return false;
+        }
+    }
+}
+
+static void lane_request_flush(playback_lane_t lane)
+{
+    if (lane == PLAYBACK_LANE_MUSIC) {
+        if (!s_playback_rb) return;
+        portENTER_CRITICAL(&s_music_writer_mux);
+        s_flush_music_req = true;
+        s_flush_music_seq++;
+        s_music_cancel_generation++;
+        portEXIT_CRITICAL(&s_music_writer_mux);
+    } else {
+        if (!s_speech_rb) return;
+        portENTER_CRITICAL(&s_speech_writer_mux);
+        s_flush_speech_req = true;
+        s_flush_speech_seq++;
+        s_speech_cancel_generation++;
+        portEXIT_CRITICAL(&s_speech_writer_mux);
+    }
+    notify_playback_task();
+}
+
+static bool lane_flush_pending(playback_lane_t lane)
+{
+    bool pending;
+    if (lane == PLAYBACK_LANE_MUSIC) {
+        portENTER_CRITICAL(&s_music_writer_mux);
+        pending = s_flush_music_req;
+        portEXIT_CRITICAL(&s_music_writer_mux);
+    } else {
+        portENTER_CRITICAL(&s_speech_writer_mux);
+        pending = s_flush_speech_req;
+        portEXIT_CRITICAL(&s_speech_writer_mux);
+    }
+    return pending;
+}
+
+// Claim one flush generation only after every writer admitted before the
+// cancellation fence has left. While `*_flush_req` remains true, no later
+// writer can enter, so drain + resampler reset is one atomic lane boundary.
+static bool service_lane_flush(playback_lane_t lane)
+{
+    uint32_t claimed_seq = 0;
+    bool claimed = false;
+    if (lane == PLAYBACK_LANE_MUSIC) {
+        portENTER_CRITICAL(&s_music_writer_mux);
+        if (s_flush_music_req && !s_flush_music_servicing &&
+            s_music_writers == 0) {
+            s_flush_music_servicing = true;
+            claimed_seq = s_flush_music_seq;
+            claimed = true;
+        }
+        portEXIT_CRITICAL(&s_music_writer_mux);
+        if (!claimed) return false;
+
+        drain_ringbuffer(s_playback_rb);
+        reset_44k_resampler();
+
+        portENTER_CRITICAL(&s_music_writer_mux);
+        s_flush_music_servicing = false;
+        if (s_flush_music_seq == claimed_seq) s_flush_music_req = false;
+        portEXIT_CRITICAL(&s_music_writer_mux);
+    } else {
+        portENTER_CRITICAL(&s_speech_writer_mux);
+        if (s_flush_speech_req && !s_flush_speech_servicing &&
+            s_speech_writers == 0) {
+            s_flush_speech_servicing = true;
+            claimed_seq = s_flush_speech_seq;
+            claimed = true;
+        }
+        portEXIT_CRITICAL(&s_speech_writer_mux);
+        if (!claimed) return false;
+
+        drain_ringbuffer(s_speech_rb);
+
+        portENTER_CRITICAL(&s_speech_writer_mux);
+        s_flush_speech_servicing = false;
+        if (s_flush_speech_seq == claimed_seq) s_flush_speech_req = false;
+        portEXIT_CRITICAL(&s_speech_writer_mux);
+    }
+    return true;
+}
+
 // ── Ducking mixer ────────────────────────────────────────────────────────────
 // Two lanes → one I²S stream. Speech plays at full level; the music bed is
 // scaled by a per-frame-ramped duck gain so the assistant talking over
@@ -276,30 +531,58 @@ static void playback_task(void *arg)
     int16_t *speech_buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_8BIT);
     if (!bus_buf || !music_buf || !speech_buf) {
         ESP_LOGE(TAG, "playback_task: malloc fail");
+        portENTER_CRITICAL(&s_gate_mux);
+        s_playback_task = NULL;
+        portEXIT_CRITICAL(&s_gate_mux);
         vTaskDelete(NULL);
         return;
     }
 
     while (1) {
-        if (s_flush_music_req)  { s_flush_music_req = false;  drain_ringbuffer(s_playback_rb); }
-        if (s_flush_speech_req) { s_flush_speech_req = false; drain_ringbuffer(s_speech_rb); }
+        // Claim this entire flush/dequeue/I2S iteration atomically against gate
+        // request publication. A hold published after this claim waits for the
+        // matching release; a hold published first prevents the claim.
+        if (!playback_work_claim()) {
+            playback_wait(50);
+            continue;
+        }
+        uint32_t wait_ms = 0;
+
+        // A flush is also a temporary writer-admission fence. Service it only
+        // after every writer admitted before the cancellation generation has
+        // exited. If one is still unwinding, do not play stale queued data.
+        service_lane_flush(PLAYBACK_LANE_MUSIC);
+        service_lane_flush(PLAYBACK_LANE_SPEECH);
+        const bool music_flush_pending =
+            lane_flush_pending(PLAYBACK_LANE_MUSIC);
+        const bool speech_flush_pending =
+            lane_flush_pending(PLAYBACK_LANE_SPEECH);
+        if (music_flush_pending && speech_flush_pending) {
+            wait_ms = WRITER_CANCEL_POLL_MS;
+            goto playback_iteration_done;
+        }
+
         if (!s_playback_active || !s_tx) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
+            wait_ms = 20;
+            goto playback_iteration_done;
         }
 
-        // Pause: stall here without consuming either ring. Resuming simply
-        // clears the flag and we pick up where we stopped.
+        // Either owner may hold playback. Normal resume clears only
+        // s_paused; a provisional wake remains silent until its explicit
+        // gate release.
         if (s_paused) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
+            wait_ms = 50;
+            goto playback_iteration_done;
         }
 
-        size_t music_bytes  = rb_pull(s_playback_rb, (uint8_t *)music_buf, chunk_bytes);
-        size_t speech_bytes = rb_pull(s_speech_rb,  (uint8_t *)speech_buf, chunk_bytes);
+        size_t music_bytes = music_flush_pending ? 0 :
+            rb_pull(s_playback_rb, (uint8_t *)music_buf, chunk_bytes);
+        size_t speech_bytes = speech_flush_pending ? 0 :
+            rb_pull(s_speech_rb, (uint8_t *)speech_buf, chunk_bytes);
         if (music_bytes == 0 && speech_bytes == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
+            wait_ms = (music_flush_pending || speech_flush_pending) ?
+                WRITER_CANCEL_POLL_MS : 10;
+            goto playback_iteration_done;
         }
         const size_t music_samples  = music_bytes / sizeof(int16_t);
         const size_t speech_samples = speech_bytes / sizeof(int16_t);
@@ -336,6 +619,10 @@ static void playback_task(void *arg)
 
         size_t bw;
         i2s_channel_write(s_tx, bus_buf, out_idx * sizeof(int32_t), &bw, pdMS_TO_TICKS(100));
+
+playback_iteration_done:
+        playback_work_release();
+        if (wait_ms > 0) playback_wait(wait_ms);
     }
 }
 
@@ -390,6 +677,9 @@ esp_err_t audio_io_init(void)
     // The 16 kHz master mode (i2s_v1.0.7.bin firmware) is the revert
     // path if anything breaks: change I2S_ROLE_SLAVE → I2S_ROLE_MASTER
     // and AUDIO_BUS_SAMPLE_RATE 48000 → 16000 in audio_io.h.
+    s_music_write_mutex = xSemaphoreCreateMutex();
+    if (!s_music_write_mutex) return ESP_ERR_NO_MEM;
+
     s_capture_rb = xRingbufferCreate(CAPTURE_RB_BYTES, RINGBUF_TYPE_BYTEBUF);
     // Playback ringbuffer lives in PSRAM — at 256 KB it would otherwise
     // squeeze internal SRAM (~150-200 KB free at this point in boot).
@@ -413,8 +703,15 @@ esp_err_t audio_io_init(void)
     // ESP-IDF logging frames inside the deep call chain, 4 KB was
     // occasionally too tight. heartbeat_task now logs high-water marks
     // so we can tell empirically how close we get.
-    xTaskCreatePinnedToCore(capture_task, "audio_cap", 6144, NULL, 10, &s_capture_task, 1);
-    xTaskCreatePinnedToCore(playback_task, "audio_play", 6144, NULL, 9, &s_playback_task, 1);
+    BaseType_t cap_created = xTaskCreatePinnedToCore(
+        capture_task, "audio_cap", 6144, NULL, 10, &s_capture_task, 1);
+    BaseType_t play_created = xTaskCreatePinnedToCore(
+        playback_task, "audio_play", 6144, NULL, 9, &s_playback_task, 1);
+    if (cap_created != pdPASS || play_created != pdPASS) {
+        ESP_LOGE(TAG, "audio task creation failed (capture=%ld playback=%ld)",
+                 (long)cap_created, (long)play_created);
+        return ESP_ERR_NO_MEM;
+    }
 
     ESP_LOGI(TAG, "I2S slave full-duplex: BCLK=%d LRCLK=%d DIN=%d DOUT=%d @ %dHz/%dch/%dbit (XVF is master)",
              AUDIO_PIN_BCLK, AUDIO_PIN_LRCLK, AUDIO_PIN_DIN_RX, AUDIO_PIN_DOUT_TX,
@@ -455,39 +752,148 @@ esp_err_t audio_io_pause_playback(void)  { s_paused = true;  return ESP_OK; }
 esp_err_t audio_io_resume_playback(void) { s_paused = false; return ESP_OK; }
 bool      audio_io_is_paused(void)       { return s_paused; }
 
-// Send one chunk to a playback ring, counting (instead of hiding) a loss.
-// Deliberately no retry: write_pcm runs on latency-sensitive tasks
-// (websocket_task for TTS, the AirPlay receiver for music), and the 200 ms
-// timeout already gives the drain task ample room. If it still expires,
-// blocking longer only trades an audible skip for delayed pongs — count the
-// loss so pcm_drop= in [hb] surfaces it, and let server pacing take the blame.
-// Thread-local target ring for the shared resample body below: set by the
-// two public entry points before dispatching. Writers are single-threaded
-// per lane (websocket_task/tts_worker → speech; ambient/AirPlay → music),
-// and the two lanes never share a resampler branch that keeps cross-call
-// state except the 44.1 k one, which is AirPlay-only (music).
-static bool rb_send_to(RingbufHandle_t rb, const void *data, size_t bytes)
+esp_err_t audio_io_gate_hold_playback(void)
 {
-    if (xRingbufferSend(rb, data, bytes, pdMS_TO_TICKS(200)) == pdTRUE) return true;
-    s_playback_drop_samples += bytes / sizeof(int16_t);
+    uint32_t request_seq;
+    portENTER_CRITICAL(&s_gate_mux);
+    if (s_gate_held) {
+        portEXIT_CRITICAL(&s_gate_mux);
+        return ESP_OK;
+    }
+    if (s_gate_requested || !s_playback_task) {
+        portEXIT_CRITICAL(&s_gate_mux);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_gate_requested = true;
+    request_seq = ++s_gate_request_seq;
+    portEXIT_CRITICAL(&s_gate_mux);
+
+    notify_playback_task();
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)AUDIO_GATE_ACK_TIMEOUT_MS * 1000;
+    while (esp_timer_get_time() < deadline) {
+        bool acquired = false;
+        bool request_alive;
+        portENTER_CRITICAL(&s_gate_mux);
+        request_alive =
+            s_gate_requested && s_gate_request_seq == request_seq;
+        if (request_alive && s_gate_ack_seq == request_seq &&
+            !s_playback_work_active) {
+            // The playback task has reached a clean loop boundary. Publish the
+            // durable hold before removing the transient request fence.
+            s_gate_held = true;
+            s_gate_requested = false;
+            acquired = true;
+        }
+        portEXIT_CRITICAL(&s_gate_mux);
+        if (acquired) return ESP_OK;
+        if (!request_alive) return ESP_ERR_INVALID_STATE;
+        vTaskDelay(1);
+    }
+
+    // Bounded failure is fail-clean: remove only our still-current request.
+    // A late acknowledgement carries the old sequence and cannot satisfy the
+    // next acquisition.
+    portENTER_CRITICAL(&s_gate_mux);
+    if (s_gate_requested && s_gate_request_seq == request_seq) {
+        s_gate_requested = false;
+    }
+    portEXIT_CRITICAL(&s_gate_mux);
+    notify_playback_task();
+    ESP_LOGE(TAG, "verify playback gate quiescence timed out");
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t audio_io_gate_release_playback(void)
+{
+    bool changed;
+    portENTER_CRITICAL(&s_gate_mux);
+    changed = s_gate_held || s_gate_requested;
+    s_gate_held = false;
+    if (s_gate_requested) {
+        s_gate_requested = false;
+        ++s_gate_request_seq;  // invalidate a concurrent waiter's target
+    }
+    portEXIT_CRITICAL(&s_gate_mux);
+    if (changed) notify_playback_task();
+    return ESP_OK;
+}
+
+bool audio_io_is_gate_held(void)
+{
+    portENTER_CRITICAL(&s_gate_mux);
+    const bool held = s_gate_held;
+    portEXIT_CRITICAL(&s_gate_mux);
+    return held;
+}
+
+// Send one chunk with the original 200-ms aggregate backpressure budget, but
+// split the wait into short cancellation-aware slices. A destructive fence can
+// therefore stop a writer promptly instead of waiting 200 ms for every
+// remaining resampler chunk (up to ~1.6 s for one 4096-byte speech frame).
+static bool rb_send_to(RingbufHandle_t rb, const void *data, size_t bytes,
+                       const writer_ticket_t *ticket)
+{
+    TickType_t total_ticks = pdMS_TO_TICKS(WRITER_SEND_TIMEOUT_MS);
+    TickType_t slice_ticks = pdMS_TO_TICKS(WRITER_CANCEL_POLL_MS);
+    if (total_ticks == 0) total_ticks = 1;
+    if (slice_ticks == 0) slice_ticks = 1;
+    const TickType_t started = xTaskGetTickCount();
+
+    while (true) {
+        if (lane_writer_cancelled(ticket)) return false;
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= total_ticks) break;
+        const TickType_t remaining = total_ticks - elapsed;
+        const TickType_t wait = remaining < slice_ticks ? remaining : slice_ticks;
+        if (xRingbufferSend(rb, data, bytes, wait) == pdTRUE) {
+            // A block/flush can race the successful send. Report cancellation
+            // to the caller; the still-asserted lane fence guarantees the
+            // queued edge item is included in the subsequent drain.
+            return !lane_writer_cancelled(ticket);
+        }
+    }
+
+    if (lane_writer_cancelled(ticket)) return false;
+    const uint32_t dropped = __sync_add_and_fetch(
+        &s_playback_drop_samples, bytes / sizeof(int16_t));
     ESP_LOGW(TAG, "playback rb full: dropped %u samples (pcm_drop total %u)",
-             (unsigned)(bytes / sizeof(int16_t)), (unsigned)s_playback_drop_samples);
+             (unsigned)(bytes / sizeof(int16_t)), (unsigned)dropped);
     return false;
 }
 
-static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t samples, uint32_t source_rate);
+static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo,
+                           size_t samples, uint32_t source_rate,
+                           const writer_ticket_t *ticket);
 
 size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate)
 {
-    return write_pcm_to(s_playback_rb, pcm_stereo, samples, source_rate);
+    writer_ticket_t ticket;
+    if (!lane_writer_enter(PLAYBACK_LANE_MUSIC, &ticket)) return 0;
+    if (!music_writer_lock(&ticket)) {
+        lane_writer_leave(&ticket);
+        return 0;
+    }
+    size_t written = write_pcm_to(
+        s_playback_rb, pcm_stereo, samples, source_rate, &ticket);
+    xSemaphoreGive(s_music_write_mutex);
+    lane_writer_leave(&ticket);
+    return written;
 }
 
 size_t audio_io_write_speech_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate)
 {
-    return write_pcm_to(s_speech_rb, pcm_stereo, samples, source_rate);
+    writer_ticket_t ticket;
+    if (!lane_writer_enter(PLAYBACK_LANE_SPEECH, &ticket)) return 0;
+    size_t written = write_pcm_to(
+        s_speech_rb, pcm_stereo, samples, source_rate, &ticket);
+    lane_writer_leave(&ticket);
+    return written;
 }
 
-static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t samples, uint32_t source_rate)
+static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo,
+                           size_t samples, uint32_t source_rate,
+                           const writer_ticket_t *ticket)
 {
     if (!rb) return 0;
     // Ringbuffer holds STEREO INTERLEAVED L/R int16 samples at BUS rate
@@ -509,7 +915,8 @@ static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t
 
     if (source_rate == AUDIO_BUS_SAMPLE_RATE) {
         // 48 kHz native stereo — push straight to bus rb.
-        return rb_send_to(rb, pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
+        return rb_send_to(
+            rb, pcm_stereo, samples * sizeof(int16_t), ticket) ? samples : 0;
     }
 
     if (source_rate == 16000) {
@@ -538,8 +945,11 @@ static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            rb_send_to(rb, buf, bi * sizeof(int16_t));
-            total_written += bi;
+            if (rb_send_to(rb, buf, bi * sizeof(int16_t), ticket)) {
+                total_written += bi;
+            } else if (lane_writer_cancelled(ticket)) {
+                return total_written;
+            }
             in_base += chunk_in;
         }
         return total_written;
@@ -589,8 +999,15 @@ static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t
                 out[out_idx++] = o_r;
                 phase += PHASE_STEP_44K;
                 if (out_idx >= (sizeof(out) / sizeof(out[0]))) {
-                    rb_send_to(rb, out, out_idx * sizeof(int16_t));
-                    total_written += out_idx;
+                    if (rb_send_to(
+                            rb, out, out_idx * sizeof(int16_t), ticket)) {
+                        total_written += out_idx;
+                    } else if (lane_writer_cancelled(ticket)) {
+                        s_44k_prev_l = prev_l;
+                        s_44k_prev_r = prev_r;
+                        s_44k_phase = phase;
+                        return total_written;
+                    }
                     out_idx = 0;
                 }
             }
@@ -600,8 +1017,14 @@ static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t
         }
 
         if (out_idx > 0) {
-            rb_send_to(rb, out, out_idx * sizeof(int16_t));
-            total_written += out_idx;
+            if (rb_send_to(rb, out, out_idx * sizeof(int16_t), ticket)) {
+                total_written += out_idx;
+            } else if (lane_writer_cancelled(ticket)) {
+                s_44k_prev_l = prev_l;
+                s_44k_prev_r = prev_r;
+                s_44k_phase = phase;
+                return total_written;
+            }
         }
         s_44k_prev_l = prev_l;
         s_44k_prev_r = prev_r;
@@ -629,8 +1052,11 @@ static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            rb_send_to(rb, buf, bi * sizeof(int16_t));
-            total_written += bi;
+            if (rb_send_to(rb, buf, bi * sizeof(int16_t), ticket)) {
+                total_written += bi;
+            } else if (lane_writer_cancelled(ticket)) {
+                return total_written;
+            }
             in_base += chunk_in;
         }
         return total_written;
@@ -639,32 +1065,110 @@ static size_t write_pcm_to(RingbufHandle_t rb, const int16_t *pcm_stereo, size_t
     // Unknown source rate — fall back to 1:1 push (will sound wrong unless
     // it happens to be 48 kHz). Log so future-us notices.
     ESP_LOGW(TAG, "audio_io_write_pcm: unhandled source_rate=%u, pushing 1:1", (unsigned) source_rate);
-    return rb_send_to(rb, pcm_stereo, samples * sizeof(int16_t)) ? samples : 0;
+    return rb_send_to(
+        rb, pcm_stereo, samples * sizeof(int16_t), ticket) ? samples : 0;
 }
 
 void audio_io_flush_playback(void)
 {
-    if (!s_playback_rb) return;
-    s_flush_music_req = true;
-    s_flush_speech_req = true;
-    // OE 2026-05-27: reset the 44.1→48 kHz fractional resampler state
-    // so a fresh AirPlay stream (or post-pause resume) doesn't linear-
-    // interpolate between a stale prev_l/prev_r and the new first
-    // sample — that interpolation across a gap produces an audible
-    // click. The rate-change guard inside write_pcm only fires when
-    // source_rate changes; on pause-then-resume the source stays 44100
-    // so without this reset the statics carry forward. The 16k/24k
-    // branches use stack-local state and aren't affected.
-    reset_44k_resampler();
+    lane_request_flush(PLAYBACK_LANE_MUSIC);
+    lane_request_flush(PLAYBACK_LANE_SPEECH);
+}
+
+void audio_io_flush_music(void)
+{
+    // The 44.1-kHz state is reset by the eventual flush service, after old
+    // writers have exited and while new admission remains fenced. Resetting it
+    // here would race an in-flight AirPlay/ambient/alarm resampler callback.
+    lane_request_flush(PLAYBACK_LANE_MUSIC);
 }
 
 void audio_io_flush_speech(void)
 {
-    if (!s_speech_rb) return;
-    s_flush_speech_req = true;
+    lane_request_flush(PLAYBACK_LANE_SPEECH);
 }
 
 bool audio_io_playback_active(void) { return s_playback_active; }
+
+void audio_io_block_music_writes(void)
+{
+    portENTER_CRITICAL(&s_music_writer_mux);
+    s_music_writes_blocked = true;
+    s_music_cancel_generation++;
+    portEXIT_CRITICAL(&s_music_writer_mux);
+    notify_playback_task();
+}
+
+void audio_io_allow_music_writes(void)
+{
+    portENTER_CRITICAL(&s_music_writer_mux);
+    s_music_writes_blocked = false;
+    portEXIT_CRITICAL(&s_music_writer_mux);
+}
+
+bool audio_io_music_writers_idle(void)
+{
+    portENTER_CRITICAL(&s_music_writer_mux);
+    bool idle = s_music_writers == 0;
+    portEXIT_CRITICAL(&s_music_writer_mux);
+    return idle;
+}
+
+void audio_io_block_speech_writes(void)
+{
+    portENTER_CRITICAL(&s_speech_writer_mux);
+    s_speech_writes_blocked = true;
+    s_speech_cancel_generation++;
+    portEXIT_CRITICAL(&s_speech_writer_mux);
+    notify_playback_task();
+}
+
+void audio_io_allow_speech_writes(void)
+{
+    portENTER_CRITICAL(&s_speech_writer_mux);
+    s_speech_writes_blocked = false;
+    portEXIT_CRITICAL(&s_speech_writer_mux);
+}
+
+bool audio_io_speech_writers_idle(void)
+{
+    portENTER_CRITICAL(&s_speech_writer_mux);
+    bool idle = s_speech_writers == 0;
+    portEXIT_CRITICAL(&s_speech_writer_mux);
+    return idle;
+}
+
+bool audio_io_gate_service_pending_music_flush(void)
+{
+    portENTER_CRITICAL(&s_gate_mux);
+    const bool held = s_gate_held && !s_gate_requested;
+    portEXIT_CRITICAL(&s_gate_mux);
+    if (!held) return false;
+
+    // Successful hold acquisition already received playback_task's quiescence
+    // acknowledgement, so it cannot be a concurrent ring receiver here.
+    // Service every generation visible here; a concurrent source-control event
+    // can request another flush while the drain runs.
+    for (int pass = 0; pass < FLUSH_SERVICE_MAX_PASSES; ++pass) {
+        if (!lane_flush_pending(PLAYBACK_LANE_MUSIC)) return true;
+        if (!service_lane_flush(PLAYBACK_LANE_MUSIC)) return false;
+    }
+    return !lane_flush_pending(PLAYBACK_LANE_MUSIC);
+}
+
+bool audio_io_gate_service_pending_speech_flush(void)
+{
+    portENTER_CRITICAL(&s_gate_mux);
+    const bool held = s_gate_held && !s_gate_requested;
+    portEXIT_CRITICAL(&s_gate_mux);
+    if (!held) return false;
+
+    for (int pass = 0; pass < FLUSH_SERVICE_MAX_PASSES; ++pass) {
+        if (!lane_flush_pending(PLAYBACK_LANE_SPEECH)) return true;
+        if (!service_lane_flush(PLAYBACK_LANE_SPEECH)) return false;
+    }
+    return !lane_flush_pending(PLAYBACK_LANE_SPEECH);
+}
 
 // SPEECH lane — every existing caller (TTS drain in stream_finalize_task,
 // the stall watchdog, LEAD_MS sizing) reasons about the assistant's speech.

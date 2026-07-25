@@ -578,8 +578,10 @@ static void ring_session_begin(void)
 
 static void ring_session_end(void)
 {
-    audio_io_stop_playback();
-    audio_io_flush_playback();
+    // The playback engine and speech ring are shared with TTS. Ending an
+    // alarm owns only the music lane; stopping the engine or flushing both
+    // lanes would truncate an overlapping assistant reply.
+    audio_io_flush_music();
     if (s_amp_cb)      s_amp_cb(false);
     if (s_speaking_cb) s_speaking_cb(false);
 }

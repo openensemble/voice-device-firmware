@@ -18,6 +18,12 @@ you only need this repo to hack on the firmware itself. Overview:
 - **Wake words on-device** — [microWakeWord](https://github.com/kahrendt/microWakeWord)
   streaming models, 6 slots, per-user models pushed by the server over the
   WS `ww_upload` path. Stock image ships "Hey Ensemble" and "Hey Computer".
+- **Fail-closed wake verification** — when OE enables the second-stage gate,
+  the device sends the wake window only to OE's fixed same-origin endpoint
+  over HTTPS or direct numeric private-LAN HTTP. Missing policy, disallowed
+  origins, malformed verdicts, overload, and interrupted configuration updates
+  all drop the fire. Private HTTP deliberately assumes a trusted/isolated LAN;
+  it is never accepted for a hostname or public IP.
 - **Voice turns** — wake → capture (XVF3800 beamformed + echo-cancelled) →
   utterance to OE `/api/stt` → reply streamed back as paced PCM frames over
   the WS and played out the speaker. Barge-in works during playback.

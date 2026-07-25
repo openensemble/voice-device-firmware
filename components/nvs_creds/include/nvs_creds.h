@@ -15,6 +15,18 @@ bool      nvs_creds_has_wifi(void);
 esp_err_t nvs_creds_set_server(const char *url);
 esp_err_t nvs_creds_get_server(char *url, size_t url_len);
 
+// Exact OE verify-proxy path (empty/absent = gate disabled). The legacy
+// "vgate_url" NVS key is intentionally retained so upgrades can migrate a
+// previously provisioned direct verifier URL without silently bypassing it.
+esp_err_t nvs_creds_set_verify_gate_path(const char *path);
+esp_err_t nvs_creds_get_verify_gate_path(char *path, size_t path_len);
+
+// Canonical OE voice-device id. Gate path + id are persisted in fail-closed
+// order when they arrive together in server_caps (NVS is not transactional).
+esp_err_t nvs_creds_set_device_id(const char *device_id);
+esp_err_t nvs_creds_get_device_id(char *device_id, size_t device_id_len);
+esp_err_t nvs_creds_set_verify_gate_config(const char *device_id, const char *path);
+
 esp_err_t nvs_creds_set_token(const char *token);
 esp_err_t nvs_creds_get_token(char *token, size_t token_len);
 
@@ -35,6 +47,12 @@ esp_err_t nvs_creds_get_volume(uint8_t *pct);
 
 esp_err_t nvs_creds_set_headphone_mode(uint8_t enabled);
 esp_err_t nvs_creds_get_headphone_mode(uint8_t *enabled);
+
+// One-shot OTA memory-recovery latch. State is persisted because the recovery
+// deliberately crosses esp_restart(): 0=idle, 1=pending reboot resume,
+// 2=recovery attempt consumed. Writing 0 erases the key.
+esp_err_t nvs_creds_set_ota_retry_state(uint8_t state);
+esp_err_t nvs_creds_get_ota_retry_state(uint8_t *state);
 
 esp_err_t nvs_creds_set_server_cert(const uint8_t *pem, size_t pem_len);
 esp_err_t nvs_creds_get_server_cert(uint8_t *pem, size_t *pem_len);

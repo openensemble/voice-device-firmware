@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <math.h>       // fabsf/M_PI for the DoA direction gate
 #include <sys/stat.h>   // stat() for ww_file_matches (skip identical ww re-push)
+#include <time.h>       // gmtime_r/strftime for the verify-gate fired_at stamp
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -228,6 +230,164 @@ static void agc_freeze_task(void *arg)
 
 dev_config_t g_dev_config = {0};
 
+// Gate path + canonical device id form one runtime configuration pair. The WS
+// task can reconcile them while the capture/verify tasks are active, so publish
+// and snapshot the pair under one lock. NVS persists policy before identity so
+// an interrupted update cannot turn an enabled gate into a silent bypass.
+static portMUX_TYPE s_verify_config_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_verify_gate_config_persisted = false;
+// Missing NVS state is not the same as an explicit remote disable. Until a
+// server_caps from an allowed paired origin supplies the fixed or empty path,
+// genuine wakes must remain blocked.
+static bool s_verify_gate_config_known = false;
+
+static void verify_gate_config_snapshot(char path[OE_URL_MAX],
+                                        char device_id[OE_DEVICE_ID_MAX])
+{
+    portENTER_CRITICAL(&s_verify_config_mux);
+    memcpy(path, g_dev_config.verify_gate_path, OE_URL_MAX);
+    memcpy(device_id, g_dev_config.device_id, OE_DEVICE_ID_MAX);
+    portEXIT_CRITICAL(&s_verify_config_mux);
+}
+
+static bool server_device_id_valid(const char *device_id)
+{
+    if (!device_id) return false;
+    size_t n = strnlen(device_id, OE_DEVICE_ID_MAX);
+    if (n == 0 || n >= OE_DEVICE_ID_MAX) return false;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)device_id[i];
+        if (c <= 0x20 || c == 0x7f) return false;
+    }
+    return true;
+}
+
+static bool server_verify_gate_path_valid(const char *path)
+{
+    if (!path) return false;
+    return path[0] == '\0' || strcmp(path, OE_VERIFY_GATE_PATH) == 0;
+}
+
+// Follow-up and conversation-mode barge intentionally open capture without a
+// wake word. UNKNOWN policy never authorizes them. Enabled policy requires an
+// allowed paired origin: HTTPS, or numeric private-LAN HTTP by deployment
+// policy. Explicit-disabled policy preserves the legacy behavior.
+static bool server_control_may_open_ungated_capture(void)
+{
+    bool known;
+    bool gate_enabled;
+    portENTER_CRITICAL(&s_verify_config_mux);
+    known = s_verify_gate_config_known;
+    gate_enabled = g_dev_config.verify_gate_path[0] != '\0';
+    portEXIT_CRITICAL(&s_verify_config_mux);
+    return known &&
+           (!gate_enabled ||
+            oe_verify_gate_origin_allowed(g_dev_config.server_url));
+}
+
+static void apply_verify_gate_server_caps(const cJSON *j)
+{
+    // Gate policy arrives on the operational WebSocket. Plaintext is accepted
+    // only when the paired target is a numeric private-LAN IPv4 origin.
+    if (!oe_verify_gate_origin_allowed(g_dev_config.server_url)) {
+        ESP_LOGW(TAG, "server_caps: gate config ignored on disallowed OE origin");
+        return;
+    }
+
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(j, "device_id");
+    const cJSON *jpath = cJSON_GetObjectItemCaseSensitive(j, "verify_gate_path");
+    const cJSON *jlegacy =
+        cJSON_GetObjectItemCaseSensitive(j, "verify_gate_url");
+    bool apply_id = false;
+    bool apply_path = false;
+    const char *path_value = NULL;
+
+    if (jid) {
+        apply_id = cJSON_IsString(jid) && server_device_id_valid(jid->valuestring);
+        if (!apply_id) ESP_LOGW(TAG, "server_caps: ignoring invalid device_id");
+    }
+    if (jpath) {
+        apply_path = cJSON_IsString(jpath) &&
+                     server_verify_gate_path_valid(jpath->valuestring);
+        if (apply_path) path_value = jpath->valuestring;
+        else ESP_LOGW(TAG, "server_caps: ignoring invalid verify_gate_path");
+    } else if (jlegacy) {
+        // OE sends an empty legacy field as a kill switch for old firmware.
+        // New firmware may honor only that empty value. A non-empty direct URL
+        // is never accepted because it would receive the voice-device bearer.
+        apply_path = cJSON_IsString(jlegacy) &&
+                     jlegacy->valuestring &&
+                     jlegacy->valuestring[0] == '\0';
+        if (apply_path) path_value = "";
+        else ESP_LOGW(TAG, "server_caps: refusing legacy direct verify_gate_url");
+    }
+    // Missing fields come from an older server and intentionally preserve the
+    // current values. Empty device ids are never authoritative; an explicitly
+    // empty path is valid and disables the gate.
+    if (!apply_id && !apply_path) return;
+
+    char next_path[OE_URL_MAX];
+    char next_device_id[OE_DEVICE_ID_MAX];
+    bool next_known;
+    verify_gate_config_snapshot(next_path, next_device_id);
+    portENTER_CRITICAL(&s_verify_config_mux);
+    next_known = s_verify_gate_config_known;
+    portEXIT_CRITICAL(&s_verify_config_mux);
+    if (apply_id) snprintf(next_device_id, sizeof(next_device_id), "%s", jid->valuestring);
+    if (apply_path) {
+        snprintf(next_path, sizeof(next_path), "%s", path_value);
+        next_known = true;
+    }
+
+    bool changed;
+    portENTER_CRITICAL(&s_verify_config_mux);
+    changed = strcmp(next_path, g_dev_config.verify_gate_path) != 0 ||
+              strcmp(next_device_id, g_dev_config.device_id) != 0 ||
+              next_known != s_verify_gate_config_known;
+    portEXIT_CRITICAL(&s_verify_config_mux);
+    if (!changed && s_verify_gate_config_persisted) return;
+
+    if (next_known && next_path[0]) {
+        // Publish a blocked transition state before the slower NVS operation.
+        // Otherwise disabled->enabled leaves a window in which capture still
+        // observes known+empty and admits an ungated wake.
+        portENTER_CRITICAL(&s_verify_config_mux);
+        s_verify_gate_config_known = false;
+        portEXIT_CRITICAL(&s_verify_config_mux);
+    }
+
+    esp_err_t e;
+    if (next_known) {
+        // Persistence writes an enabling path before identity, so interruption
+        // can leave a blocked missing/stale identity but never an empty-path
+        // bypass. See nvs_creds_set_verify_gate_config().
+        e = nvs_creds_set_verify_gate_config(next_device_id, next_path);
+        s_verify_gate_config_persisted = e == ESP_OK;
+    } else {
+        // An identity-only update must not materialize an empty gate key:
+        // absence remains UNKNOWN/BLOCKED until an explicit path field arrives.
+        e = nvs_creds_set_device_id(next_device_id);
+        s_verify_gate_config_persisted = false;
+    }
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "server_caps: gate config NVS write failed: %s",
+                 esp_err_to_name(e));
+    }
+
+    portENTER_CRITICAL(&s_verify_config_mux);
+    memcpy(g_dev_config.device_id, next_device_id, sizeof(g_dev_config.device_id));
+    memcpy(g_dev_config.verify_gate_path, next_path, sizeof(g_dev_config.verify_gate_path));
+    s_verify_gate_config_known = next_known;
+    portEXIT_CRITICAL(&s_verify_config_mux);
+    ESP_LOGI(TAG, "server_caps: verify gate %s (device_id=%s%s)",
+             !next_known ? "pending"
+                 : (next_path[0] && next_device_id[0]
+                        ? "configured"
+                        : "disabled"),
+             next_device_id[0] ? next_device_id : "(pending)",
+             e == ESP_OK ? "" : ", volatile");
+}
+
 // Wake-word slots loaded concurrently. The wakewords SPIFFS partition is built
 // from firmware/wakewords/slot{0..N}.tflite + slot{0..N}.json — fresh flash
 // ships slots 0 + 1 (hey_ensemble + hey_computer); slots 2-5 start empty and are
@@ -239,14 +399,24 @@ dev_config_t g_dev_config = {0};
 // the server can route to slot_assignments[N] (a per-device map managed in
 // Settings → Voice devices).
 //
-// The wakewords partition is 0x80000 (512 KB) per partitions.csv — at ~63 KB
-// per slot pair that fits 6 comfortably with overhead. Bumping past 6 would
-// require either resizing the partition (USB re-flash) or shrinking the
+// The wakewords partition is 0x80000 (512 KB) per partitions.csv. Measured
+// with esp-idf spiffsgen.py at this project's SPIFFS geometry (2026-07-06):
+// 459,364 B of slot files fit, 476,034 B did not. Six ~63 KB (v1) pairs fit
+// comfortably; the retrained ~79 KB pairs (tensor_arena_size 78240) max out
+// at FIVE — six of those overflow. The OE server refuses over-budget pushes
+// up front (lib/voice-config.mjs, WW_SPIFFS_BUDGET_BYTES = 460000), which
+// matters because apply_ww_upload below unlinks the old slot file before
+// writing — a failed write would leave that slot empty. Bumping capacity
+// would require resizing the partition (USB re-flash) or shrinking the
 // SPIFFS image somehow.
 #define WW_NUM_SLOTS 6
 static wakeword_t *s_ww[WW_NUM_SLOTS] = { NULL };
 static uint8_t     s_active_slot      = 0;  // which slot fired the current utterance
 static uint8_t     s_active_wake_prob = 0;  // sliding-window avg prob (0..255) of the wake that fired
+// Manifest-derived identity snapshotted with the winning detection. It must
+// travel with the fire: reading the slot manifest later would let a concurrent
+// hot-swap relabel an already-fired model.
+static char        s_active_wake_slug[WW_WAKE_SLUG_MAX] = "";
 
 // Per-slot manifest (default) probability cutoff, mirrored at file scope so the
 // playback-aware cutoff task can restore the CURRENT cutoff after TTS/AirPlay
@@ -264,6 +434,17 @@ static uint8_t     s_default_cutoff[WW_NUM_SLOTS] = {0};
 // task) can reference them. See stream_finalize_task / stream_abort_local.
 static volatile bool s_stream_active  = false;   // between tts_audio_begin and finalize
 static volatile bool s_stream_end_req = false;   // tts_audio_end received; finalize task drains
+// Legacy HTTP TTS can overlap the pushed stream's teardown; the WS disconnect
+// path needs this ownership bit early enough to preserve its speech output.
+static volatile bool s_legacy_tts_active = false;
+// Exact server tag of the active pushed stream. A verify hold requires this
+// to match s_turn_id; untagged announcements cannot be safely paused/resumed
+// through the turn-scoped server protocol and are therefore fail-closed.
+static char          s_stream_turn_id[24] = "";
+// ACCEPT quarantines turnless announcement frames until the old announcement
+// proves terminal or correctly tagged content from the promoted turn begins.
+// This covers frames already queued on TCP even after the server hold/stop.
+static bool          s_drop_untagged_tts = false;
 static uint8_t       s_pcm_frame[4096];          // base64 decode scratch (WS callback is single-threaded)
 // Liveness timestamp for the streamed-TTS path: last tts_audio_begin/tts_audio
 // arrival (esp_timer us). stream_finalize_task's stall watchdog uses it to
@@ -305,10 +486,72 @@ static char     s_turn_id[24] = "";
 static char     s_turn_prefix[5] = "0000";   // 4 hex chars from esp_random at boot
 static uint32_t s_turn_counter = 0;
 
+static void mint_turn_id_into(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    snprintf(out, out_len, "%s-%lu",
+             s_turn_prefix, (unsigned long)(++s_turn_counter));
+}
+
 static void mint_turn_id(void)
 {
-    snprintf(s_turn_id, sizeof(s_turn_id), "%s-%lu",
-             s_turn_prefix, (unsigned long)(++s_turn_counter));
+    mint_turn_id_into(s_turn_id, sizeof(s_turn_id));
+}
+
+// A verify-gated wake is not the current turn until the gate accepts it.
+// Keep its id separate so the active reply's tagged token/TTS/end events
+// continue to be accepted (and can be resumed after a reject).
+static char          s_prov_turn_id[24] = "";
+static volatile bool s_verify_playback_hold_active = false;
+static volatile bool s_verify_cancelled = false;
+// Alarm start is serialized with gate release. If its amp callback arrives
+// while a provisional hold owns physical silence, the release path consumes
+// this handoff; if it arrives after release, the callback enables playback
+// directly. This closes the final snapshot-to-release race.
+static bool          s_alarm_amp_deferred = false;
+// Monotonic ownership token for the reversible hold. A delayed RESUME retry
+// may act only while this is still the generation that requested it; the next
+// provisional wake invalidates that retry before issuing its own PAUSE.
+static volatile uint32_t s_verify_hold_generation = 0;
+// A turnless announcement can be active before the hold or begin behind the
+// server-side hold-id latch. Track that ownership explicitly so REJECT restores
+// it even at boot, where there is no established turn id to compare.
+static bool s_verify_hold_untagged_stream_owned = false;
+// Serializes acquisition/release/commit of the provisional playback hold
+// against mute, alarm, disconnect, and the final state transition of each
+// TTS producer.  The hold spans several independent components, so publishing
+// a bare boolean without this mutex leaves an acquisition window where a mute
+// can release flags that have not been set yet (then begin sets them forever).
+static SemaphoreHandle_t s_verify_lifecycle_mutex = NULL;
+// ACCEPT closes admission before waiting for any already-admitted speech-ring
+// writer to finish.  This prevents an old WS frame that passed correlation
+// just before promotion from refilling the ring after the destructive flush.
+static volatile bool     s_speech_writes_blocked = false;
+static volatile uint32_t s_speech_writers = 0;
+
+// Identity/UI-adjacent state changed by detector arbitration before a verdict.
+// These declarations must precede ws_event_cb: a tagged await_followup event
+// received during verification still belongs to this previous slot.
+static bool              s_prov_identity_valid = false;
+static uint8_t           s_prov_prev_slot = 0;
+static uint8_t           s_prov_prev_prob = 0;
+static char              s_prov_prev_slug[WW_WAKE_SLUG_MAX] = "";
+static int64_t           s_prov_prev_followup_until_us = 0;
+static bool              s_prov_bearing_pending = false;
+static float             s_prov_bearing = -1.0f;
+
+static bool vg_abort_for_mute(void);
+static void vg_request_cancel(void);
+
+static bool vg_lifecycle_take(void)
+{
+    return s_verify_lifecycle_mutex &&
+           xSemaphoreTake(s_verify_lifecycle_mutex, portMAX_DELAY) == pdTRUE;
+}
+
+static void vg_lifecycle_give(void)
+{
+    xSemaphoreGive(s_verify_lifecycle_mutex);
 }
 
 // True when the event names a turn that is NOT the device's current one.
@@ -320,6 +563,20 @@ static bool evt_turn_stale(const oe_ws_payload_t *evt)
     return strcmp(evt->turn_id, s_turn_id) != 0;
 }
 
+// PCM BEGIN establishes one stream identity; every AUDIO/END must match both
+// its tag value and its tagged-vs-untagged class. Otherwise a late untagged
+// announcement can append into (or terminate) a newer tagged reply.
+// Callers hold s_verify_lifecycle_mutex.
+static bool evt_matches_active_stream(const oe_ws_payload_t *evt)
+{
+    if (!s_stream_active) return false;
+    const bool evt_tagged = evt->turn_id && evt->turn_id[0];
+    const bool stream_tagged = s_stream_turn_id[0];
+    if (evt_tagged != stream_tagged) return false;
+    return !evt_tagged ||
+           strcmp(evt->turn_id, s_stream_turn_id) == 0;
+}
+
 // Server capability flags, learned from `server_caps` after auth and reset on
 // disconnect (the next server may be older). Gate every NEW device→server
 // message type on these so a firmware upgrade never breaks against an old
@@ -327,6 +584,8 @@ static bool evt_turn_stale(const oe_ws_payload_t *evt)
 // unknown fields harmlessly.
 static volatile bool s_caps_tts_pause  = false;
 static volatile bool s_caps_stt_stream = false;
+static volatile bool s_caps_turn_ids   = false;
+static volatile bool s_caps_tts_hold_ids = false;
 
 // ── Speech barge-in (conversation mode): pause-then-verify ──────────────────
 // While the device speaks a streamed reply, a burst of mic energy PAUSES
@@ -420,7 +679,27 @@ static inline uint32_t frame_energy(const int16_t *samples, size_t n)
     return (uint32_t)(sum_sq / n);
 }
 static volatile bool s_ws_connected = false;
+// Retries are scoped to one authenticated websocket lifetime. An old STOP or
+// RESUME must never migrate onto a replacement connection after reconnect.
+static volatile uint32_t s_ws_connection_epoch = 0;
 static volatile bool s_ota_marked_valid = false;
+// A memory-recovery OTA may resume only after both the authenticated
+// server_caps message and the tail of operational boot. oe_ws_start is
+// asynchronous, so caps can otherwise race the remaining task allocations.
+static volatile bool s_authenticated_caps_seen = false;
+static volatile bool s_operational_boot_ready = false;
+
+static void maybe_resume_pending_ota(void)
+{
+    if (!s_authenticated_caps_seen || !s_operational_boot_ready) return;
+    esp_err_t e = oe_ota_resume_pending(g_dev_config.server_url);
+    if (e == ESP_OK) {
+        ESP_LOGI(TAG, "pending OTA memory recovery resumed");
+    } else if (e != ESP_ERR_NOT_FOUND && e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "pending OTA memory recovery not resumed: %s",
+                 esp_err_to_name(e));
+    }
+}
 
 // THINKING-state gate. Set when VAD ends and we ship the utterance to STT/LLM;
 // cleared the instant the TTS worker enters SPEAKING (so barge-in during TTS
@@ -436,6 +715,21 @@ static volatile bool s_awaiting_reply = false;
 // wake until reboot. 0 = not armed.
 static volatile int64_t s_awaiting_since_us = 0;
 static portMUX_TYPE s_time_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Current servers intentionally leave background announcements untagged. They
+// may start behind a reversible verify hold (so REJECT can still play them),
+// but once a command has committed, an untagged late event must not mutate or
+// mix into that correlated turn. Normal turn replies are always tagged when
+// verify gating is enabled (s_caps_turn_ids is mandatory).
+static bool evt_untagged_conflicts_with_busy_turn(
+    const oe_ws_payload_t *evt)
+{
+    if (evt->turn_id && evt->turn_id[0]) return false;
+    if (s_drop_untagged_tts) return true;
+    if (s_verify_playback_hold_active) return false;
+    return s_in_utterance || s_awaiting_reply ||
+           (s_stream_active && s_stream_turn_id[0]);
+}
 // Watchdog ceiling. Generous so a slow-but-valid delegated LLM reply (observed
 // up to ~50s) is never cut off; the OE_WS_EVT_DISCONNECTED handler clears the
 // gate instantly in the common dead-socket case, so this only backstops a live
@@ -453,6 +747,8 @@ static volatile int64_t s_followup_until_us = 0;
 // actually drains (see stream_finalize_task). Otherwise the window would tick
 // down during the spoken reply and expire before the user can answer.
 static volatile int     s_followup_pending_ms = 0;
+#define FOLLOWUP_WINDOW_DEFAULT_MS 5000
+#define FOLLOWUP_WINDOW_MAX_MS    15000
 // Slot the conversation was on when follow-up was armed. Any utterance
 // captured during the window — whether a VAD-start or a (potentially
 // false) wake fire on a different slot — gets routed back to THIS slot
@@ -468,6 +764,87 @@ static volatile uint8_t s_followup_slot = 0;
 // only grazes 800k triggers a word late. A too-eager trigger is cheap — the
 // capture just ends as no-speech / an empty transcript apology.
 #define FOLLOWUP_TRIGGER_ENERGY 300000
+// …cheap in a QUIET room. Near speakers the fixed 300k answered the TV:
+// dialog/music bleed sits above 300k, every window fired on it, and STT
+// happily transcribed the TV line as the user's answer. So the effective
+// trigger is floor-relative like the barge detector's: an EMA of idle-room
+// energy (mic hot, nothing playing) raises the bar in a noisy placement and
+// leaves quiet rooms untouched (floor≈0 → the max() keeps 300k). Frames at or
+// above VOICE_ENERGY_THRESHOLD never feed the EMA — firm speech and TV peaks
+// must not shape the baseline they're judged against; steady sub-800k bleed
+// is exactly what we want absorbed. Accepted limit: dialog PEAKS above the
+// raised trigger still fire and transcribe — rejecting other-people's-speech
+// outright needs speaker-ID upstream, not an energy gate.
+#define FOLLOWUP_FLOOR_MULT 3
+static uint32_t s_room_floor = 0;   // EMA (α=1/8) of idle-room frame energy
+
+// ── DoA direction gate (0.2.75) ──────────────────────────────────────────────
+// Field data 2026-07-07 (Kitchen, music on nearby speakers): the user sat at
+// azimuth ~1.08 rad all session; the speakers tracked at ~0.45 and ~4.72.
+// Both "she stopped mid-reply to listen" incidents were barge captures whose
+// speech energy sat entirely at a speaker bearing — while during the user's
+// real utterances the auto-select beam pointed at HIM even with music
+// playing (the XVF's auto-select prefers speech-like sources). So: anchor
+// the turn's bearing when a wake word commits (the wake phrase is
+// proof-of-user; barge/follow-up captures are NOT and never move the
+// anchor), then let barge candidates and follow-up fires proceed only if a
+// tracked beam points near that bearing.
+//
+// Fail-open everywhere: no anchor, or no sufficiently fresh reading → behave
+// exactly like 0.2.74. The gate only REJECTS on positive evidence (fresh
+// reading, every considered beam off-axis). A rejected candidate costs
+// nothing audible; a wrongly allowed one still faces stage B/C.
+//
+// The free-running beam (index 2) is deliberately NOT consulted: it parks at
+// exactly π/2 between transients (an idle default in the field logs), which
+// would leak through the gate whenever the anchor lands near 1.57.
+#define DOA_GATE_TOLERANCE_RAD      0.35f     // user jitter ±0.01; speakers sat 0.6+ away
+#define DOA_GATE_MAX_AGE_US         1500000   // cache older than this = fail open
+#define DOA_GATE_REJECT_COOLDOWN_US 1000000   // barge streak holdoff after a rejection
+static portMUX_TYPE s_doa_mux = portMUX_INITIALIZER_UNLOCKED;
+static float   s_doa_az[4] = {0};        // beam1, beam2, free-running, auto-select
+static int64_t s_doa_fresh_us = 0;       // 0 = no fresh reading yet
+static float   s_turn_bearing = -1.0f;   // <0 = unset; anchored at wake commit
+// Defined with the probe task near boot_operational; the wake-commit anchor
+// calls it directly for a fresh reading (the idle-cadence cache can be ~2 s
+// old, which would fail the anchor open in exactly the music-playing case
+// the gate exists for).
+static bool doa_read4(uint8_t cmd, float vals[4], uint8_t *last_st);
+
+static inline float doa_ang_dist(float a, float b)
+{
+    float d = fabsf(a - b);
+    return d > (float)M_PI ? (2.0f * (float)M_PI - d) : d;
+}
+
+// True = proceed. Logs rejections (throttled — a loud speaker can re-trip the
+// energy triggers every frame during a follow-up window).
+static bool doa_gate_allows(const char *what)
+{
+    float az[4], bearing;
+    int64_t fresh;
+    taskENTER_CRITICAL(&s_doa_mux);
+    memcpy(az, (const void *)s_doa_az, sizeof(az));
+    fresh = s_doa_fresh_us;
+    bearing = s_turn_bearing;
+    taskEXIT_CRITICAL(&s_doa_mux);
+    if (bearing < 0 || fresh == 0) return true;
+    if (esp_timer_get_time() - fresh > DOA_GATE_MAX_AGE_US) return true;
+    if (doa_ang_dist(az[0], bearing) <= DOA_GATE_TOLERANCE_RAD ||
+        doa_ang_dist(az[1], bearing) <= DOA_GATE_TOLERANCE_RAD ||
+        doa_ang_dist(az[3], bearing) <= DOA_GATE_TOLERANCE_RAD) return true;
+    static int64_t s_last_reject_log_us = 0;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us - s_last_reject_log_us > 1000000) {
+        s_last_reject_log_us = now_us;
+        char gl[128];
+        snprintf(gl, sizeof(gl), "[doagate] reject %s az=%.2f,%.2f,%.2f,%.2f turn=%.2f",
+                 what, (double)az[0], (double)az[1], (double)az[2], (double)az[3],
+                 (double)bearing);
+        ESP_LOGI(TAG, "%s", gl); oe_udplog_send(gl);
+    }
+    return false;
+}
 static vad_state_t *s_vad = NULL;
 static QueueHandle_t s_sentence_q = NULL;
 
@@ -481,8 +858,14 @@ static QueueHandle_t s_sentence_q = NULL;
 // first word ("Who started…" → "started…") because onset→confirm spans
 // ~700 ms+ and the ring couldn't reach back far enough. Barge prepends a
 // computed span (candidate age + BARGE_PREROLL_LEAD_MS); follow-up prepends
-// whatever accumulated since the window armed. 38.4 KB PSRAM.
-#define PREROLL_SAMPLES (16000 * 1200 / 1000)   // 1.2 s @ 16 kHz mono
+// whatever accumulated since the window armed.
+//
+// 2.6 s (was 1.2 s), 2026-07-24: the verify gate needs the full wake window
+// [fire−2.0 s, fire+0.5 s], so the ring must hold ≥2.0 s of pre-fire audio
+// with margin. At fire the frozen ring (preroll_append stops once
+// s_in_utterance) supplies the [fire−2.0 s, fire] slice; the +0.5 s tail is
+// captured over the next frames into the wake-window buffer. ~83 KB PSRAM.
+#define PREROLL_SAMPLES (16000 * 2600 / 1000)   // 2.6 s @ 16 kHz mono
 static int16_t *s_preroll_buf = NULL;
 static size_t   s_preroll_head = 0;     // next write index (circular)
 static size_t   s_preroll_filled = 0;   // valid samples, caps at PREROLL_SAMPLES
@@ -540,10 +923,14 @@ static size_t s_capture_used = 0;
 
 typedef struct {
     char text[SENTENCE_MAX];
+    // Snapshot the reply turn at enqueue time. A sentence dequeued after a
+    // verify ACCEPT must not resurrect audio from the reply we just stopped.
+    char turn_id[24];
 } sentence_t;
 
 static char s_token_accum[2048];
 static size_t s_token_accum_len = 0;
+static char s_token_accum_turn[24] = "";
 static SemaphoreHandle_t s_token_mutex = NULL;
 
 static int64_t get_awaiting_since_us(void)
@@ -663,6 +1050,13 @@ static void pair_worker_task(void *arg)
     if (oe_pair_redeem(r->server_url, r->pair_code, r->device_name, &pr) == ESP_OK) {
         nvs_creds_set_token(pr.token);
         if (pr.server_hint[0]) nvs_creds_set_server(pr.server_hint);
+        if (pr.device_id[0]) {
+            esp_err_t e = nvs_creds_set_device_id(pr.device_id);
+            if (e != ESP_OK) {
+                ESP_LOGW(TAG, "paired device_id NVS write failed: %s",
+                         esp_err_to_name(e));
+            }
+        }
         ESP_LOGI(TAG, "paired — rebooting into operational mode");
         free(r);
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -715,15 +1109,19 @@ static void flush_token_to_sentence_queue_locked(void)
     if (!s_sentence_q) {
         s_token_accum_len = 0;
         s_token_accum[0] = 0;
+        s_token_accum_turn[0] = 0;
         return;
     }
-    sentence_t s;
+    sentence_t s = {0};
     size_t take = s_token_accum_len < SENTENCE_MAX - 1 ? s_token_accum_len : SENTENCE_MAX - 1;
     memcpy(s.text, s_token_accum, take);
     s.text[take] = 0;
+    snprintf(s.turn_id, sizeof(s.turn_id), "%s",
+             s_token_accum_turn[0] ? s_token_accum_turn : s_turn_id);
     xQueueSend(s_sentence_q, &s, pdMS_TO_TICKS(100));
     s_token_accum_len = 0;
     s_token_accum[0] = 0;
+    s_token_accum_turn[0] = 0;
 }
 
 static void flush_token_to_sentence_queue(void)
@@ -738,6 +1136,7 @@ static void reset_token_accum(void)
     token_lock();
     s_token_accum_len = 0;
     s_token_accum[0] = 0;
+    s_token_accum_turn[0] = 0;
     token_unlock();
 }
 
@@ -749,13 +1148,35 @@ static bool token_accum_empty(void)
     return empty;
 }
 
-static void accumulate_token(const char *tok, size_t len)
+static void accumulate_token(const char *tok, size_t len, const char *turn_id)
 {
     if (!tok || len == 0) return;
     if (len >= sizeof(s_token_accum)) len = sizeof(s_token_accum) - 1;
 
     token_lock();
-    if (s_token_accum_len + len + 1 > sizeof(s_token_accum)) flush_token_to_sentence_queue_locked();
+    // Re-check correlation under the same lock used by ACCEPT's accumulator
+    // reset. An old event can pass evt_turn_stale(), lose the race to turn
+    // promotion, then arrive here; without this check it would be mislabeled
+    // as the new turn and spoken later.
+    if (turn_id && turn_id[0] &&
+        (!s_turn_id[0] || strcmp(turn_id, s_turn_id) != 0)) {
+        token_unlock();
+        return;
+    }
+    const char *event_turn = (turn_id && turn_id[0]) ? turn_id : s_turn_id;
+    if (s_token_accum_len > 0 && s_token_accum_turn[0] &&
+        event_turn[0] && strcmp(s_token_accum_turn, event_turn) != 0) {
+        flush_token_to_sentence_queue_locked();
+    }
+    if (s_token_accum_len == 0) {
+        snprintf(s_token_accum_turn, sizeof(s_token_accum_turn), "%s",
+                 event_turn);
+    }
+    if (s_token_accum_len + len + 1 > sizeof(s_token_accum)) {
+        flush_token_to_sentence_queue_locked();
+        snprintf(s_token_accum_turn, sizeof(s_token_accum_turn), "%s",
+                 event_turn);
+    }
     memcpy(s_token_accum + s_token_accum_len, tok, len);
     s_token_accum_len += len;
     s_token_accum[s_token_accum_len] = 0;
@@ -764,16 +1185,19 @@ static void accumulate_token(const char *tok, size_t len)
         char c = s_token_accum[i];
         if ((c == '.' || c == '!' || c == '?') && i + 1 < s_token_accum_len &&
             (s_token_accum[i + 1] == ' ' || s_token_accum[i + 1] == '\n')) {
-            sentence_t s;
+            sentence_t s = {0};
             size_t take = i + 1;
             if (take > SENTENCE_MAX - 1) take = SENTENCE_MAX - 1;
             memcpy(s.text, s_token_accum, take);
             s.text[take] = 0;
+            snprintf(s.turn_id, sizeof(s.turn_id), "%s",
+                     s_token_accum_turn[0] ? s_token_accum_turn : s_turn_id);
             xQueueSend(s_sentence_q, &s, pdMS_TO_TICKS(100));
             size_t rest = s_token_accum_len >= (i + 2) ? s_token_accum_len - (i + 2) : 0;
             memmove(s_token_accum, s_token_accum + i + 2, rest);
             s_token_accum_len = rest;
             s_token_accum[s_token_accum_len] = 0;
+            if (rest == 0) s_token_accum_turn[0] = 0;
             i = (size_t)-1;
         }
     }
@@ -1079,6 +1503,7 @@ typedef struct {
 } ambient_req_t;
 static void ambient_task(void *arg);
 static void ambient_resume(void);   // un-pause ambient audio once a turn is fully over
+static bool ambient_resume_locked(bool gate_rollback_owner);
 static void heartbeat_task(void *arg);
 static volatile bool s_ambient_active = false;
 static volatile bool s_ambient_stop   = false;
@@ -1113,7 +1538,16 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
 {
     switch (evt->type) {
         case OE_WS_EVT_CONNECTED:
+            // Treat CONNECTED→SERVER_CAPS as an untrusted compatibility
+            // window. A reconnect to an older server must not inherit the
+            // previous socket's capabilities for even one wake frame.
+            s_caps_tts_pause = false;
+            s_caps_stt_stream = false;
+            s_caps_turn_ids = false;
+            s_caps_tts_hold_ids = false;
+            s_authenticated_caps_seen = false;
             s_ws_connected = true;
+            __sync_add_and_fetch(&s_ws_connection_epoch, 1);
             // Bring AirPlay 1 receiver online now that we have Wi-Fi + a
             // paired account. airplay_init is internally idempotent so
             // reconnects are safe. Service name uses the configured device
@@ -1123,19 +1557,45 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // before this event fires, so the session is established first.
             alarm_resend_fired();
             break;
-        case OE_WS_EVT_CHAT_TOKEN:
-            if (evt_turn_stale(evt)) break;
-            accumulate_token(evt->text, evt->text_len);
+        case OE_WS_EVT_CHAT_TOKEN: {
+            if (!vg_lifecycle_take()) break;
+            if (s_drop_untagged_tts &&
+                evt->turn_id && evt->turn_id[0] &&
+                !evt_turn_stale(evt)) {
+                s_drop_untagged_tts = false;
+            }
+            if (!evt_turn_stale(evt) &&
+                !evt_untagged_conflicts_with_busy_turn(evt) &&
+                !s_speech_writes_blocked) {
+                accumulate_token(evt->text, evt->text_len, evt->turn_id);
+            }
+            vg_lifecycle_give();
             break;
+        }
         case OE_WS_EVT_CHAT_DONE:
-            if (evt_turn_stale(evt)) break;
+            if (!vg_lifecycle_take()) break;
+            if (s_drop_untagged_tts &&
+                (!evt->turn_id || !evt->turn_id[0])) {
+                s_drop_untagged_tts = false;
+                vg_lifecycle_give();
+                break;
+            }
+            if (evt_turn_stale(evt) ||
+                evt_untagged_conflicts_with_busy_turn(evt) ||
+                s_speech_writes_blocked) {
+                vg_lifecycle_give();
+                break;
+            }
             // A `done` while the user is mid-command is NOT ours to act on —
             // it's the tail of an aborted turn (stop-ack, superseded streamer)
             // racing the new turn. Acting on it used to IDLE the UI and
             // airplay_resume() over the user's speech (repro: wake during
             // AirPlay → barge-in pauses music + sends stop → server acks with
             // a bare done → music resumed mid-dictation).
-            if (s_in_utterance) break;
+            if (s_in_utterance && !s_verify_playback_hold_active) {
+                vg_lifecycle_give();
+                break;
+            }
             s_wait_led_until_us = 0;
             flush_token_to_sentence_queue();
             // If the reply produced no audio (e.g. server-side voice-intent
@@ -1164,27 +1624,52 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 }
                 airplay_resume();
             }
+            vg_lifecycle_give();
             break;
         case OE_WS_EVT_TTS_AUDIO_BEGIN:
             // Server-side streaming: about to receive synthesized PCM frames.
             // Enter SPEAKING once; the legacy per-sentence path isn't used.
             // Stale-turn begin (aborted reply racing a barge-in) must not
             // re-enter SPEAKING mid-capture of the new turn.
-            if (evt_turn_stale(evt)) break;
+            if (!vg_lifecycle_take()) break;
+            if (s_drop_untagged_tts &&
+                evt->turn_id && evt->turn_id[0] &&
+                !evt_turn_stale(evt)) {
+                s_drop_untagged_tts = false;
+            }
+            if (evt_turn_stale(evt) ||
+                evt_untagged_conflicts_with_busy_turn(evt) ||
+                s_speech_writes_blocked) {
+                vg_lifecycle_give();
+                break;
+            }
             if (!leds_buttons_is_muted() && !s_stream_active) {
+                if (s_verify_playback_hold_active &&
+                    (!evt->turn_id || !evt->turn_id[0])) {
+                    s_verify_hold_untagged_stream_owned = true;
+                }
                 s_stream_active  = true;
                 s_stream_end_req = false;
+                snprintf(s_stream_turn_id, sizeof(s_stream_turn_id), "%s",
+                         (evt->turn_id && evt->turn_id[0])
+                             ? evt->turn_id : "");
                 s_awaiting_reply = false;
                 s_last_tts_frame_us = esp_timer_get_time();
                 s_wait_led_until_us = 0;
                 set_ui_state(UI_STATE_SPEAKING);
                 for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                     if (s_ww[_i]) wakeword_notify_speaking_began(s_ww[_i]);
-                xvf3800_enable_amplifier(true);
+                // A provisional wake owns an independent local playback hold.
+                // Preserve the old stream state and buffer its tagged frames,
+                // but do not re-enable the amp while verification is listening.
+                if (!s_verify_playback_hold_active) {
+                    xvf3800_enable_amplifier(true);
+                }
                 audio_io_start_playback();
             }
+            vg_lifecycle_give();
             break;
-        case OE_WS_EVT_TTS_AUDIO:
+        case OE_WS_EVT_TTS_AUDIO: {
             // One base64 PCM frame → write straight to I²S. Payload contract
             // with lib/voice-tts-stream.mjs: 16 kHz STEREO interleaved s16le
             // (CHANNELS=2, ffmpeg -ac 2), so the frame goes to write_pcm
@@ -1192,8 +1677,18 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // and it (a) double-expanded the already-stereo frames (half-
             // speed audio) and (b) blew the 4 KB websocket_task stack — the
             // panic-on-every-reply bug fixed in 0.2.61.
-            if (evt_turn_stale(evt)) break;
-            if (s_stream_active && evt->text && evt->text_len) {
+            bool admitted = false;
+            if (!vg_lifecycle_take()) break;
+            if (!evt_turn_stale(evt) &&
+                !evt_untagged_conflicts_with_busy_turn(evt) &&
+                !s_speech_writes_blocked &&
+                evt_matches_active_stream(evt) &&
+                evt->text && evt->text_len) {
+                __sync_add_and_fetch(&s_speech_writers, 1);
+                admitted = true;
+            }
+            vg_lifecycle_give();
+            if (admitted) {
                 s_last_tts_frame_us = esp_timer_get_time();
                 size_t olen = 0;
                 if (mbedtls_base64_decode(s_pcm_frame, sizeof(s_pcm_frame), &olen,
@@ -1202,11 +1697,26 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                     // instead of fighting it for one ring.
                     audio_io_write_speech_pcm((const int16_t *)s_pcm_frame, olen / 2, 16000);
                 }
+                __sync_sub_and_fetch(&s_speech_writers, 1);
             }
             break;
+        }
         case OE_WS_EVT_TTS_AUDIO_END: {
             // All audio sent — finalize task drains the ring, then idles.
-            if (evt_turn_stale(evt)) break;
+            if (!vg_lifecycle_take()) break;
+            if (s_drop_untagged_tts &&
+                (!evt->turn_id || !evt->turn_id[0])) {
+                s_drop_untagged_tts = false;
+                vg_lifecycle_give();
+                break;
+            }
+            if (evt_turn_stale(evt) ||
+                evt_untagged_conflicts_with_busy_turn(evt) ||
+                s_speech_writes_blocked ||
+                !evt_matches_active_stream(evt)) {
+                vg_lifecycle_give();
+                break;
+            }
             if (s_stream_active) {
                 bool pending = false;
                 if (evt->text && evt->text_len) {
@@ -1219,6 +1729,7 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 s_stream_end_pending = pending;
                 s_stream_end_req = true;
             }
+            vg_lifecycle_give();
             break;
         }
         case OE_WS_EVT_DUPLICATE_SUPPRESSED:
@@ -1238,7 +1749,13 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // sitting deaf until the 90 s watchdog. The streaming path
             // usually converts errors to spoken fallback + done server-side;
             // this handles the bare-error paths (validation, caps, shutdown).
-            if (evt_turn_stale(evt)) break;
+            if (!vg_lifecycle_take()) break;
+            if (evt_turn_stale(evt) ||
+                evt_untagged_conflicts_with_busy_turn(evt) ||
+                s_speech_writes_blocked) {
+                vg_lifecycle_give();
+                break;
+            }
             if (s_awaiting_reply && !s_stream_active) {
                 ESP_LOGW(TAG, "server error while awaiting reply%s%.*s — back to IDLE",
                          evt->text ? ": " : "",
@@ -1250,18 +1767,27 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 set_ui_state(UI_STATE_IDLE);
                 airplay_resume();
             }
+            vg_lifecycle_give();
             break;
         case OE_WS_EVT_SERVER_CAPS: {
-            // { type:'server_caps', turn_ids, tts_pause, stt_stream } — what
-            // the connected server understands. Gates every NEW device→server
-            // message so this firmware stays compatible with older servers.
+            // Capability flags plus production verify-gate provisioning. The
+            // URL field is authoritative even when empty; omitted fields
+            // preserve state for compatibility with older servers.
             cJSON *j = cJSON_ParseWithLength(evt->text, evt->text_len);
             if (j) {
                 s_caps_tts_pause  = cJSON_IsTrue(cJSON_GetObjectItem(j, "tts_pause"));
                 s_caps_stt_stream = cJSON_IsTrue(cJSON_GetObjectItem(j, "stt_stream"));
-                ESP_LOGI(TAG, "server caps: tts_pause=%d stt_stream=%d",
-                         (int)s_caps_tts_pause, (int)s_caps_stt_stream);
+                s_caps_turn_ids   = cJSON_IsTrue(cJSON_GetObjectItem(j, "turn_ids"));
+                s_caps_tts_hold_ids =
+                    cJSON_IsTrue(cJSON_GetObjectItem(j, "tts_hold_ids"));
+                apply_verify_gate_server_caps(j);
+                ESP_LOGI(TAG, "server caps: turn_ids=%d tts_pause=%d tts_hold_ids=%d stt_stream=%d",
+                         (int)s_caps_turn_ids, (int)s_caps_tts_pause,
+                         (int)s_caps_tts_hold_ids,
+                         (int)s_caps_stt_stream);
                 cJSON_Delete(j);
+                s_authenticated_caps_seen = true;
+                maybe_resume_pending_ota();
             }
             break;
         }
@@ -1270,6 +1796,11 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             if (j) {
                 cJSON *je = cJSON_GetObjectItem(j, "enabled");
                 bool en = cJSON_IsTrue(je) || (cJSON_IsNumber(je) && je->valueint != 0);
+                if (en && !server_control_may_open_ungated_capture()) {
+                    ESP_LOGW(TAG,
+                             "conversation mode enable ignored: secure gate control unavailable");
+                    en = false;
+                }
                 if (en != s_conversation_mode) {
                     s_conversation_mode = en;
                     ESP_LOGI(TAG, "conversation mode: %s", en ? "on" : "off");
@@ -1305,12 +1836,25 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
         }
         case OE_WS_EVT_DISCONNECTED:
             s_ws_connected = false;
+            s_authenticated_caps_seen = false;
+            __sync_add_and_fetch(&s_ws_connection_epoch, 1);
+            s_drop_untagged_tts = false;
+            // Turn ownership is socket-scoped. Never carry an old id onto a
+            // replacement connection, where a retry/next wake could target a
+            // chat this socket never owned.
+            s_turn_id[0] = 0;
+            // The gate cannot safely accept after losing the control socket.
+            // The capture task will roll back its gate-owned hold on the next
+            // frame; keeping cleanup there preserves single-owner ordering.
+            vg_request_cancel();
             s_wait_led_until_us = 0;
             s_stream_end_pending = false;
             // Forget capabilities — the socket may reconnect to an older
             // server (rollback) that doesn't understand the newer messages.
             s_caps_tts_pause  = false;
             s_caps_stt_stream = false;
+            s_caps_turn_ids   = false;
+            s_caps_tts_hold_ids = false;
             // A barge verify in flight loses its server: release OUR pause on
             // the playback engine so the stream teardown below fully cleans up.
             if (s_paused_for_barge) {
@@ -1330,12 +1874,22 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             if (s_stream_active || s_stream_end_req) {
                 for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                     if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
-                xvf3800_enable_amplifier(false);
-                airplay_note_amp_forced_off();
-                audio_io_stop_playback();
-                audio_io_flush_playback();
                 s_stream_active = false;
                 s_stream_end_req = false;
+                s_stream_turn_id[0] = 0;
+                // The dead socket owns only its speech lane. A global engine
+                // stop/flush here used to erase retained ambient/AirPlay/alarm
+                // PCM, including audio behind a provisional verify hold.
+                audio_io_flush_speech();
+                const bool other_audio =
+                    s_legacy_tts_active ||
+                    (s_ambient_active && !s_ambient_paused) ||
+                    airplay_is_playing() || alarm_is_firing();
+                if (!other_audio || s_verify_playback_hold_active) {
+                    xvf3800_enable_amplifier(false);
+                    airplay_note_amp_forced_off();
+                }
+                if (!alarm_is_firing()) set_ui_state(UI_STATE_IDLE);
             }
             airplay_resume();
             break;
@@ -1432,20 +1986,45 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // short reply that already drained), arm immediately.
             cJSON *j = cJSON_ParseWithLength(evt->text, evt->text_len);
             if (j) {
+                if (!server_control_may_open_ungated_capture()) {
+                    ESP_LOGW(TAG,
+                             "follow-up ignored: secure gate control unavailable");
+                    cJSON_Delete(j);
+                    break;
+                }
+                if (!vg_lifecycle_take()) {
+                    cJSON_Delete(j);
+                    break;
+                }
                 // Raw-JSON message — turn check happens here, not in oe_ws.c.
                 // A follow-up window for an aborted/prior turn must not open.
                 const cJSON *jturn = cJSON_GetObjectItem(j, "turn_id");
                 if (cJSON_IsString(jturn) && jturn->valuestring[0] &&
                     (!s_turn_id[0] || strcmp(jturn->valuestring, s_turn_id) != 0)) {
+                    vg_lifecycle_give();
                     cJSON_Delete(j);
                     break;
                 }
                 const cJSON *jw = cJSON_GetObjectItem(j, "windowMs");
-                int window_ms = (cJSON_IsNumber(jw) && jw->valueint > 0) ? jw->valueint : 5000;
+                int window_ms =
+                    (cJSON_IsNumber(jw) && jw->valueint > 0)
+                        ? jw->valueint
+                        : FOLLOWUP_WINDOW_DEFAULT_MS;
+                if (window_ms > FOLLOWUP_WINDOW_MAX_MS) {
+                    ESP_LOGW(TAG, "follow-up window clamped from %d to %d ms",
+                             window_ms, FOLLOWUP_WINDOW_MAX_MS);
+                    window_ms = FOLLOWUP_WINDOW_MAX_MS;
+                }
                 // Lock the slot of the turn that opened this follow-up so a
                 // false-fire on a different wake-word can't reroute the
                 // answer to a different user.
-                s_followup_slot = s_active_slot;
+                // During provisional verification s_active_slot already names
+                // the candidate wake, while this tagged event still belongs to
+                // the old published reply. Preserve that reply's owner.
+                s_followup_slot =
+                    (s_verify_playback_hold_active &&
+                     s_prov_identity_valid)
+                        ? s_prov_prev_slot : s_active_slot;
                 // Defer whenever ANY part of the reply is still in flight —
                 // not just when PCM is already streaming. The old
                 // s_stream_active-only check armed the window immediately for
@@ -1467,6 +2046,7 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                     ESP_LOGI(TAG, "follow-up window armed: %d ms, slot=%u",
                              window_ms, (unsigned) s_followup_slot);
                 }
+                vg_lifecycle_give();
                 cJSON_Delete(j);
             }
             break;
@@ -1542,7 +2122,9 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                             // the LLM turn) — resuming here played the rain
                             // UNDER the reply. When busy, stay paused: the
                             // capture loop's idle check resumes it later.
-                            if (!s_in_utterance && !s_awaiting_reply && !s_stream_active &&
+                            if (!s_verify_playback_hold_active &&
+                                !leds_buttons_is_muted() && !alarm_is_firing() &&
+                                !s_in_utterance && !s_awaiting_reply && !s_stream_active &&
                                 get_followup_until_us() == 0 &&
                                 uxQueueMessagesWaiting(s_sentence_q) == 0 && token_accum_empty()) {
                                 oe_udplog_send("[ambient] same-marker restore -> resume");
@@ -1643,8 +2225,9 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // any in-flight audio, and let the ambient worker exit.
             ESP_LOGI(TAG, "stop_ambient (server)");
             s_ambient_stop = true;
-            audio_io_stop_playback();
-            audio_io_flush_playback();
+            // Ambient owns only the music lane. A global stop/flush here can
+            // destroy speech retained behind a provisional verify hold.
+            audio_io_flush_music();
             break;
         case OE_WS_EVT_OTA_CHECK: {
             // Server-driven OTA. Worker task fans the whole flow (fetch
@@ -1706,16 +2289,52 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
 // providers (Piper @ 22050, OpenAI @ 24000, ElevenLabs @ 44100, etc.) each
 // get to set their own rate.
 static uint32_t s_tts_stable_rate = 0;
+// Legacy per-sentence TTS runs a blocking HTTP stream on tts_worker_task.
+// Verification stalls its decoder callback (TCP backpressure preserves the
+// response) and ACCEPT flips abort so old audio cannot refill the speech ring
+// after teardown. The active turn tag is also checked at every PCM callback.
+static volatile bool s_legacy_tts_verify_hold = false;
+static volatile bool s_legacy_tts_abort = false;
+static volatile bool s_legacy_tts_was_verify_held = false;
+static char          s_legacy_tts_turn[24] = "";
 
 static void tts_pcm_cb(const int16_t *pcm, size_t samples, uint32_t rate, void *user)
 {
     (void)user;
+    for (;;) {
+        while (s_legacy_tts_verify_hold && !s_legacy_tts_abort) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (!vg_lifecycle_take()) return;
+        // Close the wait→write race with gate acquisition: begin/commit/mute
+        // mutate these flags under the same mutex. Register the writer before
+        // releasing it so ACCEPT can close admission and wait for this exact
+        // callback before flushing.
+        if (s_legacy_tts_verify_hold && !s_legacy_tts_abort) {
+            vg_lifecycle_give();
+            continue;
+        }
+        bool stale = s_speech_writes_blocked || s_legacy_tts_abort ||
+                     (s_legacy_tts_turn[0] &&
+                      (!s_turn_id[0] ||
+                       strcmp(s_legacy_tts_turn, s_turn_id) != 0));
+        if (!stale) __sync_add_and_fetch(&s_speech_writers, 1);
+        vg_lifecycle_give();
+        if (stale) {
+            // Make oe_tts_post's next HTTP event abort promptly too; returning
+            // here prevents every remaining decoded frame in the current chunk.
+            s_legacy_tts_abort = true;
+            return;
+        }
+        break;
+    }
     if (s_tts_stable_rate == 0 && rate > 0) {
         s_tts_stable_rate = rate;
         ESP_LOGI(TAG, "tts: rate locked at %u Hz", (unsigned)rate);
     }
     uint32_t effective_rate = s_tts_stable_rate > 0 ? s_tts_stable_rate : rate;
     audio_io_write_speech_pcm(pcm, samples, effective_rate);
+    __sync_sub_and_fetch(&s_speech_writers, 1);
 }
 
 // ── Server-side TTS streaming (push model) ──────────────────────────────────
@@ -1727,20 +2346,47 @@ static void tts_pcm_cb(const int16_t *pcm, size_t samples, uint32_t rate, void *
 static void stream_finalize_task(void *arg)
 {
     while (1) {
-        if (s_stream_end_req && s_stream_active) {
+        if (s_stream_end_req && s_stream_active &&
+            !s_verify_playback_hold_active) {
             s_stream_end_req = false;
+            bool deferred = false;
             for (int i = 0; i < 300; ++i) {           // up to ~15 s safety cap
+                // A verify hold can begin after this task observed end_req.
+                // Hand ownership back to the gate instead of finalizing the
+                // old reply underneath a potentially-rejected wake.
+                if (s_verify_playback_hold_active || !s_stream_active) {
+                    deferred = true;
+                    break;
+                }
                 uint32_t used = 0, cap = 0;
                 audio_io_get_playback_buf_stats(&used, &cap);
                 if (used == 0) break;
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
+            if (deferred || s_verify_playback_hold_active ||
+                !s_stream_active) {
+                if (s_stream_active) s_stream_end_req = true;
+                vTaskDelay(pdMS_TO_TICKS(30));
+                continue;
+            }
             vTaskDelay(pdMS_TO_TICKS(120));           // I²S DMA tail margin
+            if (!vg_lifecycle_take()) continue;
+            if (s_verify_playback_hold_active || !s_stream_active) {
+                if (s_stream_active) s_stream_end_req = true;
+                vg_lifecycle_give();
+                continue;
+            }
+            // Publish the terminal stream state while begin/commit/mute are
+            // excluded. A gate that wins this mutex sees a live stream and
+            // holds it; a finalizer that wins first makes the old reply fully
+            // terminal before that gate snapshots playback.
+            s_stream_active = false;
+            s_stream_turn_id[0] = 0;
+            vg_lifecycle_give();
             for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                 if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
             xvf3800_enable_amplifier(false);
             airplay_note_amp_forced_off();
-            s_stream_active = false;
             int64_t now_us = esp_timer_get_time();
             int64_t followup_until = get_followup_until_us();
             // Playback has drained — START any deferred follow-up window now, at
@@ -1767,19 +2413,37 @@ static void stream_finalize_task(void *arg)
             }
             s_stream_end_pending = false;
             airplay_resume();
-        } else if (s_stream_active && !s_stream_end_req && !s_paused_for_barge) {
+        } else if (s_stream_active && !s_stream_end_req &&
+                   !s_paused_for_barge &&
+                   !s_verify_playback_hold_active) {
             // Stall watchdog: tts_audio_begin arrived but the stream went
             // silent with no tts_audio_end and the ring has fully drained.
             // Without this there was NO timeout on SPEAKING — a server crash
             // mid-stream on a healthy socket left the amp on (AEC suppressing
             // the mic) and every non-owner wake slot gated forever. Use the
             // same teardown as the WS-disconnect path. Suspended while a
-            // barge verify holds the pacer paused (frames stop on purpose).
+            // barge or wake verification holds the pacer paused (frames stop
+            // on purpose).
             int64_t last = s_last_tts_frame_us;
             uint32_t used = 0, cap = 0;
             audio_io_get_playback_buf_stats(&used, &cap);
             if (last != 0 && used == 0 &&
                 esp_timer_get_time() - last > (int64_t)TTS_STREAM_STALL_TIMEOUT_MS * 1000) {
+                if (!vg_lifecycle_take()) {
+                    vTaskDelay(pdMS_TO_TICKS(30));
+                    continue;
+                }
+                // Revalidate under the lifecycle lock; a gate may have begun
+                // after the watchdog's outer snapshot and intentionally
+                // stopped frame arrival.
+                if (s_verify_playback_hold_active || !s_stream_active ||
+                    s_stream_end_req || s_paused_for_barge) {
+                    vg_lifecycle_give();
+                    continue;
+                }
+                s_stream_active = false;
+                s_stream_turn_id[0] = 0;
+                vg_lifecycle_give();
                 ESP_LOGW(TAG, "tts stream stalled (%d ms, ring empty, no end) — tearing down SPEAKING",
                          TTS_STREAM_STALL_TIMEOUT_MS);
                 oe_udplog_send("[tts] stream stall watchdog fired");
@@ -1789,7 +2453,6 @@ static void stream_finalize_task(void *arg)
                 airplay_note_amp_forced_off();
                 audio_io_stop_playback();
                 audio_io_flush_playback();
-                s_stream_active = false;
                 s_followup_pending_ms = 0;
                 set_ui_state(UI_STATE_IDLE);
                 airplay_resume();
@@ -1814,6 +2477,28 @@ static void tts_worker_task(void *arg)
     while (1) {
         if (xQueueReceive(s_sentence_q, &s, portMAX_DELAY) != pdTRUE) continue;
         if (leds_buttons_is_muted()) continue;
+        // Publish ownership before waiting: a gate that starts after dequeue
+        // can now hold/abort this exact sentence even though no PCM exists yet.
+        if (!vg_lifecycle_take()) continue;
+        s_legacy_tts_abort = false;
+        s_legacy_tts_was_verify_held = false;
+        snprintf(s_legacy_tts_turn, sizeof(s_legacy_tts_turn), "%s",
+                 s.turn_id[0] ? s.turn_id : s_turn_id);
+        s_legacy_tts_active = true;
+        vg_lifecycle_give();
+        while (s_legacy_tts_verify_hold && !s_legacy_tts_abort) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (s_legacy_tts_abort ||
+            (s_legacy_tts_turn[0] &&
+             (!s_turn_id[0] || strcmp(s_legacy_tts_turn, s_turn_id) != 0)) ||
+            leds_buttons_is_muted()) {
+            ESP_LOGI(TAG, "dropping stale/aborted TTS sentence (turn=%s current=%s)",
+                     s_legacy_tts_turn, s_turn_id);
+            s_legacy_tts_abort = true;
+            s_legacy_tts_active = false;
+            continue;
+        }
         ESP_LOGI(TAG, "tts sentence: \"%s\"", s.text);
         set_ui_state(UI_STATE_SPEAKING);
         // Re-open the wake-word feed for barge-in: THINKING is over now that
@@ -1828,6 +2513,12 @@ static void tts_worker_task(void *arg)
             if (s_ww[_i]) wakeword_notify_speaking_began(s_ww[_i]);
         }
         xvf3800_enable_amplifier(true);  // turn speaker on for playback
+        // Close the narrow race where a gate acquired its hold between the
+        // wait/check above and this amp write.
+        if (s_legacy_tts_verify_hold) {
+            xvf3800_enable_amplifier(false);
+            airplay_note_amp_forced_off();
+        }
         audio_io_start_playback();
         // Reset TTS rate-lock for this sentence — different providers can
         // stream at different rates (Piper 22050, OpenAI 24000, ElevenLabs
@@ -1839,11 +2530,51 @@ static void tts_worker_task(void *arg)
         // slot stays valid for the whole turn — utterance capture + STT +
         // chat + TTS — so reusing it here is correct.
         esp_err_t te = oe_tts_post(g_dev_config.server_url, g_dev_config.token,
-                                    s.text, NULL, (int)s_active_slot, tts_pcm_cb, NULL, NULL, NULL);
+                                    s.text, NULL, (int)s_active_slot, tts_pcm_cb,
+                                    NULL, &s_legacy_tts_abort, NULL);
         ESP_LOGI(TAG, "tts post -> %s, queue_remaining=%u",
                  esp_err_to_name(te), (unsigned)uxQueueMessagesWaiting(s_sentence_q));
-        vTaskDelay(pdMS_TO_TICKS(200));
-        if (uxQueueMessagesWaiting(s_sentence_q) == 0) {
+        // The HTTP stream can finish just before a verify hold starts, leaving
+        // its tail entirely in the retained speech ring. Defer this worker's
+        // amp/UI finalizer until the verdict, then (on rollback) wait for that
+        // preserved tail to actually drain.
+legacy_finalize_retry:
+        while (s_legacy_tts_verify_hold && !s_legacy_tts_abort) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (s_legacy_tts_was_verify_held && !s_legacy_tts_abort) {
+            for (int i = 0; i < 300; ++i) {
+                uint32_t used = 0, cap = 0;
+                audio_io_get_playback_buf_stats(&used, &cap);
+                if (used == 0 || s_legacy_tts_abort) break;
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (!s_legacy_tts_abort) vTaskDelay(pdMS_TO_TICKS(120));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        if (!vg_lifecycle_take()) continue;
+        // Close the final delay→teardown window. If begin acquired the hold
+        // while we slept, hand finalization back to the verdict path instead
+        // of clearing SPEAKING/UI state underneath retained audio.
+        if (s_legacy_tts_verify_hold && !s_legacy_tts_abort) {
+            s_legacy_tts_was_verify_held = true;
+            vg_lifecycle_give();
+            goto legacy_finalize_retry;
+        }
+        bool aborted = s_legacy_tts_abort ||
+                       (s_legacy_tts_turn[0] &&
+                        (!s_turn_id[0] ||
+                         strcmp(s_legacy_tts_turn, s_turn_id) != 0));
+        s_legacy_tts_active = false;
+        bool queue_empty = uxQueueMessagesWaiting(s_sentence_q) == 0;
+        vg_lifecycle_give();
+        if (aborted) {
+            ESP_LOGI(TAG, "legacy TTS teardown superseded (turn=%s)",
+                     s_legacy_tts_turn);
+            continue;
+        }
+        if (queue_empty) {
             for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i) {
                 if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
             }
@@ -1881,25 +2612,48 @@ static void mute_change_cb(bool muted)
 {
     g_dev_config.muted = muted;
     if (muted) {
+        // Capture stops consuming frames while muted, so it cannot perform
+        // the usual provisional rollback itself. The helper serializes with
+        // begin/commit, fences speech writers, performs local destruction
+        // while the verify holds remain asserted, then releases them last.
+        bool ambient_was_active = vg_abort_for_mute();
+        // DACP connect/send/recv can block on a dead controller. The local
+        // source, amp and writer teardown above is complete and the lifecycle
+        // mutex is released before this best-effort remote stop.
+        airplay_send_stop();
         // Ambient is a "real teardown" case (see s_ambient_stop's comment) —
         // before 0.2.62 this callback skipped it, leaving the ambient task's
         // HTTP stream alive and, worse, the server's ambient session marker
         // intact, so the wake-mid-ambient resume logic would resurrect the
         // "muted away" ambient after the next turn. Stop the worker AND tell
         // the server so both halves of the session die together.
-        if (s_ambient_active) {
-            s_ambient_stop = true;
+        if (ambient_was_active) {
             oe_ws_send_ambient_stopped("mute");
         }
-        audio_io_stop_playback();
-        audio_io_flush_playback();
-        // Cancel any in-flight server-pushed TTS stream (server halts on stop).
-        s_stream_active  = false;
-        s_stream_end_req = false;
-        oe_ws_send_stop(g_dev_config.default_agent_id, s_turn_id);
-        // Hard-drop any AirPlay session — physically muting a speaker
-        // should disconnect the iOS sender, not just gag the output.
-        airplay_stop();
+        // Cancel any in-flight server turn after local mute is already
+        // complete. The turn-scoped server guard makes a stale id a no-op.
+        // Modern firmware never sends an unscoped fallback: with no owned
+        // turn id it could abort an unrelated browser/device coordinator chat.
+        if (s_turn_id[0]) {
+            oe_ws_send_stop(g_dev_config.default_agent_id, s_turn_id);
+        }
+    } else {
+        // Physical mute owns durable producer fences. Re-open them only after
+        // the button state has published unmuted; any still-pending lane flush
+        // remains its own admission fence until playback_task services it.
+        if (vg_lifecycle_take()) {
+            s_speech_writes_blocked = false;
+            audio_io_allow_speech_writes();
+            audio_io_allow_music_writes();
+            // The alarm's amp callback is one-shot per firing session. If it
+            // arrived while mute owned physical silence, restore from durable
+            // alarm state now rather than leaving that session inaudible.
+            if (alarm_is_firing()) {
+                audio_io_start_playback();
+                xvf3800_enable_amplifier(true);
+            }
+            vg_lifecycle_give();
+        }
     }
 }
 
@@ -1925,6 +2679,1179 @@ static bool transcript_is_filler(const char *t)
         if (strcmp(norm, kFillers[i]) == 0) return true;
     }
     return false;
+}
+
+// ── Wake-word verify gate: device-owned provisional session (Option A) ───────
+// On a genuine wake fire, when OE's verify-gate proxy path is configured, we do NOT
+// immediately ack (no LED flip, no chime, no stt_begin). Instead we snapshot
+// the wake window [fire−2.0 s, fire+0.5 s] from the enlarged pre-roll ring plus
+// the first 0.5 s of command capture, POST it to the paired OE fixed gate path
+// on a worker task, and keep buffering the command locally. Only an explicit
+// effective=="accept" may commit the turn. A reject, transport/provider error,
+// malformed response, local deadline, missing identity/resource, disallowed OE
+// origin, or busy worker drops the fire. An explicitly empty provisioned path
+// is the one disabled state and preserves the legacy immediate path. Everything
+// keys on turn_id so a late verdict for a superseded fire is ignored. Follow-up
+// / speech-barge captures never enter this path (they carry no wake word). See
+// oe-design-docs/verify-gate-integration-plan.md §2.2.
+#define VG_PRE_SAMPLES   (16000 * 2000 / 1000)              // 2.0 s pre-fire  (32000)
+#define VG_TAIL_SAMPLES  (16000 *  500 / 1000)              // 0.5 s post-fire  (8000)
+#define VG_WIN_SAMPLES   (VG_PRE_SAMPLES + VG_TAIL_SAMPLES) // 2.5 s window    (40000)
+#define VG_DEADLINE_MS   1200                               // client long-poll deadline
+#define VG_STT_REPLAY_BUDGET_MS 160                         // ample margin under 512 ms ring
+#define VG_CONTROL_SEND_TIMEOUT_MS 20                       // never starve capture
+
+typedef enum {
+    VG_CONTROL_RETRY_RESUME = 1,
+    VG_CONTROL_RETRY_STOP,
+} vg_control_retry_kind_t;
+
+typedef struct {
+    vg_control_retry_kind_t kind;
+    char turn_id[24];
+    char hold_id[24];
+    char agent_id[OE_AGENT_ID_MAX];
+    uint32_t hold_generation;
+    uint32_t connection_epoch;
+} vg_control_retry_t;
+
+// A bounded gate send normally succeeds immediately. If the socket TX lock was
+// briefly busy, retry off the capture task so a REJECT cannot leave the old
+// server pacer paused, and ACCEPT cannot leave an old turn producing forever.
+// Both messages are turn-scoped; a late retry is a safe no-op after supersede.
+static void vg_control_retry_task(void *arg)
+{
+    vg_control_retry_t *job = (vg_control_retry_t *)arg;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (!oe_ws_connected() ||
+            __sync_fetch_and_add(&s_ws_connection_epoch, 0) !=
+                job->connection_epoch) {
+            break;
+        }
+        if (job->kind == VG_CONTROL_RETRY_RESUME) {
+            if (!vg_lifecycle_take()) break;
+            const bool still_current =
+                s_verify_hold_generation == job->hold_generation;
+            vg_lifecycle_give();
+            if (!still_current) break;
+        }
+        esp_err_t err =
+            job->kind == VG_CONTROL_RETRY_RESUME
+                ? oe_ws_send_tts_resume_hold_timeout(
+                      job->turn_id, job->hold_id, 100)
+                : oe_ws_send_stop_hold_timeout(
+                      job->agent_id, job->turn_id, job->hold_id, 100);
+        if (err == ESP_OK) {
+            free(job);
+            vTaskDelete(NULL);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    ESP_LOGW(TAG, "verify control retry exhausted (%s turn=%s)",
+             job->kind == VG_CONTROL_RETRY_RESUME ? "resume" : "stop",
+             job->turn_id);
+    free(job);
+    vTaskDelete(NULL);
+}
+
+static void vg_schedule_control_retry(vg_control_retry_kind_t kind,
+                                      const char *turn_id,
+                                      const char *hold_id,
+                                      const char *agent_id,
+                                      uint32_t hold_generation,
+                                      uint32_t connection_epoch)
+{
+    if ((!turn_id || !turn_id[0]) &&
+        (!hold_id || !hold_id[0])) {
+        return;
+    }
+    if (!oe_ws_connected() ||
+        __sync_fetch_and_add(&s_ws_connection_epoch, 0) !=
+            connection_epoch) {
+        return;
+    }
+    vg_control_retry_t *job =
+        (vg_control_retry_t *)calloc(1, sizeof(*job));
+    if (!job) {
+        ESP_LOGW(TAG, "verify control retry alloc failed");
+        return;
+    }
+    job->kind = kind;
+    snprintf(job->turn_id, sizeof(job->turn_id), "%s",
+             turn_id ? turn_id : "");
+    snprintf(job->hold_id, sizeof(job->hold_id), "%s",
+             hold_id ? hold_id : "");
+    snprintf(job->agent_id, sizeof(job->agent_id), "%s",
+             agent_id ? agent_id : "");
+    job->hold_generation = hold_generation;
+    job->connection_epoch = connection_epoch;
+    if (xTaskCreate(vg_control_retry_task, "vg_ctrl_retry", 3072, job, 5,
+                    NULL) != pdPASS) {
+        ESP_LOGW(TAG, "verify control retry task create failed");
+        free(job);
+    }
+}
+
+typedef enum { PROV_NONE = 0, PROV_FILL_TAIL, PROV_AWAIT_VERDICT } prov_state_t;
+static prov_state_t s_prov_state   = PROV_NONE;   // capture-task-owned
+static vad_end_reason_t s_prov_vad_end = VAD_END_NONE; // first terminal command boundary
+static int16_t     *s_verify_wav   = NULL;        // PSRAM, holds the assembled wake window
+static size_t       s_verify_win_len = 0;         // samples assembled so far
+static size_t       s_verify_pre_len = 0;         // pre-fire samples snapshotted (<=VG_PRE_SAMPLES)
+static int64_t      s_prov_deadline_us = 0;
+
+// Capture-task → verify-worker handshake. Dispatch fills s_verify_wav + the
+// job params WHILE the worker is idle (s_verify_inflight==false), then gives
+// the binary semaphore. The worker reads s_verify_wav in place (no copy); the
+// capture task must not reuse s_verify_wav until s_verify_inflight clears — it
+// never does during a live provisional/command. A new genuine wake that finds
+// the worker busy is rejected; it must never fall into the ungated command path.
+// The result is published as (s_verify_effective, s_verify_res_turn) with
+// s_verify_done set last; the capture task ignores a result whose turn does not
+// match the live turn_id.
+static SemaphoreHandle_t s_verify_job_sem  = NULL;
+static TaskHandle_t      s_verify_worker_handle = NULL;
+static volatile bool     s_verify_inflight = false;
+static volatile bool     s_verify_done     = false;
+static volatile int      s_verify_effective = (int)OE_VERIFY_ERROR;
+static char              s_verify_res_turn[24] = "";   // turn the published result belongs to
+static char              s_verify_job_turn[24] = "";   // turn the dispatched job is for
+static char              s_verify_job_server_url[OE_URL_MAX] = "";
+static char              s_verify_job_gate_path[OE_URL_MAX] = "";
+static char              s_verify_job_device_id[OE_DEVICE_ID_MAX] = "";
+static char              s_verify_job_slug[WW_WAKE_SLUG_MAX] = "";
+static float             s_verify_job_score  = -1.0f;
+static size_t            s_verify_job_samples = 0;
+
+// Playback hold snapshot. The gate owns an independent audio_io/AirPlay hold;
+// these fields track only source-side changes that must be rolled back.
+static bool              s_verify_hold_stream_flow_paused = false;
+static bool              s_verify_hold_ambient_owned = false;
+static bool              s_verify_hold_transferred_barge = false;
+static char              s_verify_hold_old_turn[24] = "";
+static char              s_verify_hold_ambient_marker[64] = "";
+
+typedef enum {
+    VG_DISABLED = 0,  // explicit empty path: preserve the legacy wake path
+    VG_READY,
+    VG_BLOCKED,       // configured, but cannot prove this wake: drop it
+} verify_gate_state_t;
+
+// Configuration and readiness are deliberately separate. Once the proxy path is
+// configured, a missing canonical id, capture resource, worker, token, or an
+// already-busy worker is a fail-closed condition—not a reason to bypass.
+static verify_gate_state_t verify_gate_state(const char **blocked_reason)
+{
+    bool known;
+    bool has_path;
+    bool has_device_id;
+    portENTER_CRITICAL(&s_verify_config_mux);
+    known = s_verify_gate_config_known;
+    has_path = g_dev_config.verify_gate_path[0] != 0;
+    has_device_id = g_dev_config.device_id[0] != 0;
+    portEXIT_CRITICAL(&s_verify_config_mux);
+    if (!known) {
+        if (blocked_reason) *blocked_reason = "gate_policy_pending";
+        return VG_BLOCKED;
+    }
+    if (!has_path) return VG_DISABLED;
+    if (!has_device_id) {
+        if (blocked_reason) *blocked_reason = "missing_device_id";
+        return VG_BLOCKED;
+    }
+    if (!g_dev_config.token[0]) {
+        if (blocked_reason) *blocked_reason = "missing_token";
+        return VG_BLOCKED;
+    }
+    if (!oe_verify_gate_origin_allowed(g_dev_config.server_url)) {
+        if (blocked_reason) *blocked_reason = "disallowed_oe_origin";
+        return VG_BLOCKED;
+    }
+    // Correlation is part of the safety boundary, not an optional
+    // optimization. A persisted gate URL may outlive a server rollback; on a
+    // server that does not echo turn ids, late old TTS frames could cross the
+    // ACCEPT promotion and refill the freshly flushed speech lane.
+    if (!s_caps_turn_ids || !s_caps_tts_pause ||
+        !s_caps_tts_hold_ids) {
+        if (blocked_reason) {
+            *blocked_reason = "server_gate_protocol_unavailable";
+        }
+        return VG_BLOCKED;
+    }
+    if (!s_preroll_buf || !s_verify_wav || !s_verify_job_sem ||
+        !s_verify_worker_handle) {
+        if (blocked_reason) *blocked_reason = "resources_unavailable";
+        return VG_BLOCKED;
+    }
+    if (s_verify_inflight) {
+        if (blocked_reason) *blocked_reason = "worker_busy";
+        return VG_BLOCKED;
+    }
+    return VG_READY;
+}
+
+static void vg_restore_rejected_identity(void)
+{
+    if (!s_prov_identity_valid) return;
+    s_active_slot = s_prov_prev_slot;
+    s_active_wake_prob = s_prov_prev_prob;
+    snprintf(s_active_wake_slug, sizeof(s_active_wake_slug), "%s",
+             s_prov_prev_slug);
+    // Do not overwrite a newer follow-up event that arrived during the gate.
+    if (get_followup_until_us() == 0 &&
+        s_prov_prev_followup_until_us > esp_timer_get_time()) {
+        set_followup_until_us(s_prov_prev_followup_until_us);
+    }
+    s_prov_identity_valid = false;
+    s_prov_bearing_pending = false;
+}
+
+static void vg_accept_identity(void)
+{
+    if (s_prov_bearing_pending) {
+        taskENTER_CRITICAL(&s_doa_mux);
+        s_turn_bearing = s_prov_bearing;
+        taskEXIT_CRITICAL(&s_doa_mux);
+    }
+    s_prov_identity_valid = false;
+    s_prov_bearing_pending = false;
+}
+
+static void vg_clear_playback_hold_locked(void)
+{
+    s_verify_playback_hold_active = false;
+    s_verify_hold_stream_flow_paused = false;
+    s_verify_hold_ambient_owned = false;
+    s_verify_hold_transferred_barge = false;
+    s_verify_hold_untagged_stream_owned = false;
+    s_verify_hold_old_turn[0] = 0;
+    s_verify_hold_ambient_marker[0] = 0;
+}
+
+static bool vg_wait_playback_writers_locked(uint32_t timeout_ms)
+{
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while ((__sync_fetch_and_add(&s_speech_writers, 0) != 0 ||
+            !audio_io_speech_writers_idle() ||
+            !audio_io_music_writers_idle()) &&
+           esp_timer_get_time() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return __sync_fetch_and_add(&s_speech_writers, 0) == 0 &&
+           audio_io_speech_writers_idle() &&
+           audio_io_music_writers_idle();
+}
+
+static bool vg_wait_speech_writers_locked(uint32_t timeout_ms)
+{
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while ((__sync_fetch_and_add(&s_speech_writers, 0) != 0 ||
+            !audio_io_speech_writers_idle()) &&
+           esp_timer_get_time() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return __sync_fetch_and_add(&s_speech_writers, 0) == 0 &&
+           audio_io_speech_writers_idle();
+}
+
+static bool vg_service_gate_flushes_locked(uint32_t timeout_ms)
+{
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    do {
+        const bool music_clean =
+            audio_io_gate_service_pending_music_flush();
+        const bool speech_clean =
+            audio_io_gate_service_pending_speech_flush();
+        if (music_clean && speech_clean) return true;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    } while (esp_timer_get_time() < deadline);
+    return false;
+}
+
+static bool vg_service_gate_speech_flush_locked(uint32_t timeout_ms)
+{
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    do {
+        if (audio_io_gate_service_pending_speech_flush()) return true;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    } while (esp_timer_get_time() < deadline);
+    return false;
+}
+
+// Called with s_verify_lifecycle_mutex held immediately before releasing the
+// audio gate. alarm_amp_cb uses the same mutex, so an alarm start is either
+// represented by this latch or observes the fully released gate and performs
+// its own handoff; it cannot fall between the two.
+static void vg_release_deferred_alarm_locked(void)
+{
+    if (!s_alarm_amp_deferred) return;
+    s_alarm_amp_deferred = false;
+    if (leds_buttons_is_muted() || !alarm_is_firing()) return;
+    audio_io_start_playback();
+    xvf3800_enable_amplifier(true);
+}
+
+// External priority/destructive events request cancellation through the same
+// lifecycle state used by begin/commit. The normal path takes the mutex; the
+// busy path publishes the one-way cancellation flag without waiting so a
+// synchronous WebSocket error callback cannot recursively deadlock its sender.
+static void vg_request_cancel(void)
+{
+    if (!s_verify_lifecycle_mutex) {
+        s_verify_cancelled = true;
+        return;
+    }
+    // A failed esp_websocket_client send can synchronously dispatch the
+    // DISCONNECTED callback on the very task that currently owns this mutex.
+    // Never block recursively here: publish the cancellation lock-free when
+    // the lifecycle is busy; begin/commit/rollback recheck it before crossing
+    // or releasing their boundary.
+    if (xSemaphoreTake(s_verify_lifecycle_mutex, 0) != pdTRUE) {
+        s_verify_cancelled = true;
+        return;
+    }
+    if (s_verify_playback_hold_active) s_verify_cancelled = true;
+    xSemaphoreGive(s_verify_lifecycle_mutex);
+}
+
+// Release a provisional hold without destroying any playback. Source
+// producers are re-opened while the independent audio gate is still held;
+// the final release then makes the preserved rings audible atomically.
+static void vg_playback_hold_finish_rollback_locked(void)
+{
+    if (!s_verify_playback_hold_active) return;
+
+    // The mute callback has already published the physical mute state and is
+    // waiting for this mutex. It owns destructive teardown; do not resume a
+    // server pacer or clear its legacy abort while the speaker is muting.
+    if (leds_buttons_is_muted()) {
+        s_verify_cancelled = true;
+        return;
+    }
+
+    const bool same_old_turn =
+        strcmp(s_verify_hold_old_turn, s_turn_id) == 0;
+    const bool stream_live =
+        s_stream_active &&
+        (same_old_turn ||
+         (s_verify_hold_untagged_stream_owned &&
+          !s_stream_turn_id[0]));
+
+    s_legacy_tts_verify_hold = false;
+    // begin never asserts the legacy abort flag, so rollback must not clear
+    // it. A concurrent destructive owner (mute/disconnect/explicit stop) may
+    // have asserted it for reasons unrelated to this reversible hold.
+
+    // A source that independently stopped during verification may have queued
+    // a destructive lane flush. Service it while playback is still
+    // acknowledged-held; the request itself already canceled/fenced old
+    // writers, so this does not truncate an otherwise live REJECT path.
+    if (!vg_service_gate_flushes_locked(250)) {
+        ESP_LOGE(TAG, "verify rollback could not settle pending lane flush");
+        oe_udplog_send("[verify] rollback flush invariant failed — rebooting");
+        esp_restart();
+        return;
+    }
+
+    bool ambient_resumed = false;
+    if (s_verify_hold_ambient_owned &&
+        strncmp(s_ambient_cur_marker, s_verify_hold_ambient_marker,
+                sizeof(s_verify_hold_ambient_marker)) == 0) {
+        // The lifecycle mutex is already held. This variant bypasses only the
+        // provisional hold/busy checks; mute, alarm, stop and source identity
+        // still veto restoration.
+        ambient_resumed = ambient_resume_locked(true);
+    }
+
+    // Do not pre-enable the amp from an AirPlay state snapshot: RAOP STOP can
+    // race that snapshot while its amp latch is still marked forced-off. A
+    // genuinely live transport receives another PCM callback immediately
+    // after verify release, and that callback owns the amp enable.
+    const bool source_will_play =
+        stream_live || s_legacy_tts_active || ambient_resumed ||
+        alarm_is_firing();
+    if (!audio_io_is_paused() && source_will_play) {
+        xvf3800_enable_amplifier(true);
+        audio_io_start_playback();
+    }
+
+    // AirPlay can begin feeding its music lane again while the audio gate is
+    // still closed; releasing the shared gate last makes rollback audible as
+    // one transition and preserves the queued speech lane.
+    airplay_verify_release();
+    vg_release_deferred_alarm_locked();
+    audio_io_gate_release_playback();
+    if (s_verify_hold_transferred_barge && stream_live) {
+        s_barge_cooldown_until_us =
+            esp_timer_get_time() +
+            (int64_t)BARGE_FALSE_ALARM_COOLDOWN_MS * 1000;
+        set_ui_state(UI_STATE_SPEAKING);
+    }
+
+    vg_clear_playback_hold_locked();
+}
+
+static void vg_playback_hold_rollback(void)
+{
+    if (!vg_lifecycle_take()) return;
+    if (!s_verify_playback_hold_active) {
+        vg_lifecycle_give();
+        return;
+    }
+    if (leds_buttons_is_muted()) {
+        s_verify_cancelled = true;
+        vg_lifecycle_give();
+        return;
+    }
+
+    const bool need_resume =
+        s_verify_hold_stream_flow_paused &&
+        s_caps_tts_pause && s_caps_tts_hold_ids &&
+        oe_ws_connected();
+    char resume_turn[sizeof(s_verify_hold_old_turn)];
+    char resume_hold[sizeof(s_prov_turn_id)];
+    snprintf(resume_turn, sizeof(resume_turn), "%s",
+             s_verify_hold_old_turn);
+    snprintf(resume_hold, sizeof(resume_hold), "%s",
+             s_prov_turn_id);
+    const uint32_t resume_generation =
+        __sync_fetch_and_add(&s_verify_hold_generation, 0);
+    const uint32_t resume_epoch =
+        __sync_fetch_and_add(&s_ws_connection_epoch, 0);
+
+    // Never call esp_websocket_client while holding the lifecycle mutex. A
+    // send error synchronously dispatches ERROR then DISCONNECTED callbacks;
+    // both must be able to enter this lifecycle without self-deadlocking.
+    if (need_resume) {
+        vg_lifecycle_give();
+        esp_err_t re = ESP_FAIL;
+        for (int attempt = 0; attempt < 2 && re != ESP_OK; ++attempt) {
+            if (__sync_fetch_and_add(&s_ws_connection_epoch, 0) !=
+                resume_epoch) {
+                break;
+            }
+            re = oe_ws_send_tts_resume_hold_timeout(
+                resume_turn, resume_hold, 50);
+        }
+        if (re != ESP_OK) {
+            ESP_LOGW(TAG, "verify rollback tts_resume failed after retry: %s",
+                     esp_err_to_name(re));
+            oe_udplog_send("[verify] rollback resume send failed");
+            vg_schedule_control_retry(
+                VG_CONTROL_RETRY_RESUME, resume_turn, resume_hold, NULL,
+                resume_generation, resume_epoch);
+        }
+        if (!vg_lifecycle_take()) return;
+    }
+
+    // Mute may have won while the bounded resume was outside the lock.
+    // Its local teardown already released/cleared the holds.
+    if (!s_verify_playback_hold_active) {
+        vg_lifecycle_give();
+        return;
+    }
+    vg_playback_hold_finish_rollback_locked();
+    vg_lifecycle_give();
+}
+
+// Acquire every reversible source hold before gate audio capture starts.
+// A tagged streamed reply additionally needs a bounded server-pacer pause;
+// inability to establish that pause drops the wake with playback restored.
+static bool vg_playback_hold_begin(void)
+{
+    if (!vg_lifecycle_take()) return false;
+    if (s_verify_playback_hold_active || leds_buttons_is_muted() ||
+        alarm_is_firing() || !oe_ws_connected() ||
+        !s_caps_turn_ids || !s_caps_tts_pause ||
+        !s_caps_tts_hold_ids || !s_prov_turn_id[0]) {
+        vg_lifecycle_give();
+        return false;
+    }
+
+    const bool stream_now = s_stream_active;
+    if (stream_now && s_stream_turn_id[0] &&
+        (!s_turn_id[0] ||
+         strcmp(s_stream_turn_id, s_turn_id) != 0)) {
+        oe_udplog_send("[verify] active TTS is not safely pausable — fire dropped");
+        vg_lifecycle_give();
+        return false;
+    }
+
+    snprintf(s_verify_hold_old_turn, sizeof(s_verify_hold_old_turn), "%s",
+             s_turn_id);
+    s_verify_hold_stream_flow_paused = false;
+    s_verify_hold_ambient_owned = false;
+    s_verify_hold_transferred_barge = s_paused_for_barge;
+    s_verify_hold_untagged_stream_owned =
+        stream_now && !s_stream_turn_id[0];
+    s_verify_hold_ambient_marker[0] = 0;
+    s_verify_cancelled = false;
+
+    // Acquire every component hold first, then publish ACTIVE while still
+    // holding the lifecycle mutex. A mute/alarm/disconnect requester can no
+    // longer observe a half-acquired set and strand the later flags.
+    esp_err_t hold_err = audio_io_gate_hold_playback();
+    if (hold_err != ESP_OK) {
+        ESP_LOGW(TAG, "verify playback hold could not quiesce audio task: %s",
+                 esp_err_to_name(hold_err));
+        oe_udplog_send("[verify] playback hold unavailable — fire dropped");
+        vg_lifecycle_give();
+        return false;
+    }
+    __sync_add_and_fetch(&s_verify_hold_generation, 1);
+    airplay_verify_hold();
+    s_legacy_tts_verify_hold = true;
+    if (s_legacy_tts_active) s_legacy_tts_was_verify_held = true;
+    s_verify_playback_hold_active = true;
+
+    if (s_ambient_active && !s_ambient_paused) {
+        s_verify_hold_ambient_owned = true;
+        snprintf(s_verify_hold_ambient_marker,
+                 sizeof(s_verify_hold_ambient_marker), "%s",
+                 s_ambient_cur_marker);
+        s_ambient_paused = true;
+        oe_udplog_send("[ambient] HOLD (wake verification)");
+    }
+
+    // Transfer a speech-barge pause only after the independent gate hold is
+    // established, so there is no unpaused frame between the two owners.
+    if (s_paused_for_barge) {
+        s_paused_for_barge = false;
+        s_barge_state = BARGE_NONE;
+        s_barge_capture = false;
+        audio_io_resume_playback();
+    }
+
+    // The playback task acknowledgement proves no more I2S writes can begin,
+    // but the TX DMA may still contain the tail of its last chunk even when
+    // every source/ring snapshot above is empty. Silence the physical output
+    // unconditionally; rollback restores it only from live source ownership.
+    xvf3800_enable_amplifier(false);
+    airplay_note_amp_forced_off();
+
+    char pause_turn[sizeof(s_verify_hold_old_turn)];
+    char pause_hold[sizeof(s_prov_turn_id)];
+    snprintf(pause_turn, sizeof(pause_turn), "%s",
+             s_verify_hold_old_turn);
+    snprintf(pause_hold, sizeof(pause_hold), "%s", s_prov_turn_id);
+    // Establish the server-side latch for EVERY provisional wake, including
+    // a first-ever wake with no prior turn/stream. This closes the window in
+    // which a turnless announcement could start after local hold acquisition.
+    // Mark it optimistically: if the frame queued just before a reported send
+    // failure, rollback's matching hold-id resume remains the safe inverse.
+    s_verify_hold_stream_flow_paused = true;
+    vg_lifecycle_give();
+    esp_err_t pe = oe_ws_send_tts_pause_hold_timeout(
+        pause_turn, pause_hold, VG_CONTROL_SEND_TIMEOUT_MS);
+    if (!vg_lifecycle_take()) return false;
+    // Mute may have completed the entire local teardown while the bounded
+    // send ran outside the lock.
+    if (!s_verify_playback_hold_active) {
+        vg_lifecycle_give();
+        return false;
+    }
+    if (pe != ESP_OK) {
+        ESP_LOGW(TAG, "verify tts_pause failed: %s — restoring reply",
+                 esp_err_to_name(pe));
+        // Restore the old reply's routing slot before releasing a legacy
+        // worker that may be waiting on the hold.
+        vg_restore_rejected_identity();
+        vg_lifecycle_give();
+        vg_playback_hold_rollback();
+        return false;
+    }
+
+    // The physical/network state can change while the bounded pause send
+    // yields. Revalidate before exposing a usable provisional session.
+    if (s_verify_cancelled || leds_buttons_is_muted() ||
+        alarm_is_firing() || !oe_ws_connected()) {
+        vg_restore_rejected_identity();
+        vg_lifecycle_give();
+        vg_playback_hold_rollback();
+        return false;
+    }
+    vg_lifecycle_give();
+    return true;
+}
+
+// ACCEPT was explicit, but a priority owner or socket loss arrived while the
+// hold-scoped STOP send was outside the lifecycle mutex. Delivery is ambiguous,
+// so the old speech turn cannot be safely resumed; equally, a disconnected
+// provisional id must never be promoted onto the next socket. Retire only the
+// old speech ownership, restore independent live sources, and abandon capture.
+// Caller owns s_verify_lifecycle_mutex.
+static bool vg_cancel_accept_after_stop_locked(void)
+{
+    const bool had_stream = s_stream_active;
+    const bool had_legacy = s_legacy_tts_active;
+
+    s_speech_writes_blocked = true;
+    audio_io_block_speech_writes();
+    if (!vg_wait_speech_writers_locked(1000)) {
+        ESP_LOGE(TAG, "cancelled accept could not quiesce speech writers");
+        oe_udplog_send("[verify] cancelled accept invariant failed — rebooting");
+        esp_restart();
+        return false;
+    }
+
+    s_legacy_tts_abort = true;
+    s_stream_active = false;
+    s_stream_end_req = false;
+    s_stream_end_pending = false;
+    s_stream_turn_id[0] = 0;
+    s_turn_id[0] = 0;
+    s_awaiting_reply = false;
+    set_awaiting_since_us(0);
+    s_followup_pending_ms = 0;
+    set_followup_until_us(0);
+    s_wait_led_until_us = 0;
+    audio_io_flush_speech();
+    xQueueReset(s_sentence_q);
+    reset_token_accum();
+    s_legacy_tts_verify_hold = false;
+
+    if (!vg_service_gate_speech_flush_locked(250)) {
+        ESP_LOGE(TAG, "cancelled accept could not service speech flush");
+        oe_udplog_send("[verify] cancelled accept flush failed — rebooting");
+        esp_restart();
+        return false;
+    }
+
+    if (had_stream || had_legacy) {
+        for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i)
+            if (s_ww[i]) wakeword_notify_speaking_ended(s_ww[i]);
+    }
+
+    // The accepted command will not run, so retire its/its predecessor's
+    // whole-turn AirPlay latch. The independent verify hold still prevents
+    // PCM admission until the final release below.
+    airplay_resume();
+    const bool ambient_resumed = ambient_resume_locked(true);
+    if (!audio_io_is_paused() &&
+        (ambient_resumed || alarm_is_firing())) {
+        audio_io_start_playback();
+        xvf3800_enable_amplifier(true);
+    }
+
+    airplay_verify_release();
+    vg_release_deferred_alarm_locked();
+    audio_io_gate_release_playback();
+    vg_clear_playback_hold_locked();
+    s_speech_writes_blocked = false;
+    audio_io_allow_speech_writes();
+    return false;
+}
+
+// Explicit ACCEPT is the sole destructive boundary. Stop uses the old reply
+// id; only after that frame is queued do we publish the provisional id, making
+// all late old reply events stale.
+static bool vg_playback_hold_commit(void)
+{
+    if (!vg_lifecycle_take()) return false;
+    if (!s_verify_playback_hold_active || s_verify_cancelled ||
+        leds_buttons_is_muted() || alarm_is_firing() ||
+        !oe_ws_connected() || !s_caps_turn_ids ||
+        !s_caps_tts_pause || !s_caps_tts_hold_ids ||
+        !s_prov_turn_id[0]) {
+        vg_lifecycle_give();
+        return false;
+    }
+
+    char stop_turn[sizeof(s_verify_hold_old_turn)];
+    char stop_hold[sizeof(s_prov_turn_id)];
+    snprintf(stop_turn, sizeof(stop_turn), "%s",
+             s_verify_hold_old_turn);
+    snprintf(stop_hold, sizeof(stop_hold), "%s", s_prov_turn_id);
+    const uint32_t stop_generation =
+        __sync_fetch_and_add(&s_verify_hold_generation, 0);
+    const uint32_t stop_epoch =
+        __sync_fetch_and_add(&s_ws_connection_epoch, 0);
+
+    // From this point an explicit ACCEPT owns the transition. Quarantine any
+    // already-queued turnless announcement frames before the matching
+    // hold-scoped STOP crosses the socket. Local writer cancellation remains
+    // after the send, so every pre-boundary failure above was reversible.
+    s_drop_untagged_tts = true;
+    vg_lifecycle_give();
+
+    // Stop the exact server hold even when there is no old turn id (first wake
+    // during a turnless announcement). OE uses hold_id as socket ownership and
+    // never falls through to the legacy user+agent abort in that case.
+    esp_err_t se = ESP_FAIL;
+    for (int attempt = 0; attempt < 2 && se != ESP_OK; ++attempt) {
+        if (__sync_fetch_and_add(&s_ws_connection_epoch, 0) !=
+            stop_epoch) {
+            break;
+        }
+        se = oe_ws_send_stop_hold_timeout(
+            g_dev_config.default_agent_id, stop_turn, stop_hold, 50);
+    }
+    if (se != ESP_OK) {
+        ESP_LOGW(TAG, "verify accept stop send failed after retry: %s",
+                 esp_err_to_name(se));
+        vg_schedule_control_retry(
+            VG_CONTROL_RETRY_STOP, stop_turn, stop_hold,
+            g_dev_config.default_agent_id,
+            stop_generation, stop_epoch);
+    }
+    if (!vg_lifecycle_take()) return false;
+    // Mute can win while the bounded stop is outside the lock. It already
+    // performed the accepted turn's destructive local teardown; report the
+    // boundary as crossed so the caller only suppresses new capture.
+    if (!s_verify_playback_hold_active) {
+        vg_lifecycle_give();
+        return true;
+    }
+    // The STOP send deliberately ran without the lifecycle mutex. Do not
+    // publish this provisional id after its socket epoch died, nor install
+    // whole-turn source pauses after an alarm/cancellation already won.
+    if (leds_buttons_is_muted()) {
+        // Physical mute has published and is waiting for this mutex; leave the
+        // held resources for its destructive owner.
+        vg_lifecycle_give();
+        return false;
+    }
+    const bool socket_lost =
+        __sync_fetch_and_add(&s_ws_connection_epoch, 0) != stop_epoch ||
+        !oe_ws_connected() || !s_caps_turn_ids ||
+        !s_caps_tts_pause || !s_caps_tts_hold_ids;
+    const bool hold_changed =
+        __sync_fetch_and_add(&s_verify_hold_generation, 0) != stop_generation ||
+        strcmp(s_prov_turn_id, stop_hold) != 0;
+    if (socket_lost || hold_changed || s_verify_cancelled ||
+        alarm_is_firing()) {
+        ESP_LOGW(TAG,
+                 "verify accept abandoned after stop attempt "
+                 "(socket=%d hold=%d cancel=%d alarm=%d)",
+                 socket_lost ? 1 : 0, hold_changed ? 1 : 0,
+                 s_verify_cancelled ? 1 : 0,
+                 alarm_is_firing() ? 1 : 0);
+        if (socket_lost) s_drop_untagged_tts = false;
+        bool committed = vg_cancel_accept_after_stop_locked();
+        vg_lifecycle_give();
+        return committed;
+    }
+
+    // The accepted boundary is now crossed. Cancel and close both lane
+    // admissions, then quiesce callbacks that passed correlation just before
+    // promotion. Cancellation-aware ring sends leave within ~5 ms.
+    s_speech_writes_blocked = true;
+    audio_io_block_speech_writes();
+    audio_io_block_music_writes();
+    if (!vg_wait_playback_writers_locked(1000)) {
+        ESP_LOGE(TAG, "accepted verify could not quiesce playback writers");
+        oe_udplog_send("[verify] accepted teardown invariant failed — rebooting");
+        vg_lifecycle_give();
+        esp_restart();
+        return true;
+    }
+
+    snprintf(s_turn_id, sizeof(s_turn_id), "%s", s_prov_turn_id);
+    // Snapshot after the bounded send: an already-in-flight old BEGIN may
+    // have made the stream live while the send yielded. Promotion plus the
+    // lifecycle mutex now makes every later old event stale.
+    const bool had_stream = s_stream_active;
+    const bool had_legacy = s_legacy_tts_active;
+    s_legacy_tts_abort = true;
+    s_stream_active = false;
+    s_stream_end_req = false;
+    s_stream_end_pending = false;
+    s_stream_turn_id[0] = 0;
+    s_followup_pending_ms = 0;
+    set_followup_until_us(0);
+    s_wait_led_until_us = 0;
+
+    // Convert reversible source holds into the established whole-turn pauses.
+    if (s_ambient_active) s_ambient_paused = true;
+    // Session-independent latch: a session created after this instant must
+    // also stay paused for the accepted command/reply.
+    airplay_pause();
+
+    if (had_stream || had_legacy) {
+        for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i)
+            if (s_ww[i]) wakeword_notify_speaking_ended(s_ww[i]);
+    }
+    xvf3800_enable_amplifier(false);
+    airplay_note_amp_forced_off();
+    // Keep the gate hold asserted until the destructive stop/flush is done;
+    // this prevents a one-tick audible gap during ownership conversion.
+    audio_io_stop_playback();
+    audio_io_flush_playback();
+    xQueueReset(s_sentence_q);
+    reset_token_accum();
+    s_legacy_tts_verify_hold = false;
+
+    // Complete both destructive lane flushes synchronously while the
+    // acknowledged gate and writer fences are still owned. Releasing first
+    // would let a new accepted-turn frame queue behind an asynchronous old
+    // flush and be discarded with it.
+    if (!vg_service_gate_flushes_locked(250)) {
+        ESP_LOGE(TAG, "accepted verify could not service gated flushes");
+        oe_udplog_send("[verify] accepted flush invariant failed — rebooting");
+        vg_lifecycle_give();
+        esp_restart();
+        return true;
+    }
+
+    // Disconnect/cancel callbacks cannot take this mutex recursively from a
+    // failed WebSocket send, so reconcile once more after all destructive
+    // work and before releasing source holds. Nothing below can reinstall a
+    // pause after this check; a later disconnect's own resume/turn clear wins.
+    const bool late_socket_lost =
+        __sync_fetch_and_add(&s_ws_connection_epoch, 0) != stop_epoch ||
+        !oe_ws_connected();
+    if (late_socket_lost || s_verify_cancelled || alarm_is_firing()) {
+        if (late_socket_lost) s_drop_untagged_tts = false;
+        s_turn_id[0] = 0;
+        airplay_resume();
+        const bool ambient_resumed = ambient_resume_locked(true);
+        if (!audio_io_is_paused() &&
+            (ambient_resumed || alarm_is_firing())) {
+            audio_io_start_playback();
+            xvf3800_enable_amplifier(true);
+        }
+        airplay_verify_release();
+        vg_release_deferred_alarm_locked();
+        audio_io_gate_release_playback();
+        vg_clear_playback_hold_locked();
+        s_speech_writes_blocked = false;
+        audio_io_allow_speech_writes();
+        audio_io_allow_music_writes();
+        vg_lifecycle_give();
+        return false;
+    }
+
+    airplay_verify_release();
+    vg_release_deferred_alarm_locked();
+    audio_io_gate_release_playback();
+
+    vg_clear_playback_hold_locked();
+    s_speech_writes_blocked = false;
+    audio_io_allow_speech_writes();
+    audio_io_allow_music_writes();
+    vg_lifecycle_give();
+    return true;
+}
+
+// Mute is intentionally destructive and also stops frame consumption, so a
+// provisional session cannot wait for the capture task to roll itself back.
+static bool vg_abort_for_mute(void)
+{
+    if (!vg_lifecycle_take()) return false;
+    const bool had_hold = s_verify_playback_hold_active;
+    const bool had_ambient = s_ambient_active;
+    if (had_hold) s_verify_cancelled = true;
+    s_alarm_amp_deferred = false;
+
+    // Fence source writers before the local destructive teardown. The amp is
+    // disabled immediately; waiting only protects the post-flush ring state.
+    s_speech_writes_blocked = true;
+    audio_io_block_speech_writes();
+    audio_io_block_music_writes();
+    s_legacy_tts_abort = true;
+    if (s_ambient_active) s_ambient_stop = true;
+    s_stream_active = false;
+    s_stream_end_req = false;
+    s_stream_end_pending = false;
+    s_stream_turn_id[0] = 0;
+    // Publish the AirPlay source as stopped under its state mutex before the
+    // shared physical force-off. Otherwise an already-admitted PCM callback
+    // could finish its ring write between note_amp_forced_off() and the local
+    // stop, still see streaming=true, and briefly re-enable the amplifier.
+    airplay_mute_local();
+    xvf3800_enable_amplifier(false);
+    airplay_note_amp_forced_off();
+    audio_io_stop_playback();
+    if (!vg_wait_playback_writers_locked(1000)) {
+        ESP_LOGE(TAG, "mute could not quiesce playback writers");
+        oe_udplog_send("[audio] mute teardown invariant failed — rebooting");
+        vg_lifecycle_give();
+        esp_restart();
+        return had_ambient;
+    }
+    // Flush again after admitted writers have left, then release provisional
+    // holds last. No AirPlay callback can reopen the amp in between.
+    audio_io_flush_playback();
+    if (had_hold) {
+        if (!vg_service_gate_flushes_locked(250)) {
+            ESP_LOGE(TAG, "mute could not service gated flushes");
+            oe_udplog_send("[audio] mute flush invariant failed — rebooting");
+            vg_lifecycle_give();
+            esp_restart();
+            return had_ambient;
+        }
+        airplay_verify_release();
+        audio_io_gate_release_playback();
+        vg_clear_playback_hold_locked();
+    }
+    s_legacy_tts_verify_hold = false;
+    vg_lifecycle_give();
+    // Leave candidate/state publication to capture_and_drive_task. It may be
+    // inside vg_provisional_step right now; clearing the id/state here would
+    // let that task cross ACCEPT with an empty/torn candidate. On unmute, the
+    // next frame observes s_verify_cancelled and performs the normal reject.
+    return had_ambient;
+}
+
+// Build the one-element wake_words array from the exact identity snapshotted
+// when the winning detector fired. wakeword.cpp already normalized and bounded
+// it from manifest.wake_word; revalidate the invariant before creating JSON.
+// There is intentionally no model-filename or all-loaded-slots fallback.
+static bool vg_build_wake_words(const char *slug, char *out, size_t out_len)
+{
+    if (!slug || !slug[0] || !out || out_len == 0) return false;
+    size_t n = strnlen(slug, WW_WAKE_SLUG_MAX);
+    if (n == 0 || n >= WW_WAKE_SLUG_MAX ||
+        slug[0] == '_' || slug[n - 1] == '_') {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        char c = slug[i];
+        if (!((c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_') ||
+            (c == '_' && i > 0 && slug[i - 1] == '_')) {
+            return false;
+        }
+    }
+    int written = snprintf(out, out_len, "[\"%s\"]", slug);
+    return written > 0 && (size_t)written < out_len;
+}
+
+// Persistent worker that runs the (blocking) gate POST off the capture task so
+// the command buffer keeps filling during PROVISIONAL. One job at a time.
+static void verify_worker_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(s_verify_job_sem, portMAX_DELAY);
+        // Job params are stable: dispatch set them before giving the sem and
+        // won't touch s_verify_wav/params again until s_verify_inflight clears.
+        char wake_words[WW_WAKE_SLUG_MAX + 5];
+        char fired_at[32] = "";
+        time_t now = time(NULL);
+        if (now > 1700000000) {   // SNTP has a real wall clock (post-2023)
+            struct tm tmv;
+            gmtime_r(&now, &tmv);
+            strftime(fired_at, sizeof(fired_at), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+        }
+        oe_verify_result_t eff = OE_VERIFY_ERROR;
+        if (!vg_build_wake_words(s_verify_job_slug,
+                                 wake_words, sizeof(wake_words))) {
+            oe_udplog_send("[verify] invalid fired wake slug — fail-closed");
+        } else {
+            oe_verify_gate_post(s_verify_job_server_url,
+                                s_verify_job_gate_path,
+                                g_dev_config.token,
+                                s_verify_job_turn, s_verify_job_device_id,
+                                wake_words, s_verify_job_score, fired_at,
+                                s_verify_wav, s_verify_job_samples,
+                                VG_DEADLINE_MS, &eff);
+        }
+        s_verify_effective = (int)eff;
+        snprintf(s_verify_res_turn, sizeof(s_verify_res_turn), "%s", s_verify_job_turn);
+        __sync_synchronize();      // publish params/result before the done flag
+        s_verify_done = true;
+        s_verify_inflight = false;
+    }
+}
+
+// Advance the provisional (verify-gate) session for one captured frame. Runs
+// ONLY on the capture task while s_prov_state != PROV_NONE. Keeps filling the
+// local command buffer + the wake-window tail, dispatches the gate POST once the
+// +0.5 s tail is complete, then acts on the verdict. Command frames feed VAD
+// immediately even though all STT/turn side effects remain deferred. The first
+// terminal VAD boundary is latched and freezes the command buffer while gate
+// polling continues. On explicit accept, return that boundary so the caller can
+// finalize immediately; all other outcomes return VAD_END_NONE.
+static vad_end_reason_t vg_provisional_step(const int16_t *frame, size_t n)
+{
+    bool local_cancel = false;
+    // Mirror normal capture through the first terminal VAD frame. Once VAD
+    // ends, later frames are gate-polling time, not part of this utterance.
+    if (s_prov_vad_end == VAD_END_NONE) {
+        if (s_capture_used + n < CAPTURE_BUFFER_SAMPLES) {
+            memcpy(s_capture_buf + s_capture_used, frame, n * sizeof(int16_t));
+            s_capture_used += n;
+        }
+        vad_end_reason_t observed = VAD_END_NONE;
+        vad_feed(s_vad, frame, n, &observed);
+        if (observed != VAD_END_NONE) {
+            s_prov_vad_end = observed;
+            oe_udplog_send("[verify] command boundary held pending verdict");
+        }
+    }
+
+    local_cancel = s_verify_cancelled || alarm_is_firing() ||
+                   leds_buttons_is_muted() || !oe_ws_connected();
+    if (local_cancel) {
+        // External teardown/priority work wins. An eventual worker result for
+        // this candidate is ignored after the local fail-closed rollback.
+        s_prov_state = PROV_AWAIT_VERDICT;
+    }
+
+    if (s_prov_state == PROV_FILL_TAIL) {
+        // Append into the wake-window tail until we have fire+0.5 s.
+        if (s_verify_wav && s_verify_win_len < VG_WIN_SAMPLES) {
+            size_t room = VG_WIN_SAMPLES - s_verify_win_len;
+            size_t take = n < room ? n : room;
+            memcpy(s_verify_wav + s_verify_win_len, frame, take * sizeof(int16_t));
+            s_verify_win_len += take;
+        }
+        if (s_verify_win_len >= s_verify_pre_len + VG_TAIL_SAMPLES) {
+            // Tail complete → dispatch the gate POST on the worker task.
+            s_verify_job_samples = s_verify_win_len;
+            s_verify_job_score   = (float)s_active_wake_prob / 255.0f;
+            snprintf(s_verify_job_turn, sizeof(s_verify_job_turn), "%s",
+                     s_prov_turn_id);
+            snprintf(s_verify_job_slug, sizeof(s_verify_job_slug), "%s",
+                     s_active_wake_slug);
+            // server_caps can update the live path/id pair on the WS task.
+            // Snapshot it atomically; the paired OE origin is immutable for
+            // this operational boot and is copied into the same worker job.
+            snprintf(s_verify_job_server_url,
+                     sizeof(s_verify_job_server_url), "%s",
+                     g_dev_config.server_url);
+            verify_gate_config_snapshot(s_verify_job_gate_path,
+                                        s_verify_job_device_id);
+            s_verify_done     = false;
+            s_verify_inflight = true;
+            s_prov_deadline_us = esp_timer_get_time() + (int64_t)(VG_DEADLINE_MS + 300) * 1000;
+            s_prov_state = PROV_AWAIT_VERDICT;
+            if (xSemaphoreGive(s_verify_job_sem) != pdTRUE) {
+                // Should be impossible with an idle binary semaphore, but a
+                // failed dispatch cannot be treated as an ungated wake.
+                s_verify_effective = (int)OE_VERIFY_ERROR;
+                snprintf(s_verify_res_turn, sizeof(s_verify_res_turn), "%s",
+                         s_verify_job_turn);
+                s_verify_inflight = false;
+                s_verify_done = true;
+                oe_udplog_send("[verify] worker dispatch failed — fail-closed");
+            }
+        }
+        return VAD_END_NONE;
+    }
+
+    // PROV_AWAIT_VERDICT — the command buffer keeps filling while we wait.
+    oe_verify_result_t eff;
+    bool have = false;
+    if (local_cancel) {
+        eff = OE_VERIFY_ERROR;
+        have = true;
+    } else if (s_verify_done) {
+        __sync_synchronize();  // pair with worker's publish barrier
+        have = strcmp(s_verify_res_turn, s_prov_turn_id) == 0;
+    }
+    if (have) {
+        if (!local_cancel) {
+            eff = (oe_verify_result_t) s_verify_effective;
+            s_verify_done = false;
+        }
+    } else if (esp_timer_get_time() > s_prov_deadline_us) {
+        eff = OE_VERIFY_ERROR;
+        oe_udplog_send("[verify] deadline elapsed — fail-closed");
+    } else {
+        return VAD_END_NONE;        // still waiting
+    }
+
+    // Re-check priority/destructive state after consuming the verdict. An
+    // alarm or mute can race the worker publication within this same frame;
+    // it must win before we cross the irreversible ACCEPT boundary.
+    if (eff == OE_VERIFY_ACCEPT &&
+        (s_verify_cancelled || alarm_is_firing() ||
+         leds_buttons_is_muted() || !oe_ws_connected())) {
+        eff = OE_VERIFY_ERROR;
+    }
+
+    if (eff != OE_VERIFY_ACCEPT) {
+        oe_udplog_send(eff == OE_VERIFY_REJECT
+                           ? "[verify] reject — fire dropped silently"
+                           : "[verify] error — fire dropped fail-closed");
+        s_capture_used = 0;
+        s_in_utterance = false;
+        s_prov_state = PROV_NONE;
+        s_prov_vad_end = VAD_END_NONE;
+        vg_restore_rejected_identity();
+        vg_playback_hold_rollback();
+        s_prov_turn_id[0] = 0;
+        s_verify_cancelled = false;
+        return VAD_END_NONE;
+    }
+
+    // Explicit ACCEPT: this is the sole irreversible boundary. Stop the old
+    // reply with its old id, promote the provisional id, then acknowledge the
+    // wake and try to preserve streaming STT.
+    if (!vg_playback_hold_commit()) {
+        // A pre-STOP veto is fully reversible. A priority/socket change after
+        // the STOP attempt may already have retired old speech, but commit
+        // clears its hold before returning false; rollback is intentionally
+        // idempotent in both cases.
+        s_capture_used = 0;
+        s_in_utterance = false;
+        s_prov_state = PROV_NONE;
+        s_prov_vad_end = VAD_END_NONE;
+        vg_restore_rejected_identity();
+        vg_playback_hold_rollback();
+        s_prov_turn_id[0] = 0;
+        s_verify_cancelled = false;
+        return VAD_END_NONE;
+    }
+    // A destructive owner may have arrived immediately after commit released
+    // the lifecycle mutex. It is allowed to tear down the now-accepted old
+    // playback, but must not let this task re-arm LISTENING/STT while muted,
+    // under an alarm, or on a dead control socket.
+    if (leds_buttons_is_muted() || alarm_is_firing() ||
+        !oe_ws_connected()) {
+        vg_restore_rejected_identity();
+        if (vg_lifecycle_take()) {
+            s_turn_id[0] = 0;
+            if (!leds_buttons_is_muted()) {
+                // No chat will be sent for this accepted-but-abandoned wake;
+                // do not strand independent sources behind its turn latch.
+                airplay_resume();
+                ambient_resume_locked(true);
+            }
+            vg_lifecycle_give();
+        }
+        s_capture_used = 0;
+        s_in_utterance = false;
+        s_prov_state = PROV_NONE;
+        s_prov_vad_end = VAD_END_NONE;
+        s_prov_turn_id[0] = 0;
+        s_verify_cancelled = false;
+        if (!leds_buttons_is_muted() && !alarm_is_firing()) {
+            set_ui_state(UI_STATE_IDLE);
+        }
+        oe_udplog_send("[verify] accepted but external teardown won before capture");
+        return VAD_END_NONE;
+    }
+    vg_accept_identity();
+    // Its 160 ms send budget leaves ample margin under the ~512 ms capture
+    // ring; a congested socket fails over to the complete local buffer instead
+    // of starving capture and truncating a command still being spoken.
+    set_ui_state(UI_STATE_LISTENING);
+    s_stt_streaming = s_caps_stt_stream && oe_ws_connected();
+    s_stt_send_failed = false;
+    s_stt_seq = 0;
+    if (s_stt_streaming &&
+        oe_ws_send_stt_backlog(
+            s_turn_id, s_active_slot, s_active_wake_prob,
+            g_dev_config.default_agent_id, s_capture_buf, s_capture_used,
+            VG_STT_REPLAY_BUDGET_MS, &s_stt_seq) != ESP_OK) {
+        s_stt_send_failed = true;
+        oe_udplog_send("[stt] bounded gate replay failed — buffered fallback armed");
+    }
+    vad_end_reason_t accepted_end = s_prov_vad_end;
+    s_prov_state = PROV_NONE;
+    s_prov_vad_end = VAD_END_NONE;
+    s_prov_turn_id[0] = 0;
+    s_verify_cancelled = false;
+    oe_udplog_send("[verify] accept — turn proceeds");
+    return accepted_end;
 }
 
 static void capture_and_drive_task(void *arg)
@@ -1971,6 +3898,7 @@ static void capture_and_drive_task(void *arg)
     int     pending_slot = -1;
     uint8_t pending_prob = 0;
     int     pending_age  = 0;
+    char    pending_wake_slug[WW_WAKE_SLUG_MAX] = "";
 
     // Wake-word cutoff is CONSTANT — we do NOT lower it during playback.
     // The old playback-aware drop (-30) made first-try barge-in easier, but it
@@ -2002,7 +3930,8 @@ static void capture_and_drive_task(void *arg)
         // follow-up window open. This single check covers every turn-end path
         // (reply spoken, STT failed, empty reply, watchdog) — they all land
         // back here at full idle, where the rain should pick back up.
-        if (s_ambient_paused && !s_in_utterance && !s_awaiting_reply && !s_stream_active &&
+        if (s_ambient_paused && !s_verify_playback_hold_active &&
+            !s_in_utterance && !s_awaiting_reply && !s_stream_active &&
             get_followup_until_us() == 0 &&
             !alarm_is_firing() &&
             uxQueueMessagesWaiting(s_sentence_q) == 0 && token_accum_empty()) {
@@ -2038,6 +3967,7 @@ static void capture_and_drive_task(void *arg)
                 // but skip inference. pending_* state is irrelevant here — any
                 // mid-flight pending was committed or expired before the gate.
                 pending_slot = -1; pending_prob = 0; pending_age = 0;
+                pending_wake_slug[0] = '\0';
                 continue;
             }
         }
@@ -2047,6 +3977,17 @@ static void capture_and_drive_task(void *arg)
             // path — the only fire type that prepends pre-roll (a wake-word
             // fire must NOT: pre-roll would include the wake phrase itself).
             bool fired_from_followup = false;
+            // Idle-room noise floor for the follow-up trigger. Learn only
+            // while the mic is hot and we're not hearing ourselves: during
+            // playback amp_en is HIGH and the XVF AEC reads the whole room
+            // ~250× quiet — folding those frames in would crater the floor
+            // right before a window opens on a hot mic.
+            uint32_t fe_room = frame_energy(frame, n);
+            if (!s_stream_active && !audio_io_playback_active() &&
+                fe_room < VOICE_ENERGY_THRESHOLD) {
+                s_room_floor = s_room_floor
+                    ? s_room_floor - s_room_floor / 8 + fe_room / 8 : fe_room;
+            }
             // Follow-up listening: if the server armed a window after its
             // last reply ended with a "?", treat any voice activity in this
             // frame as a wake fire so the user can answer without saying
@@ -2054,13 +3995,32 @@ static void capture_and_drive_task(void *arg)
             int64_t followup_until = get_followup_until_us();
             if (followup_until > 0) {
                 int64_t now_us = esp_timer_get_time();
+                uint64_t ftrig = (uint64_t)s_room_floor * FOLLOWUP_FLOOR_MULT;
+                if (ftrig < FOLLOWUP_TRIGGER_ENERGY) ftrig = FOLLOWUP_TRIGGER_ENERGY;
                 if (now_us >= followup_until) {
                     set_followup_until_us(0);
-                    // Window expired without speech — drop back to IDLE.
+                    // Window expired without speech — drop back to IDLE. The
+                    // floor/trig line is the tuning signal for the deaf-window
+                    // failure mode ("I answered and it ignored me"): it shows
+                    // the bar the answer needed to beat.
                     set_ui_state(UI_STATE_IDLE);
-                } else if (frame_energy(frame, n) > FOLLOWUP_TRIGGER_ENERGY) {
-                    ESP_LOGI(TAG, "follow-up: VAD-start (slot=%u), bypassing wake-word",
-                             (unsigned) s_followup_slot);
+                    char fl[96];
+                    snprintf(fl, sizeof(fl), "[followup] window expired floor=%u trig=%u",
+                             (unsigned)s_room_floor, (unsigned)ftrig);
+                    ESP_LOGI(TAG, "%s", fl); oe_udplog_send(fl);
+                } else if ((uint64_t)fe_room > ftrig &&
+                           doa_gate_allows("followup")) {
+                    // Direction gate on the fire (not the window): a rejected
+                    // frame leaves the window ARMED. If it's really the user
+                    // answering from a new spot, the beamformer re-tasks onto
+                    // them within a probe tick or two and a later frame
+                    // passes — the pre-roll prepend covers the delayed onset.
+                    // Speakers at their fixed bearing just never fire it.
+                    char fl[112];
+                    snprintf(fl, sizeof(fl), "[followup] fire fe=%u floor=%u trig=%u slot=%u",
+                             (unsigned)fe_room, (unsigned)s_room_floor, (unsigned)ftrig,
+                             (unsigned)s_followup_slot);
+                    ESP_LOGI(TAG, "%s", fl); oe_udplog_send(fl);
                     s_active_slot = s_followup_slot;
                     set_followup_until_us(0);
                     // Fall through into the wake-fire actions below by
@@ -2069,6 +4029,7 @@ static void capture_and_drive_task(void *arg)
                     pending_slot = s_followup_slot;
                     pending_prob = 255;
                     pending_age = 1;
+                    pending_wake_slug[0] = '\0';
                     fired_from_followup = true;
                 }
             }
@@ -2078,7 +4039,8 @@ static void capture_and_drive_task(void *arg)
             // the wake word as their barge path — their audio isn't a
             // conversation. See the barge_state_t block at file scope for the
             // three-stage design (candidate → local verify → STT commit).
-            if (s_conversation_mode && s_stream_active) {
+            if (s_conversation_mode && s_stream_active &&
+                server_control_may_open_ungated_capture()) {
                 if (s_barge_state == BARGE_NONE && !s_paused_for_barge) {
                     uint32_t fe = frame_energy(frame, n);
                     // Rolling floor: EMA (α=1/8) of the reply+room energy as
@@ -2107,25 +4069,41 @@ static void capture_and_drive_task(void *arg)
                                esp_timer_get_time() >= s_barge_cooldown_until_us) {
                         if (++s_barge_consec >= BARGE_CONSEC_FRAMES) {
                             s_barge_consec = 0;
-                            // Mute FIRST (local, ~instant): pausing playback
-                            // + dropping amp_en is what un-suppresses the mic
-                            // for the verify. Then stall the server pacer.
-                            // (The WS send can block up to 1 s worst-case on
-                            // this task — the audible pause already happened,
-                            // and verify timing keys off s_barge_started_us.)
-                            audio_io_pause_playback();
-                            xvf3800_enable_amplifier(false);
-                            s_paused_for_barge = true;
-                            s_barge_state = BARGE_VERIFYING;
-                            s_barge_started_us = esp_timer_get_time();
-                            s_barge_verify_frames = 0;
-                            s_barge_speech_ms = 0;
-                            set_ui_state(UI_STATE_LISTENING);
-                            if (s_caps_tts_pause) oe_ws_send_tts_pause(s_turn_id);
-                            char bl[96];
-                            snprintf(bl, sizeof(bl), "[barge] candidate fe=%u floor=%u",
-                                     (unsigned)fe, (unsigned)s_speak_floor);
-                            ESP_LOGI(TAG, "%s", bl); oe_udplog_send(bl);
+                            // Direction gate: a candidate whose fresh beams
+                            // all point away from the turn's talker is the
+                            // speakers, not an interjection — skip it with
+                            // ZERO audible cost (no pause, no stutter). The
+                            // cooldown keeps sustained off-axis audio from
+                            // re-running the gate every 3rd frame, and its
+                            // frames land in the else-branch below, feeding
+                            // the floor like any other cooldown audio.
+                            if (!doa_gate_allows("barge")) {
+                                s_barge_cooldown_until_us = esp_timer_get_time()
+                                    + DOA_GATE_REJECT_COOLDOWN_US;
+                                // NO continue (wake feed below must still run
+                                // this frame) — just decline the candidate.
+                            } else {
+                                // Mute FIRST (local, ~instant): pausing
+                                // playback + dropping amp_en is what
+                                // un-suppresses the mic for the verify. Then
+                                // stall the server pacer. (The WS send can
+                                // block up to 1 s worst-case on this task —
+                                // the audible pause already happened, and
+                                // verify timing keys off s_barge_started_us.)
+                                audio_io_pause_playback();
+                                xvf3800_enable_amplifier(false);
+                                s_paused_for_barge = true;
+                                s_barge_state = BARGE_VERIFYING;
+                                s_barge_started_us = esp_timer_get_time();
+                                s_barge_verify_frames = 0;
+                                s_barge_speech_ms = 0;
+                                set_ui_state(UI_STATE_LISTENING);
+                                if (s_caps_tts_pause) oe_ws_send_tts_pause(s_turn_id);
+                                char bl[96];
+                                snprintf(bl, sizeof(bl), "[barge] candidate fe=%u floor=%u",
+                                         (unsigned)fe, (unsigned)s_speak_floor);
+                                ESP_LOGI(TAG, "%s", bl); oe_udplog_send(bl);
+                            }
                         }
                     } else {
                         // Sub-trigger frame (or cooldown): this is what shapes
@@ -2222,6 +4200,7 @@ static void capture_and_drive_task(void *arg)
             // one frame later — see comment by pending_slot above.
             int     frame_best_slot = -1;
             uint8_t frame_best_prob = 0;
+            char    frame_best_wake_slug[WW_WAKE_SLUG_MAX] = "";
             for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i) {
                 if (!s_ww[i]) continue;
                 // While the device is speaking its OWN reply (streamed TTS),
@@ -2238,6 +4217,11 @@ static void capture_and_drive_task(void *arg)
                     if (frame_best_slot < 0 || p > frame_best_prob) {
                         frame_best_slot = (int) i;
                         frame_best_prob = p;
+                        if (!wakeword_last_wake_slug(
+                                s_ww[i], frame_best_wake_slug,
+                                sizeof(frame_best_wake_slug))) {
+                            frame_best_wake_slug[0] = '\0';
+                        }
                     }
                 }
             }
@@ -2245,21 +4229,31 @@ static void capture_and_drive_task(void *arg)
                 (pending_slot < 0 || frame_best_prob > pending_prob)) {
                 pending_slot = frame_best_slot;
                 pending_prob = frame_best_prob;
+                snprintf(pending_wake_slug, sizeof(pending_wake_slug), "%s",
+                         frame_best_wake_slug);
             }
 
             bool fired = false;
             if (pending_slot >= 0) {
                 if (pending_age >= 1) {
                     // Held one full frame past first fire; commit.
+                    s_prov_prev_slot = s_active_slot;
+                    s_prov_prev_prob = s_active_wake_prob;
+                    snprintf(s_prov_prev_slug, sizeof(s_prov_prev_slug), "%s",
+                             s_active_wake_slug);
+                    s_prov_prev_followup_until_us = get_followup_until_us();
+                    s_prov_identity_valid = true;
                     s_active_slot = (uint8_t) pending_slot;
                     s_active_wake_prob = pending_prob;
+                    snprintf(s_active_wake_slug, sizeof(s_active_wake_slug), "%s",
+                             pending_wake_slug);
                     fired = true;
                     // If a follow-up window is active, lock the slot back
                     // to the originating turn — a false-fire (or even a
                     // genuine fire) on a different wake-word during the
                     // window should still route the answer to the user
                     // who asked the question.
-                    if (get_followup_until_us() > esp_timer_get_time() &&
+                    if (s_prov_prev_followup_until_us > esp_timer_get_time() &&
                         s_active_slot != s_followup_slot) {
                         ESP_LOGI(TAG, "follow-up: slot %u wake fired, overriding to slot %u",
                                  (unsigned) s_active_slot, (unsigned) s_followup_slot);
@@ -2267,22 +4261,75 @@ static void capture_and_drive_task(void *arg)
                     }
                     set_followup_until_us(0);  // window closes once we commit
                     pending_slot = -1; pending_prob = 0; pending_age = 0;
+                    pending_wake_slug[0] = '\0';
                 } else {
                     pending_age++;
                 }
             }
 
             if (fired) {
+                // Follow-up VAD, speech-barge captures, and a wake used only to
+                // dismiss a locally-ringing alarm are intentional non-command
+                // paths. Every other detector fire is governed by the
+                // configured gate. Evaluate readiness before any LED/playback/
+                // WS side effect so a blocked fire remains invisible.
+                bool local_alarm_dismiss = alarm_is_firing();
+                bool vg_on = false;
+                if (fired_from_followup &&
+                    !server_control_may_open_ungated_capture()) {
+                    ESP_LOGW(TAG,
+                             "[verify] untrusted follow-up capture dropped");
+                    vg_restore_rejected_identity();
+                    continue;
+                }
+                if (!fired_from_followup && !local_alarm_dismiss) {
+                    const char *blocked_reason = NULL;
+                    verify_gate_state_t vg_state =
+                        verify_gate_state(&blocked_reason);
+                    if (vg_state == VG_READY) {
+                        char wake_words_probe[WW_WAKE_SLUG_MAX + 5];
+                        if (!vg_build_wake_words(
+                                s_active_wake_slug, wake_words_probe,
+                                sizeof(wake_words_probe))) {
+                            vg_state = VG_BLOCKED;
+                            blocked_reason = "invalid_wake_slug";
+                        }
+                    }
+                    if (vg_state == VG_BLOCKED) {
+                        char line[96];
+                        snprintf(line, sizeof(line),
+                                 "[verify] blocked (%s) — fire dropped",
+                                 blocked_reason ? blocked_reason : "not_ready");
+                        ESP_LOGW(TAG, "%s", line);
+                        oe_udplog_send(line);
+                        vg_restore_rejected_identity();
+                        continue;
+                    }
+                    vg_on = vg_state == VG_READY;
+                }
+
+                if (vg_on) {
+                    mint_turn_id_into(s_prov_turn_id,
+                                      sizeof(s_prov_turn_id));
+                    if (!vg_playback_hold_begin()) {
+                        oe_udplog_send("[verify] reversible hold unavailable — fire dropped");
+                        s_prov_turn_id[0] = 0;
+                        vg_restore_rejected_identity();
+                        continue;
+                    }
+                }
+
                 // A wake fire supersedes any speech-barge verify in flight:
-                // release OUR playback pause so the barge-in cleanup below
-                // (stop/flush) owns the audio engine outright.
-                if (s_paused_for_barge) {
+                // the ungated path releases it before destructive cleanup.
+                // The gated path transfers it inside vg_playback_hold_begin()
+                // only after the independent gate hold owns the engine.
+                if (!vg_on && s_paused_for_barge) {
                     s_paused_for_barge = false;
                     s_barge_state = BARGE_NONE;
                     s_barge_capture = false;
                     audio_io_resume_playback();
                 }
-                s_wait_led_until_us = 0;
+                if (!vg_on) s_wait_led_until_us = 0;
                 // Visual ack FIRST. Everything below this point — barge-in
                 // cleanup, WS stop send, ringbuffer flush — has variable
                 // latency (the WS send is the main offender, ~50-500 ms
@@ -2291,14 +4338,22 @@ static void capture_and_drive_task(void *arg)
                 // they're not left staring at IDLE while we tidy up. The
                 // alarm-dismiss branch below overrides this back to a
                 // short LISTENING-then-IDLE flash on its own.
-                set_ui_state(UI_STATE_LISTENING);
+                //
+                // With the verify gate active we DEFER this ack until the gate
+                // returns an explicit accept (vg_provisional_step), so a
+                // rejected/error fire dies invisibly. Alarm dismiss still
+                // flashes below.
+                if (!vg_on) set_ui_state(UI_STATE_LISTENING);
 
                 // Alarm dismiss takes precedence over normal wake flow: if
                 // any alarm is currently firing, treat the wake as a local
                 // ack — stop the ring, send alarm_acked, skip STT/utterance
                 // capture for this wake. No STT roundtrip means dismiss
                 // still works when the server is unreachable.
-                if (alarm_is_firing()) {
+                if (local_alarm_dismiss) {
+                    // Alarm dismiss is a confirmed LOCAL action (works offline)
+                    // and is NOT gated — show the LISTENING flash now even when
+                    // the verify gate deferred the ack above.
                     if (s_ambient_active) {
                         s_ambient_paused = true;
                         oe_udplog_send("[ambient] PAUSE (alarm dismiss)");
@@ -2312,9 +4367,54 @@ static void capture_and_drive_task(void *arg)
                     // enough to feel "instant."
                     vTaskDelay(pdMS_TO_TICKS(500));
                     set_ui_state(UI_STATE_IDLE);
+                    s_prov_identity_valid = false;
                     continue;
                 }
-                if (audio_io_playback_active()) {
+
+                // Anchor the direction gate to this turn's talker. Only a
+                // WAKE fire may move the anchor — the wake phrase is
+                // proof-of-user, while follow-up fires reuse the previous
+                // anchor and barge captures never touch it. Fresh blocking
+                // read (≤~50 ms) rather than the cache: at idle cadence the
+                // cache can be ~2 s stale, which would fail the anchor open
+                // in exactly the music-playing case the gate exists for.
+                // The WS stop send just below costs up to 500 ms, so this
+                // adds nothing perceptible.
+                if (!fired_from_followup) {
+                    float anchor_az[4];
+                    uint8_t anchor_st = 0;
+                    if (doa_read4(XVF_CMD_AEC_AZIMUTH_VALUES, anchor_az, &anchor_st)) {
+                        taskENTER_CRITICAL(&s_doa_mux);
+                        memcpy(s_doa_az, anchor_az, sizeof(anchor_az));
+                        s_doa_fresh_us = esp_timer_get_time();
+                        if (!vg_on) s_turn_bearing = anchor_az[3];
+                        taskEXIT_CRITICAL(&s_doa_mux);
+                        if (vg_on) {
+                            s_prov_bearing = anchor_az[3];
+                            s_prov_bearing_pending = true;
+                        }
+                        char al[96];
+                        snprintf(al, sizeof(al),
+                                 "[doagate] %sbearing=%.2f (wake)",
+                                 vg_on ? "provisional " : "turn ",
+                                 (double)anchor_az[3]);
+                        ESP_LOGI(TAG, "%s", al); oe_udplog_send(al);
+                    } else {
+                        // No fresh localization of the wake phrase — don't
+                        // reuse a stale anchor from an earlier turn; run
+                        // this conversation ungated (0.2.74 behavior).
+                        if (vg_on) {
+                            s_prov_bearing = -1.0f;
+                            s_prov_bearing_pending = true;
+                        } else {
+                            taskENTER_CRITICAL(&s_doa_mux);
+                            s_turn_bearing = -1.0f;
+                            taskEXIT_CRITICAL(&s_doa_mux);
+                        }
+                        oe_udplog_send("[doagate] no fresh bearing at wake — gate open this turn");
+                    }
+                }
+                if (!vg_on && audio_io_playback_active()) {
                     ESP_LOGI(TAG, "barge-in");
                     // Wake-during-ambient: PAUSE the ambient (don't tear it
                     // down). The single ambient task keeps its HTTP stream open
@@ -2337,6 +4437,7 @@ static void capture_and_drive_task(void *arg)
                     // The server halts the push on the stop below.
                     s_stream_active  = false;
                     s_stream_end_req = false;
+                    s_stream_turn_id[0] = 0;
                     oe_ws_send_stop(g_dev_config.default_agent_id, s_turn_id);
                     // Drain queued TTS sentences and partial-token accumulator.
                     // Without this, tts_worker_task will pull whatever was
@@ -2349,7 +4450,10 @@ static void capture_and_drive_task(void *arg)
                 // New turn starts here. Mint AFTER the barge-in block above —
                 // its stop frame must carry the OLD turn's id (the turn being
                 // stopped), not this new one's.
-                mint_turn_id();
+                if (!vg_on) {
+                    mint_turn_id();
+                    s_prov_identity_valid = false;
+                }
                 vad_reset(s_vad);
                 s_capture_used = 0;
                 capture_sat_logged = false;
@@ -2361,23 +4465,38 @@ static void capture_and_drive_task(void *arg)
                     // 16 s for a 15 s VAD ceiling, pre-roll is 0.4 s.
                     s_capture_used = preroll_copy_out(s_capture_buf, PREROLL_SAMPLES);
                 }
-                // Streaming STT: open the server-side session and ship any
-                // pre-rolled onset immediately. Failure at any point just
-                // falls back to the buffered HTTP path at VAD-end.
-                s_stt_streaming = s_caps_stt_stream && oe_ws_connected();
-                s_stt_send_failed = false;
-                s_stt_seq = 0;
-                if (s_stt_streaming) {
-                    if (oe_ws_send_stt_begin(s_turn_id, s_active_slot,
-                                             s_active_wake_prob,
-                                             g_dev_config.default_agent_id) != ESP_OK) {
-                        s_stt_streaming = false;
-                    } else {
-                        for (size_t off = 0; off < s_capture_used && !s_stt_send_failed; off += WW_FRAME_SAMPLES) {
-                            size_t chunk = s_capture_used - off;
-                            if (chunk > WW_FRAME_SAMPLES) chunk = WW_FRAME_SAMPLES;
-                            if (oe_ws_send_stt_frame(s_capture_buf + off, chunk, s_stt_seq++) != ESP_OK) {
-                                s_stt_send_failed = true;
+                if (vg_on) {
+                    // PROVISIONAL: snapshot the [fire−2.0 s, fire] slice from
+                    // the now-frozen pre-roll ring (preroll_append stops once
+                    // s_in_utterance is set below). The +0.5 s tail fills over
+                    // the next frames in the capture branch, then we POST +
+                    // await the verdict. No LED, no stt_begin until commit.
+                    s_verify_pre_len = preroll_copy_out(s_verify_wav, VG_PRE_SAMPLES);
+                    s_verify_win_len = s_verify_pre_len;
+                    s_prov_vad_end = VAD_END_NONE;
+                    s_prov_state = PROV_FILL_TAIL;
+                    oe_udplog_send("[verify] provisional — capturing wake window");
+                } else {
+                    // Gate explicitly disabled, or intentional follow-up/alarm
+                    // bypass: original immediate path.
+                    // Streaming STT: open the server-side session and ship any
+                    // pre-rolled onset immediately. Failure at any point just
+                    // falls back to the buffered HTTP path at VAD-end.
+                    s_stt_streaming = s_caps_stt_stream && oe_ws_connected();
+                    s_stt_send_failed = false;
+                    s_stt_seq = 0;
+                    if (s_stt_streaming) {
+                        if (oe_ws_send_stt_begin(s_turn_id, s_active_slot,
+                                                 s_active_wake_prob,
+                                                 g_dev_config.default_agent_id) != ESP_OK) {
+                            s_stt_streaming = false;
+                        } else {
+                            for (size_t off = 0; off < s_capture_used && !s_stt_send_failed; off += WW_FRAME_SAMPLES) {
+                                size_t chunk = s_capture_used - off;
+                                if (chunk > WW_FRAME_SAMPLES) chunk = WW_FRAME_SAMPLES;
+                                if (oe_ws_send_stt_frame(s_capture_buf + off, chunk, s_stt_seq++) != ESP_OK) {
+                                    s_stt_send_failed = true;
+                                }
                             }
                         }
                     }
@@ -2385,29 +4504,38 @@ static void capture_and_drive_task(void *arg)
                 s_in_utterance = true;
             }
         } else {
-            if (s_capture_used + n < CAPTURE_BUFFER_SAMPLES) {
-                memcpy(s_capture_buf + s_capture_used, frame, n * sizeof(int16_t));
-                s_capture_used += n;
-                // Streaming STT: ship this frame now so the upload overlaps
-                // the user's speech. One failure flips to the HTTP fallback
-                // for the rest of the utterance (buffer keeps accumulating).
-                if (s_stt_streaming && !s_stt_send_failed) {
-                    if (oe_ws_send_stt_frame(frame, n, s_stt_seq++) != ESP_OK) {
-                        s_stt_send_failed = true;
-                        oe_udplog_send("[stt] frame send failed — buffered HTTP fallback armed");
-                    }
-                }
-            } else if (!capture_sat_logged) {
-                // Saturated mid-utterance: STT will get a truncated question.
-                // Should be unreachable now that the buffer (16 s) exceeds
-                // the VAD ceiling (max_utterance_ms 15 s) — log loudly if it
-                // ever happens instead of silently cutting the user off.
-                ESP_LOGW(TAG, "capture buffer full at %u samples — utterance tail dropped",
-                         (unsigned)s_capture_used);
-                capture_sat_logged = true;
-            }
+            // Provisional (verify gate): keep buffering the command locally but
+            // run VAD locally while holding ack/STT until the gate verdict.
+            // If the command already ended, an accept returns its latched
+            // boundary and falls directly into the normal finalizer below.
             vad_end_reason_t end_reason = VAD_END_NONE;
-            vad_feed(s_vad, frame, n, &end_reason);
+            if (s_prov_state != PROV_NONE) {
+                end_reason = vg_provisional_step(frame, n);
+                if (end_reason == VAD_END_NONE) continue;
+            } else {
+                if (s_capture_used + n < CAPTURE_BUFFER_SAMPLES) {
+                    memcpy(s_capture_buf + s_capture_used, frame, n * sizeof(int16_t));
+                    s_capture_used += n;
+                    // Streaming STT: ship this frame now so the upload overlaps
+                    // the user's speech. One failure flips to the HTTP fallback
+                    // for the rest of the utterance (buffer keeps accumulating).
+                    if (s_stt_streaming && !s_stt_send_failed) {
+                        if (oe_ws_send_stt_frame(frame, n, s_stt_seq++) != ESP_OK) {
+                            s_stt_send_failed = true;
+                            oe_udplog_send("[stt] frame send failed — buffered HTTP fallback armed");
+                        }
+                    }
+                } else if (!capture_sat_logged) {
+                    // Saturated mid-utterance: STT will get a truncated question.
+                    // Should be unreachable now that the buffer (16 s) exceeds
+                    // the VAD ceiling (max_utterance_ms 15 s) — log loudly if it
+                    // ever happens instead of silently cutting the user off.
+                    ESP_LOGW(TAG, "capture buffer full at %u samples — utterance tail dropped",
+                             (unsigned)s_capture_used);
+                    capture_sat_logged = true;
+                }
+                vad_feed(s_vad, frame, n, &end_reason);
+            }
             if (end_reason != VAD_END_NONE) {
                 s_in_utterance = false;
 
@@ -2463,6 +4591,12 @@ static void capture_and_drive_task(void *arg)
                         s_capture_used = 0;
                         continue;
                     }
+                    if (!stream_clean) {
+                        // A bounded backlog/live-frame failure may have left a
+                        // partial server session. Drop it before posting the
+                        // complete local buffer so it cannot linger to TTL.
+                        oe_ws_send_stt_abort(s_turn_id);
+                    }
                     oe_udplog_send("[stt] stream fallback — posting buffered utterance");
                 }
 
@@ -2507,6 +4641,7 @@ static void capture_and_drive_task(void *arg)
                         audio_io_flush_playback();
                         s_stream_active  = false;
                         s_stream_end_req = false;
+                        s_stream_turn_id[0] = 0;
                         for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                             if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
                         oe_ws_send_stop(g_dev_config.default_agent_id, s_turn_id);
@@ -2664,10 +4799,35 @@ static void ambient_task(void *arg)
         if (s_ambient_stop || ambient_preempted()) continue;  // stopped/preempted before start
 
         // ── Begin a playback session ────────────────────────────────────────
+        if (!vg_lifecycle_take()) continue;
+        if (leds_buttons_is_muted()) {
+            vg_lifecycle_give();
+            // Physical mute is destructive for ambient sessions. Do not open
+            // a new long-lived HTTP stream behind the mute fence.
+            oe_ws_send_ambient_stopped("mute");
+            continue;
+        }
         s_ambient_active = true;
-        s_ambient_paused = false;        // fresh session starts playing
         strncpy(s_ambient_cur_marker, req.marker, sizeof(s_ambient_cur_marker) - 1);
         s_ambient_cur_marker[sizeof(s_ambient_cur_marker) - 1] = 0;
+        // Attach a replacement session to either the provisional hold or the
+        // established command/reply pause. In particular, ACCEPT's background
+        // pause must outlive a point-in-time snapshot: a new session created
+        // one tick later cannot play over the user's utterance.
+        bool turn_busy =
+            s_verify_playback_hold_active || s_in_utterance ||
+            s_awaiting_reply || s_stream_active ||
+            get_followup_until_us() != 0 ||
+            uxQueueMessagesWaiting(s_sentence_q) > 0 ||
+            !token_accum_empty() || alarm_is_firing() ||
+            leds_buttons_is_muted();
+        s_ambient_paused = turn_busy;
+        if (s_verify_playback_hold_active) {
+            s_verify_hold_ambient_owned = true;
+            snprintf(s_verify_hold_ambient_marker,
+                     sizeof(s_verify_hold_ambient_marker), "%s",
+                     s_ambient_cur_marker);
+        }
         s_ambient_stable_rate = 0;       // re-arm rate lock for this stream
         s_last_ambient_rate = 44100;
         if (req.volume >= 0 && req.volume <= 100) {
@@ -2676,9 +4836,12 @@ static void ambient_task(void *arg)
         } else {
             s_pre_ambient_volume = -1;
         }
-        set_ui_state(UI_STATE_AMBIENT);
-        xvf3800_enable_amplifier(true);
+        if (!s_ambient_paused) {
+            set_ui_state(UI_STATE_AMBIENT);
+            xvf3800_enable_amplifier(true);
+        }
         audio_io_start_playback();
+        vg_lifecycle_give();
         for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i)
             if (s_ww[i]) wakeword_notify_speaking_began(s_ww[i]);
         snprintf(ll, sizeof(ll), "[ambient] START marker=%s loop=%d vol=%d", req.marker, req.loop, req.volume);
@@ -2711,20 +4874,36 @@ static void ambient_task(void *arg)
         }
 
         // ── Tear down this session ──────────────────────────────────────────
-        audio_io_stop_playback();
-        audio_io_flush_playback();
-        for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i)
-            if (s_ww[i]) wakeword_notify_speaking_ended(s_ww[i]);
-        xvf3800_enable_amplifier(false);
-        airplay_note_amp_forced_off();
+        // This worker owns only MUSIC. Keep the shared engine and speech lane
+        // alive for any overlapping assistant reply.
+        audio_io_flush_music();
+        if (!vg_lifecycle_take()) continue;
+        s_ambient_active = false;
+        s_ambient_paused = false;
+        s_ambient_cur_marker[0] = 0;
+        const bool other_speech =
+            s_stream_active || s_legacy_tts_active;
+        const bool other_audio =
+            other_speech || airplay_is_playing() ||
+            alarm_is_firing();
+        const bool gate_active = s_verify_playback_hold_active;
+        vg_lifecycle_give();
+        if (!other_speech) {
+            for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i)
+                if (s_ww[i]) wakeword_notify_speaking_ended(s_ww[i]);
+        }
+        if (!other_audio || gate_active) {
+            xvf3800_enable_amplifier(false);
+            airplay_note_amp_forced_off();
+        }
         if (s_pre_ambient_volume >= 0) {
             audio_io_set_volume((uint8_t)s_pre_ambient_volume);
             s_pre_ambient_volume = -1;
         }
-        s_ambient_active = false;
-        s_ambient_paused = false;
-        s_ambient_cur_marker[0] = 0;
-        set_ui_state(UI_STATE_IDLE);
+        if (!other_audio && !gate_active && !s_in_utterance &&
+            !s_awaiting_reply) {
+            set_ui_state(UI_STATE_IDLE);
+        }
         oe_udplog_send("[ambient] STOP");
         // Loop: a queued (preempting) request is picked up immediately next
         // iteration; otherwise we block idle in xQueueReceive.
@@ -2735,15 +4914,38 @@ static void ambient_task(void *arg)
 // command ran; now play it again. Re-enables the amp + playback (the barge-in
 // flushed/stopped it, and a TTS reply may have stopped it). The ambient task is
 // still sitting in oe_tts_post — clearing s_ambient_paused makes its http_evt
-// start decoding the live bytes again, so the rain picks up from "now". No-op
-// unless we're actually paused on a live session.
-static void ambient_resume(void)
+// start decoding the live bytes again, so the rain picks up from "now".
+// Caller owns s_verify_lifecycle_mutex.
+static bool ambient_resume_locked(bool gate_rollback_owner)
 {
-    if (!s_ambient_paused || !s_ambient_active) { s_ambient_paused = false; return; }
+    if (!s_ambient_paused || !s_ambient_active || s_ambient_stop ||
+        leds_buttons_is_muted() || alarm_is_firing() ||
+        audio_io_is_paused()) {
+        return false;
+    }
+    if (!gate_rollback_owner &&
+        (s_verify_playback_hold_active || s_in_utterance ||
+         s_awaiting_reply || s_stream_active ||
+         get_followup_until_us() != 0 ||
+         uxQueueMessagesWaiting(s_sentence_q) > 0 ||
+         !token_accum_empty())) {
+        return false;
+    }
     xvf3800_enable_amplifier(true);
     audio_io_start_playback();
     s_ambient_paused = false;
     oe_udplog_send("[ambient] RESUME");
+    return true;
+}
+
+// Normal callers do not already own the lifecycle mutex. Re-check every
+// source/priority predicate under it so a mute or new gate cannot slip between
+// the final check and amplifier enable.
+static void ambient_resume(void)
+{
+    if (!vg_lifecycle_take()) return;
+    ambient_resume_locked(false);
+    vg_lifecycle_give();
 }
 
 // Custom-chime worker: fetch the MP3 via the one-shot marker, hand off to
@@ -2775,6 +4977,12 @@ static void chime_upload_worker(void *arg)
 // dismiss path), they just steady the slot's internal state.
 static void alarm_speaking_cb(bool speaking)
 {
+    if (speaking) {
+        // Alarm priority wins over an unverified wake. The capture task drops
+        // the provisional session on its next frame and releases only the
+        // gate-owned holds; alarm audio queued meanwhile remains intact.
+        vg_request_cancel();
+    }
     if (speaking && s_ambient_active) {
         s_ambient_paused = true;
         oe_udplog_send("[ambient] PAUSE (alarm)");
@@ -2782,14 +4990,46 @@ static void alarm_speaking_cb(bool speaking)
     for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i) {
         if (!s_ww[i]) continue;
         if (speaking) wakeword_notify_speaking_began(s_ww[i]);
-        else          wakeword_notify_speaking_ended(s_ww[i]);
+        else if (!s_stream_active && !s_legacy_tts_active)
+            wakeword_notify_speaking_ended(s_ww[i]);
     }
 }
 
 static void alarm_amp_cb(bool enable)
 {
-    xvf3800_enable_amplifier(enable);
-    if (!enable) airplay_note_amp_forced_off();
+    if (!vg_lifecycle_take()) return;
+    if (enable) {
+        // Alarm PCM may be queued behind a provisional gate or rejected by a
+        // destructive mute fence. Serialize with the gate's final release:
+        // either leave a deferred handoff for that path, or observe the gate
+        // fully clear and enable playback here.
+        if (leds_buttons_is_muted()) {
+            s_alarm_amp_deferred = false;
+        } else if (s_verify_playback_hold_active) {
+            s_alarm_amp_deferred = true;
+        } else {
+            s_alarm_amp_deferred = false;
+            audio_io_start_playback();
+            xvf3800_enable_amplifier(true);
+        }
+        vg_lifecycle_give();
+        return;
+    }
+    s_alarm_amp_deferred = false;
+    // Alarm owns the music it queued, not the shared amplifier. Preserve amp
+    // ownership for an overlapping reply/ambient/AirPlay source; each source's
+    // own finalizer will turn it off when that source actually ends.
+    bool another_source =
+        !audio_io_is_paused() &&
+        (s_stream_active || s_legacy_tts_active ||
+         (s_ambient_active && !s_ambient_paused) ||
+         airplay_is_playing());
+    if (!another_source || s_verify_playback_hold_active ||
+        leds_buttons_is_muted()) {
+        xvf3800_enable_amplifier(false);
+        airplay_note_amp_forced_off();
+    }
+    vg_lifecycle_give();
 }
 
 // Human-readable last-reset cause, sent in the [boot] UDP line. PANIC /
@@ -2812,11 +5052,177 @@ static const char *reset_reason_str(esp_reset_reason_t r)
     }
 }
 
+// ── DoA probe (0.2.74, experimental — strictly read-only) ───────────────────
+// RESOLVED by the first probe flash (2026-07-07): the formatBCE HA variant
+// DOES expose the AEC beamformer over device control —
+//   AEC_AZIMUTH_VALUES  (33, 75): 4 floats = beam1, beam2, free-running,
+//                                 auto-select — azimuth in radians
+//   AEC_SPENERGY_VALUES (33, 80): 4 floats — speech energy per beam
+// but reads answer status 0x40 (SERVICER_COMMAND_RETRY, XMOS sln_voice)
+// whenever the servicer has no fresh estimate — which is ALWAYS true in a
+// silent room, so the original one-shot discovery sweep misread "exposed but
+// quiet" as "not exposed". The host contract (verified against formatBCE's
+// ESPHome component, which runs this same firmware) is: retry the whole
+// write+read up to ~8× with a short pause; retries exhausting during silence
+// is itself signal (no source to localize). Wrong lengths return 0x42, and
+// cmd 74 returns 0x42 at every length — it does not exist on this variant
+// (the gillespinault map it came from was for a different firmware).
+//
+// This task streams the values over the UDP log so a human walking around
+// the device can verify the auto-select beam (index 3) tracks the talker.
+// If it does, next step is direction-gating the conversation windows —
+// possibly with the AEC beam-lock writes formatBCE uses (cmds 37/81), but
+// NOT in this build: reads only, and never SAVE_CONFIGURATION.
+#define DOA_STATUS_DONE  0x00
+#define DOA_STATUS_WAIT  0x01   // CTRL_WAIT: transport busy, retry
+#define DOA_STATUS_RETRY 0x40   // SERVICER_COMMAND_RETRY: no fresh data yet
+// Reads one 4-float AEC value set. True = fresh data in vals[4]; false =
+// silence (retry status exhausted) or error, with the last status byte in
+// *last_st (0xEE = I²C transport failure).
+static bool doa_read4(uint8_t cmd, float vals[4], uint8_t *last_st)
+{
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        uint8_t st = 0xEE, buf[16] = {0};
+        if (xvf3800_xmos_read_raw(XVF_RESID_AEC, cmd, &st, buf, 16) != ESP_OK) {
+            if (last_st) *last_st = 0xEE;
+            return false;
+        }
+        if (last_st) *last_st = st;
+        if (st == DOA_STATUS_DONE) {
+            memcpy(vals, buf, 16);
+            return true;
+        }
+        if (st != DOA_STATUS_WAIT && st != DOA_STATUS_RETRY) return false;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return false;
+}
+
+static void doa_probe_task(void *arg)
+{
+    // Let the XVF boot and agc_freeze_task settle before poking the bus.
+    vTaskDelay(pdMS_TO_TICKS(10000));
+
+    for (;;) {
+        // Poll faster whenever the direction data would actually matter: an
+        // utterance being captured, an armed follow-up window, or our own
+        // reply streaming (barge candidates).
+        bool active = s_in_utterance || s_stream_active ||
+                      get_followup_until_us() > 0;
+        vTaskDelay(pdMS_TO_TICKS(active ? 400 : 2000));
+
+        float az[4] = {0}, spe[4] = {0};
+        uint8_t az_st = 0, spe_st = 0;
+        bool az_ok  = doa_read4(XVF_CMD_AEC_AZIMUTH_VALUES,  az,  &az_st);
+        bool spe_ok = doa_read4(XVF_CMD_AEC_SPENERGY_VALUES, spe, &spe_st);
+
+        // Publish fresh azimuths for the direction gate (0.2.75). The gate
+        // treats readings older than DOA_GATE_MAX_AGE_US as absent, so the
+        // 2 s idle cadence naturally fails it open outside conversations.
+        if (az_ok) {
+            taskENTER_CRITICAL(&s_doa_mux);
+            memcpy(s_doa_az, az, sizeof(az));
+            s_doa_fresh_us = esp_timer_get_time();
+            taskEXIT_CRITICAL(&s_doa_mux);
+        }
+
+        // Silent room at idle cadence = nothing to say; skip the line so the
+        // udplog isn't 40k no-op rows a day. While "active" we always emit —
+        // even a stale read proves the plumbing during the windows we care
+        // about, and fresh lines appear exactly when someone is audible.
+        if (!az_ok && !spe_ok && !active) continue;
+
+        // snprintf returns would-have-written length — clamp off after every
+        // append or `sizeof(line) - off` underflows (size_t) if garbage data
+        // decodes into very wide floats.
+        char line[160];
+        int off = snprintf(line, sizeof(line), "[doa]");
+        #define DOA_APPEND(...) do { \
+                if (off < (int)sizeof(line) - 1) \
+                    off += snprintf(line + off, sizeof(line) - off, __VA_ARGS__); \
+                if (off > (int)sizeof(line) - 1) off = (int)sizeof(line) - 1; \
+            } while (0)
+        if (az_ok)  DOA_APPEND(" az=%.2f,%.2f,%.2f,%.2f",
+                               (double)az[0], (double)az[1], (double)az[2], (double)az[3]);
+        else        DOA_APPEND(" az=st%02x", az_st);
+        if (spe_ok) DOA_APPEND(" spe=%g,%g,%g,%g",
+                               (double)spe[0], (double)spe[1], (double)spe[2], (double)spe[3]);
+        else        DOA_APPEND(" spe=st%02x", spe_st);
+        DOA_APPEND(" u=%d s=%d", s_in_utterance ? 1 : 0, s_stream_active ? 1 : 0);
+        #undef DOA_APPEND
+        oe_udplog_send(line);
+    }
+}
+
 static void boot_operational(void)
 {
+    // Create this before alarm/WS/TTS tasks can call into the verify-gate
+    // lifecycle. A configured gate fails closed if its cross-component hold
+    // cannot be serialized safely.
+    s_verify_lifecycle_mutex = xSemaphoreCreateMutex();
+    if (!s_verify_lifecycle_mutex) {
+        ESP_LOGE(TAG, "verify lifecycle mutex alloc");
+        esp_restart();
+    }
+
     nvs_creds_get_server(g_dev_config.server_url, sizeof(g_dev_config.server_url));
     nvs_creds_get_token(g_dev_config.token, sizeof(g_dev_config.token));
     nvs_creds_get_device_name(g_dev_config.device_name, sizeof(g_dev_config.device_name));
+
+    // Verify-gate config. Both the fixed proxy path and OE's canonical device
+    // id are required. A non-empty legacy direct URL proves gating was enabled,
+    // so migrate it to the fixed OE proxy path in memory instead of silently
+    // bypassing wakes while waiting for server_caps. Only a persisted,
+    // explicitly empty value is disabled; a missing/unreadable key is pending
+    // and blocks wakes until server_caps from an allowed origin makes policy
+    // explicit.
+    esp_err_t gate_path_e =
+        nvs_creds_get_verify_gate_path(g_dev_config.verify_gate_path,
+                                       sizeof(g_dev_config.verify_gate_path));
+    esp_err_t device_id_e =
+        nvs_creds_get_device_id(g_dev_config.device_id,
+                                sizeof(g_dev_config.device_id));
+    bool gate_path_loaded =
+        gate_path_e == ESP_OK &&
+        server_verify_gate_path_valid(g_dev_config.verify_gate_path);
+    bool migrate_legacy_gate =
+        (gate_path_e == ESP_OK && !gate_path_loaded &&
+         g_dev_config.verify_gate_path[0] != 0) ||
+        gate_path_e == ESP_ERR_NVS_INVALID_LENGTH;
+    bool gate_policy_known = gate_path_loaded || migrate_legacy_gate;
+    bool device_id_loaded = device_id_e == ESP_OK &&
+                            server_device_id_valid(g_dev_config.device_id);
+    if (migrate_legacy_gate) {
+        snprintf(g_dev_config.verify_gate_path,
+                 sizeof(g_dev_config.verify_gate_path), "%s",
+                 OE_VERIFY_GATE_PATH);
+        ESP_LOGW(TAG, "verify gate: migrated legacy direct endpoint to OE proxy");
+    } else if (!gate_path_loaded) {
+        g_dev_config.verify_gate_path[0] = 0;
+    }
+    if (!device_id_loaded) g_dev_config.device_id[0] = 0;
+    s_verify_gate_config_known = gate_policy_known;
+    s_verify_gate_config_persisted = gate_path_loaded && device_id_loaded;
+    if (migrate_legacy_gate && device_id_loaded) {
+        esp_err_t migrate_e =
+            nvs_creds_set_verify_gate_config(
+                g_dev_config.device_id, g_dev_config.verify_gate_path);
+        s_verify_gate_config_persisted = migrate_e == ESP_OK;
+        if (migrate_e != ESP_OK) {
+            ESP_LOGW(TAG, "verify gate: legacy migration is volatile: %s",
+                     esp_err_to_name(migrate_e));
+        }
+    }
+    if (!s_verify_gate_config_known) {
+        ESP_LOGW(TAG, "verify gate: policy pending allowed-origin server_caps");
+    } else if (g_dev_config.verify_gate_path[0] && g_dev_config.device_id[0]) {
+        ESP_LOGI(TAG, "verify gate: OE proxy configured (device_id %s)",
+                 g_dev_config.device_id);
+    } else if (g_dev_config.verify_gate_path[0]) {
+        ESP_LOGI(TAG, "verify gate: pending canonical device_id");
+    } else {
+        ESP_LOGI(TAG, "verify gate: disabled (no verify_gate_path)");
+    }
     if (nvs_creds_get_default_agent(g_dev_config.default_agent_id,
                                     sizeof(g_dev_config.default_agent_id)) != ESP_OK ||
         g_dev_config.default_agent_id[0] == 0) {
@@ -2962,7 +5368,34 @@ static void boot_operational(void)
     s_preroll_buf = heap_caps_malloc(PREROLL_SAMPLES * sizeof(int16_t),
                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_preroll_buf) s_preroll_buf = malloc(PREROLL_SAMPLES * sizeof(int16_t));
-    if (!s_preroll_buf) ESP_LOGW(TAG, "preroll alloc failed — follow-up onset capture disabled");
+    if (!s_preroll_buf) {
+        ESP_LOGW(TAG, "preroll alloc failed — follow-up onset disabled; configured verify gate will fail-closed");
+    }
+
+    // Verify-gate wake-window buffer (~80 KB) + its worker task. PSRAM; if
+    // setup fails, an explicitly disabled gate still uses the legacy path, but
+    // a configured gate drops wakes until a reboot restores the resources.
+    // The worker is created unconditionally (it idles on the semaphore) so
+    // server_caps can enable or disable the gate without a firmware change.
+    s_verify_wav = heap_caps_malloc(VG_WIN_SAMPLES * sizeof(int16_t),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_verify_wav) {
+        ESP_LOGW(TAG, "verify-gate window alloc failed — configured gate will fail-closed");
+    } else {
+        s_verify_job_sem = xSemaphoreCreateBinary();
+        if (!s_verify_job_sem) {
+            ESP_LOGW(TAG, "verify-gate sem alloc failed — configured gate will fail-closed");
+            heap_caps_free(s_verify_wav);
+            s_verify_wav = NULL;
+        } else if (xTaskCreate(verify_worker_task, "verify_gate", 6144, NULL, 5,
+                               &s_verify_worker_handle) != pdPASS) {
+            ESP_LOGW(TAG, "verify-gate worker create failed — configured gate will fail-closed");
+            vSemaphoreDelete(s_verify_job_sem);
+            s_verify_job_sem = NULL;
+            heap_caps_free(s_verify_wav);
+            s_verify_wav = NULL;
+        }
+    }
 
     // Per-boot turn-id prefix: distinguishes this boot's turns from a
     // pre-reboot turn's stale events still queued server-side.
@@ -2978,10 +5411,13 @@ static void boot_operational(void)
     // is the key signal for whether the device is crash-rebooting under load.
     oe_udplog_init(g_dev_config.server_url, OE_UDPLOG_PORT);
     {
-        char bl[128];
-        snprintf(bl, sizeof(bl), "[boot] reset=%s heap_int=%luKB heap_psram=%luKB",
+        const uint32_t int_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+        char bl[160];
+        snprintf(bl, sizeof(bl),
+                 "[boot] reset=%s heap_int=%luKB heap_int_largest=%luKB heap_psram=%luKB",
                  reset_reason_str(esp_reset_reason()),
-                 (unsigned long)(esp_get_free_heap_size() / 1024),
+                 (unsigned long)(heap_caps_get_free_size(int_caps) / 1024),
+                 (unsigned long)(heap_caps_get_largest_free_block(int_caps) / 1024),
                  (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
         ESP_LOGI(TAG, "%s", bl);
         oe_udplog_send(bl);
@@ -3006,11 +5442,21 @@ static void boot_operational(void)
     xTaskCreate(xvf_migration_task, "xvf_migrate", 3072, NULL, 3, NULL);
     xTaskCreate(boot_indicator_task, "boot_ind", 3072, NULL, 4, NULL);
     xTaskCreate(agc_freeze_task, "agc_freeze", 3072, NULL, 4, NULL);
+    // 0.2.74 experiment — remove (or promote to a real direction gate) once
+    // the DoA question is answered. Low priority: purely diagnostic traffic.
+    // DISABLED 2026-07-24 for the verify-gate test image: keep this pre-existing
+    // WIP out of the flashed build so on-device gate validation isn't muddied by
+    // the probe's I2C sweep. Re-enable to resume the DoA investigation.
+    // xTaskCreate(doa_probe_task, "doa_probe", 4096, NULL, 2, NULL);
+    (void)doa_probe_task;   // keep the function referenced so it still compiles
     // hb itself needs ~4 KB now that it runs the per-minute stack-hwm
     // dump: 256-byte line buffer + ESP_LOGI (vprintf) + xTaskGetHandle +
     // uxTaskGetStackHighWaterMark traversal added enough stack pressure
     // to overflow the original 2 KB allocation (observed 0.2.34 boot).
     xTaskCreate(heartbeat_task, "hb", 6144, NULL, 1, NULL);
+
+    s_operational_boot_ready = true;
+    maybe_resume_pending_ota();
 }
 
 // Heartbeat — logs every 10s so we can tell from serial whether the CPU is
@@ -3063,14 +5509,18 @@ static void heartbeat_task(void *arg)
                 oe_ota_mark_running_valid();
                 s_ota_marked_valid = true;
             }
-            char hbline[160];
+            const uint32_t int_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+            char hbline[192];
             // pcm_drop is the running total of playback samples lost to a
             // full ring (audio_io_write_pcm). Nonzero = audible skip
             // happened; steadily climbing = server pacing outrunning the
             // ring. Cumulative on purpose — a rare drop stays visible.
-            snprintf(hbline, sizeof(hbline), "[hb] alive tick=%lu rssi=%d heap_int=%luKB cap_sps=%lu pcm_drop=%lu",
+            snprintf(hbline, sizeof(hbline),
+                     "[hb] alive tick=%lu rssi=%d heap_int=%luKB "
+                     "heap_int_largest=%luKB cap_sps=%lu pcm_drop=%lu",
                      (unsigned long)n++, rssi_now,
-                     (unsigned long)(esp_get_free_heap_size() / 1024),
+                     (unsigned long)(heap_caps_get_free_size(int_caps) / 1024),
+                     (unsigned long)(heap_caps_get_largest_free_block(int_caps) / 1024),
                      (unsigned long)cap_sps,
                      (unsigned long)audio_io_get_playback_drop_samples());
             ESP_LOGI(TAG, "%s", hbline);
@@ -3105,6 +5555,7 @@ static void heartbeat_task(void *arg)
         //   pcm_rb: bytes queued waiting for I²S to drain — IF THIS GOES
         //           NEAR 0 you have an underrun and the speaker pops
         //   heap_int: free internal SRAM in KB
+        //   heap_int_largest: largest allocatable internal block in KB
         //   heap_psram: free PSRAM in KB
         //   heap_int_min: lowest free internal ever (low-water mark)
         const uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -3129,19 +5580,22 @@ static void heartbeat_task(void *arg)
             // late wake-up of the hb task doesn't lie about rates.
             const uint32_t bytes_per_sec = (interval_ms > 0) ? (bytes_delta * 1000u / interval_ms) : 0;
             const uint32_t errs_per_sec_x10 = (interval_ms > 0) ? (errs_delta * 10000u / interval_ms) : 0;
+            const uint32_t int_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
             char as[256];
             snprintf(as, sizeof(as),
                 "[ambient-stats] rssi=%d bytes/s=%lu dec_errs/s=%lu.%lu "
-                "pcm_rb=%lu/%lu heap_int=%lu heap_psram=%lu heap_int_min=%lu",
+                "pcm_rb=%lu/%lu heap_int=%lu heap_int_largest=%lu "
+                "heap_psram=%lu heap_int_min=%lu",
                 rssi,
                 (unsigned long)bytes_per_sec,
                 (unsigned long)(errs_per_sec_x10 / 10),
                 (unsigned long)(errs_per_sec_x10 % 10),
                 (unsigned long)pcm_used,
                 (unsigned long)pcm_cap,
-                (unsigned long)(esp_get_free_heap_size() / 1024),
+                (unsigned long)(heap_caps_get_free_size(int_caps) / 1024),
+                (unsigned long)(heap_caps_get_largest_free_block(int_caps) / 1024),
                 (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
-                (unsigned long)(esp_get_minimum_free_heap_size() / 1024));
+                (unsigned long)(heap_caps_get_minimum_free_size(int_caps) / 1024));
             ESP_LOGI(TAG, "%s", as);
             oe_udplog_send(as);
         }
@@ -3161,6 +5615,14 @@ static void boot_provisioning(void)
 void app_main(void)
 {
     nvs_creds_init();
+    // Reserve OTA's task stack/TCB in internal DRAM at boot. The persistent
+    // worker sleeps until notified and never asks a fragmented runtime heap
+    // for the contiguous 8 KB block that failed on long-running devices.
+    esp_err_t ota_init_e = oe_ota_init();
+    if (ota_init_e != ESP_OK) {
+        ESP_LOGE(TAG, "persistent OTA worker init failed: %s",
+                 esp_err_to_name(ota_init_e));
+    }
     esp_netif_init();
     esp_event_loop_create_default();
 
@@ -3171,7 +5633,15 @@ void app_main(void)
     // sequences I²C init → version read → I²S init, in that order.
     xvf3800_init();
     leds_buttons_init(mute_change_cb);
-    audio_io_init();
+    esp_err_t audio_err = audio_io_init();
+    if (audio_err != ESP_OK) {
+        // In particular, surface PSRAM exhaustion from the enlarged
+        // reversible speech ring. Continuing would look like a successful
+        // boot but leave capture/playback (and therefore gating) dead.
+        ESP_LOGE(TAG, "audio_io_init failed: %s", esp_err_to_name(audio_err));
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
 
     if (nvs_creds_is_provisioned()) {
         ESP_LOGI(TAG, "provisioned — operational boot");

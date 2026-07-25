@@ -8,11 +8,16 @@
 #define OE_TOKEN_BUF 128
 #define OE_AGENT_ID_BUF 64
 #define OE_URL_BUF 256
+#define OE_DEVICE_ID_BUF 64
+#define OE_VERIFY_GATE_PATH "/api/voice-gate/v1/verify"
 
 typedef struct {
     char token[OE_TOKEN_BUF];
     char user_id[OE_AGENT_ID_BUF];
     char server_hint[OE_URL_BUF];
+    // Pairing REST field is camelCase `deviceId`; server_caps later reconciles
+    // the same canonical identity as snake_case `device_id`.
+    char device_id[OE_DEVICE_ID_BUF];
 } oe_pair_result_t;
 
 esp_err_t oe_pair_redeem(const char *server_url, const char *pair_code,
@@ -107,10 +112,11 @@ typedef enum {
     OE_WS_EVT_TTS_AUDIO_BEGIN,
     OE_WS_EVT_TTS_AUDIO,
     OE_WS_EVT_TTS_AUDIO_END,
-    // { type:'server_caps', turn_ids, tts_pause, stt_stream } — sent once
-    // after auth. Raw JSON payload; main.c stores the capability flags so
-    // newer device→server messages are only sent to servers that understand
-    // them. Flags reset on disconnect (the next server may be older).
+    // { type:'server_caps', turn_ids, tts_pause, stt_stream, device_id,
+    //   verify_gate_path } — sent once after auth. Raw JSON payload; main.c
+    // stores capability flags and reconciles the gate configuration. The only
+    // accepted non-empty path is OE_VERIFY_GATE_PATH; empty disables the gate.
+    // Omitted provisioning fields preserve state for older servers.
     OE_WS_EVT_SERVER_CAPS,
     // { type:'set_conversation_mode', enabled } — per-device toggle from
     // Settings. Enables the speech barge-in VAD during SPEAKING (main.c
@@ -153,6 +159,17 @@ bool      oe_ws_connected(void);
 // pre-roll, so the server relaxes its bare-word intent anchors ("stop").
 esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id, bool barge_in);
 esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id);
+// Capture-safe bounded variant. timeout_ms is converted to at least one
+// FreeRTOS tick, including when the caller passes 0.
+esp_err_t oe_ws_send_stop_timeout(const char *agent_id, const char *turn_id,
+                                  uint32_t timeout_ms);
+// Verify-gate variant. hold_id is the provisional wake id that owns the
+// server-side pause latch; it may be present even when there is no prior turn
+// (first wake / turnless announcement).
+esp_err_t oe_ws_send_stop_hold_timeout(const char *agent_id,
+                                       const char *turn_id,
+                                       const char *hold_id,
+                                       uint32_t timeout_ms);
 
 // Speech barge-in flow control (send ONLY when server_caps.tts_pause).
 // tts_pause stalls the server's PCM pacer while the device verifies a
@@ -161,6 +178,16 @@ esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id);
 // resume degrades to a truncated reply, never a wedged pacer.
 esp_err_t oe_ws_send_tts_pause(const char *turn_id);
 esp_err_t oe_ws_send_tts_resume(const char *turn_id);
+esp_err_t oe_ws_send_tts_pause_timeout(const char *turn_id,
+                                       uint32_t timeout_ms);
+esp_err_t oe_ws_send_tts_resume_timeout(const char *turn_id,
+                                        uint32_t timeout_ms);
+esp_err_t oe_ws_send_tts_pause_hold_timeout(const char *turn_id,
+                                            const char *hold_id,
+                                            uint32_t timeout_ms);
+esp_err_t oe_ws_send_tts_resume_hold_timeout(const char *turn_id,
+                                             const char *hold_id,
+                                             uint32_t timeout_ms);
 
 // ── Streaming STT (send ONLY when server_caps.stt_stream) ──────────────────
 // Instead of buffering the whole utterance and blocking on one HTTP POST,
@@ -175,6 +202,14 @@ esp_err_t oe_ws_send_tts_resume(const char *turn_id);
 esp_err_t oe_ws_send_stt_begin(const char *turn_id, uint8_t wake_slot,
                                uint8_t wake_avg_prob, const char *agent_id);
 esp_err_t oe_ws_send_stt_frame(const int16_t *samples, size_t n_samples, uint32_t seq);
+// Start a streaming session and replay an already-buffered prefix under a
+// capture-safe time budget. Intended for verify-gated turns: success returns
+// the next sequence number; any timeout/send failure lets the caller keep
+// buffering and use oe_stt_post without starving the capture ring.
+esp_err_t oe_ws_send_stt_backlog(const char *turn_id, uint8_t wake_slot,
+                                 uint8_t wake_avg_prob, const char *agent_id,
+                                 const int16_t *samples, size_t n_samples,
+                                 uint32_t budget_ms, uint32_t *out_next_seq);
 esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples);
 esp_err_t oe_ws_send_stt_abort(const char *turn_id);
 
@@ -200,10 +235,11 @@ esp_err_t oe_ws_send_alarm_fired(const char *alarm_id);
 esp_err_t oe_ws_send_alarm_acked(const char *alarm_id);
 
 // Stream OTA progress to the server while esp_https_ota runs. `phase` is a
-// short tag ("checking" | "downloading" | "applying" | "rebooting" |
-// "up_to_date" | "error"). `bytes_done`/`total` are 0 when not applicable;
-// `err` may be NULL. Server fans these to the user's browser tabs so the UI
-// can show a progress bar without polling.
+// short tag ("checking" | "downloading" | "applying" |
+// "restarting_for_memory" | "rebooting" | "up_to_date" | "error").
+// `bytes_done`/`total` are 0 when not applicable; `err` may be NULL. Server
+// fans these to the user's browser tabs so the UI can show progress without
+// polling.
 esp_err_t oe_ws_send_ota_progress(const char *phase, uint32_t bytes_done,
                                   uint32_t total, const char *target_version,
                                   const char *err);
@@ -211,6 +247,42 @@ esp_err_t oe_ws_send_ota_progress(const char *phase, uint32_t bytes_done,
 esp_err_t oe_stt_post(const char *server_url, const char *token,
                       const int16_t *pcm_16k_mono, size_t n_samples,
                       char *out_text, size_t out_len);
+
+// ── Wake-word verify gate client (Option A, device-owned provisional session) ─
+// Second-stage wake verification. POSTs the wake window as multipart/form-data
+// to OE_VERIFY_GATE_PATH on the already-paired OE origin. HTTP is accepted only
+// for a numeric private-LAN IPv4 origin; HTTPS remains accepted for deployments
+// that use it. OE authenticates the voice-device session, derives the canonical
+// device id, and privately relays to the loopback verifier. The response carries
+// no transcript text.
+typedef enum {
+    OE_VERIFY_ACCEPT = 0,   // effective=="accept"  → proceed with the turn
+    OE_VERIFY_REJECT,       // effective=="reject"  → drop the fire silently
+    OE_VERIFY_ERROR,        // transport/timeout/malformed/unknown → drop the fire
+} oe_verify_result_t;
+
+// server_url    : the paired OE origin with no userinfo/query/fragment/path.
+//                 Plain HTTP is allowed only for a numeric RFC1918 IPv4 host.
+// gate_path     : must exactly equal OE_VERIFY_GATE_PATH.
+// session_id    : device turn_id (<=24 chars, required).
+// device_id     : stable device id (required).
+// wake_words_json: JSON array string, e.g. "[\"hey_computer\"]".
+// detector_score: [0,1], or <0 to omit the field.
+// fired_at      : ISO8601 string, or "" to omit.
+// timeout_ms    : client long-poll deadline (~1200; just above the gate's 1 s
+//                 whisper timeout). *out_effective is ALWAYS written (ERROR on
+//                 any transport/parse/identity failure). The response must
+//                 echo the exact device_id and session_id before its verdict
+//                 is consumed. Return value is for logging only — callers act
+//                 on *out_effective.
+bool oe_verify_gate_origin_allowed(const char *server_url);
+esp_err_t oe_verify_gate_post(const char *server_url, const char *gate_path,
+                              const char *token,
+                              const char *session_id, const char *device_id,
+                              const char *wake_words_json, float detector_score,
+                              const char *fired_at,
+                              const int16_t *pcm_16k_mono, size_t n_samples,
+                              int timeout_ms, oe_verify_result_t *out_effective);
 
 typedef void (*oe_tts_pcm_cb_t)(const int16_t *pcm_mono, size_t samples, uint32_t rate, void *user);
 
@@ -252,12 +324,22 @@ size_t oe_b64_decode(const char *b64, size_t b64_len, uint8_t *out, size_t out_m
 esp_err_t oe_udplog_init(const char *server_url, uint16_t port);
 void      oe_udplog_send(const char *line);
 
-// Spawn an OTA check task. Fetches <server_url>/firmware/voice-device/manifest.json,
-// compares against the running app's version (from esp_app_get_description),
-// and if the manifest version is newer, downloads the app binary via
-// esp_https_ota and reboots. Streams ota_progress events over WS for UI.
-// Idempotent: a no-op if a check is already in flight.
+// Create OTA's persistent worker from a statically allocated internal-RAM
+// stack/TCB. Call once near the start of app_main, before memory-heavy runtime
+// setup. Safe to call repeatedly; no heap allocation is needed for the task.
+esp_err_t oe_ota_init(void);
+
+// Schedule an OTA check on the persistent worker. Fetches
+// <server_url>/firmware/voice-device/manifest.json, compares against the
+// running app's version, and applies a newer image. Returns
+// ESP_ERR_INVALID_STATE when a check is already in flight.
 esp_err_t oe_ota_start_check(const char *server_url);
+
+// Resume one OTA attempt after an explicitly diagnosed OOM reboot. The retry
+// latch is consumed in NVS before the worker is notified, preventing reboot
+// loops. Call only after authenticated server_caps and operational boot setup.
+// Returns ESP_ERR_NOT_FOUND when no retry is pending.
+esp_err_t oe_ota_resume_pending(const char *server_url);
 
 // Marks the running app as valid after a successful boot, cancelling any
 // pending rollback. Call once Wi-Fi is associated and the WS is connected —

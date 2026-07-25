@@ -45,6 +45,13 @@ extern "C" {
 
 // Command IDs (for resid 33 = AEC)
 #define XVF_CMD_AEC_SPENERGY   74
+// Candidate DoA reads — the two source maps disagree: 74 comes from the
+// gillespinault VAD project this file was built against; upstream
+// respeaker xvf_host.py instead lists AZIMUTH_VALUES=75 (4×float radians)
+// and SPENERGY_VALUES=80 (4×float). Which set the formatBCE HA variant
+// actually answers is what main.c's doa_probe_task exists to discover.
+#define XVF_CMD_AEC_AZIMUTH_VALUES   75
+#define XVF_CMD_AEC_SPENERGY_VALUES  80
 
 // Command IDs (for resid 240 = DFU_CONTROLLER)
 #define XVF_CMD_DFU_DNLOAD        1
@@ -97,6 +104,13 @@ esp_err_t xvf3800_init(void);
 // Low-level XMOS device-control transactions.
 esp_err_t xvf3800_xmos_write(uint8_t resid, uint8_t cmd, const uint8_t *data, uint8_t len);
 esp_err_t xvf3800_xmos_read(uint8_t resid, uint8_t cmd, uint8_t *out, uint8_t len);
+// Probe variant of read: returns the XMOS status byte via *status_out
+// (0 = success) instead of logging + ESP_FAILing on non-zero, so callers
+// sweeping unknown commands can tell "command rejected" from a bus error
+// without spamming warnings. `out` receives data bytes regardless of status;
+// only trust them when *status_out == 0.
+esp_err_t xvf3800_xmos_read_raw(uint8_t resid, uint8_t cmd, uint8_t *status_out,
+                                uint8_t *out, uint8_t len);
 
 // Convenience wrappers built on the low-level ops.
 esp_err_t xvf3800_set_led_effect(xvf_led_effect_t effect);

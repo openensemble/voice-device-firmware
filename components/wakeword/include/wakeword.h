@@ -15,6 +15,10 @@ extern "C" {
 // every `feature_step_ms` (10 ms by default, matching microWakeWord v2
 // training). 1280 samples per call yields ~8 slices per call.
 #define WW_FRAME_SAMPLES 1280
+// Canonical verifier slug derived from manifest.wake_word. OE and firmware use
+// the same contract: lowercase ASCII alphanumeric tokens joined by underscores,
+// 39 characters maximum plus NUL.
+#define WW_WAKE_SLUG_MAX 40
 
 typedef struct wakeword_s wakeword_t;
 
@@ -48,6 +52,12 @@ bool wakeword_feed(wakeword_t *ww, const int16_t *samples, size_t n_samples);
 // before any wake has fired. Used by main.c to resolve which slot wins when
 // two overlapping wake-word phrases fire in the same or adjacent frames.
 uint8_t wakeword_last_wake_prob(const wakeword_t *ww);
+
+// Copy the canonical manifest-derived slug belonging to the most recent
+// detection. This is snapshotted while the model mutex is held, so a concurrent
+// slot hot-swap cannot relabel an already-fired wake. Returns false if no valid
+// detection identity is available or the destination is too small.
+bool wakeword_last_wake_slug(const wakeword_t *ww, char *out, size_t out_len);
 
 void wakeword_notify_speaking_began(wakeword_t *ww);
 void wakeword_notify_speaking_ended(wakeword_t *ww);

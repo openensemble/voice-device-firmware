@@ -7,6 +7,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_app_desc.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 
 static const char *TAG = "oe_ws";
@@ -45,9 +46,10 @@ static esp_err_t ws_send_json(cJSON *o, TickType_t timeout)
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     char *s = cJSON_PrintUnformatted(o);
     if (!s) return ESP_ERR_NO_MEM;
-    int rc = esp_websocket_client_send_text(s_ws, s, strlen(s), timeout);
+    size_t len = strlen(s);
+    int rc = esp_websocket_client_send_text(s_ws, s, len, timeout);
     free(s);
-    return rc < 0 ? ESP_FAIL : ESP_OK;
+    return rc == (int)len ? ESP_OK : ESP_FAIL;
 }
 
 static void handle_message(const char *data, size_t len)
@@ -261,6 +263,11 @@ esp_err_t oe_ws_start(const char *server_url, const char *token,
     // (gate at esp_websocket_client.c:1398, flag at .h:117).
     esp_websocket_client_config_t cfg = {
         .uri = ws_url,
+        // One complete OEA1 audio message must fit in the WS client's own
+        // buffer. Its 1024-byte default split every 2568-byte STT frame into
+        // three separately blocking transport writes, long enough to overflow
+        // the ~512 ms mic capture ring on a congested link.
+        .buffer_size = 8 + OE_STT_FRAME_MAX_SAMPLES * sizeof(int16_t),
         // The WS event callback runs the entire streamed-TTS write path on
         // this task's stack: cJSON parse + base64 decode + audio_io_write_pcm
         // (which keeps a 1.5 KB resample buffer). The library default of
@@ -301,6 +308,12 @@ bool oe_ws_connected(void)
     return s_ws && esp_websocket_client_is_connected(s_ws);
 }
 
+static TickType_t timeout_ms_to_ticks(uint32_t timeout_ms)
+{
+    TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
+    return ticks > 0 ? ticks : 1;
+}
+
 esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_slot, uint8_t wake_avg_prob, const char *turn_id, bool barge_in)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
@@ -326,7 +339,8 @@ esp_err_t oe_ws_send_chat(const char *agent_id, const char *text, uint8_t wake_s
     return err;
 }
 
-esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id)
+static esp_err_t send_stop(const char *agent_id, const char *turn_id,
+                           const char *hold_id, uint32_t timeout_ms)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
@@ -336,27 +350,84 @@ esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id)
     // Id of the turn being stopped (NOT a new turn's id) so the server can
     // ignore a stale stop that races a newer turn on the same socket.
     if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
-    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    if (hold_id && hold_id[0]) cJSON_AddStringToObject(o, "hold_id", hold_id);
+    esp_err_t err = ws_send_json(o, timeout_ms_to_ticks(timeout_ms));
     cJSON_Delete(o);
     return err;
 }
 
-static esp_err_t send_tts_flow(const char *type, const char *turn_id)
+esp_err_t oe_ws_send_stop_timeout(const char *agent_id, const char *turn_id,
+                                  uint32_t timeout_ms)
+{
+    return send_stop(agent_id, turn_id, NULL, timeout_ms);
+}
+
+esp_err_t oe_ws_send_stop_hold_timeout(const char *agent_id,
+                                       const char *turn_id,
+                                       const char *hold_id,
+                                       uint32_t timeout_ms)
+{
+    return send_stop(agent_id, turn_id, hold_id, timeout_ms);
+}
+
+esp_err_t oe_ws_send_stop(const char *agent_id, const char *turn_id)
+{
+    return oe_ws_send_stop_timeout(agent_id, turn_id, 1000);
+}
+
+static esp_err_t send_tts_flow(const char *type, const char *turn_id,
+                               const char *hold_id, uint32_t timeout_ms)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", type);
     if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
-    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    if (hold_id && hold_id[0]) cJSON_AddStringToObject(o, "hold_id", hold_id);
+    esp_err_t err = ws_send_json(o, timeout_ms_to_ticks(timeout_ms));
     cJSON_Delete(o);
     return err;
 }
 
-esp_err_t oe_ws_send_tts_pause(const char *turn_id)  { return send_tts_flow("tts_pause",  turn_id); }
-esp_err_t oe_ws_send_tts_resume(const char *turn_id) { return send_tts_flow("tts_resume", turn_id); }
+esp_err_t oe_ws_send_tts_pause_timeout(const char *turn_id,
+                                       uint32_t timeout_ms)
+{
+    return send_tts_flow("tts_pause", turn_id, NULL, timeout_ms);
+}
 
-esp_err_t oe_ws_send_stt_begin(const char *turn_id, uint8_t wake_slot,
-                               uint8_t wake_avg_prob, const char *agent_id)
+esp_err_t oe_ws_send_tts_resume_timeout(const char *turn_id,
+                                        uint32_t timeout_ms)
+{
+    return send_tts_flow("tts_resume", turn_id, NULL, timeout_ms);
+}
+
+esp_err_t oe_ws_send_tts_pause_hold_timeout(const char *turn_id,
+                                            const char *hold_id,
+                                            uint32_t timeout_ms)
+{
+    return send_tts_flow("tts_pause", turn_id, hold_id, timeout_ms);
+}
+
+esp_err_t oe_ws_send_tts_resume_hold_timeout(const char *turn_id,
+                                             const char *hold_id,
+                                             uint32_t timeout_ms)
+{
+    return send_tts_flow("tts_resume", turn_id, hold_id, timeout_ms);
+}
+
+esp_err_t oe_ws_send_tts_pause(const char *turn_id)
+{
+    return oe_ws_send_tts_pause_timeout(turn_id, 1000);
+}
+
+esp_err_t oe_ws_send_tts_resume(const char *turn_id)
+{
+    return oe_ws_send_tts_resume_timeout(turn_id, 1000);
+}
+
+static esp_err_t send_stt_begin_timeout(const char *turn_id, uint8_t wake_slot,
+                                        uint8_t wake_avg_prob,
+                                        const char *agent_id,
+                                        TickType_t timeout)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
@@ -365,14 +436,23 @@ esp_err_t oe_ws_send_stt_begin(const char *turn_id, uint8_t wake_slot,
     cJSON_AddNumberToObject(o, "wake_slot", wake_slot);
     cJSON_AddNumberToObject(o, "wake_avg_prob", wake_avg_prob);
     if (agent_id && agent_id[0]) cJSON_AddStringToObject(o, "agent", agent_id);
-    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    esp_err_t err = ws_send_json(o, timeout);
     cJSON_Delete(o);
     return err;
 }
 
+esp_err_t oe_ws_send_stt_begin(const char *turn_id, uint8_t wake_slot,
+                               uint8_t wake_avg_prob, const char *agent_id)
+{
+    return send_stt_begin_timeout(turn_id, wake_slot, wake_avg_prob, agent_id,
+                                  pdMS_TO_TICKS(1000));
+}
+
 // Binary frame: 'OEA1' + u32 LE seq + payload. Static buffer is safe — only
 // the capture/drive task streams frames, one at a time.
-esp_err_t oe_ws_send_stt_frame(const int16_t *samples, size_t n_samples, uint32_t seq)
+static esp_err_t send_stt_frame_timeout(const int16_t *samples,
+                                        size_t n_samples, uint32_t seq,
+                                        TickType_t timeout)
 {
     static uint8_t buf[8 + OE_STT_FRAME_MAX_SAMPLES * sizeof(int16_t)];
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
@@ -383,13 +463,58 @@ esp_err_t oe_ws_send_stt_frame(const int16_t *samples, size_t n_samples, uint32_
     buf[6] = (uint8_t)((seq >> 16) & 0xFF);
     buf[7] = (uint8_t)((seq >> 24) & 0xFF);
     memcpy(buf + 8, samples, n_samples * sizeof(int16_t));
+    const int frame_bytes = 8 + (int)(n_samples * sizeof(int16_t));
+    int rc = esp_websocket_client_send_bin(s_ws, (const char *)buf,
+                                           frame_bytes,
+                                           timeout);
+    return rc == frame_bytes ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t oe_ws_send_stt_frame(const int16_t *samples, size_t n_samples, uint32_t seq)
+{
     // Short timeout: at the 80 ms frame cadence a congested socket must fail
     // fast so the caller can flip to the buffered-HTTP fallback rather than
     // stalling the capture loop (the 16 KB capture ring only holds ~0.5 s).
-    int rc = esp_websocket_client_send_bin(s_ws, (const char *)buf,
-                                           8 + n_samples * sizeof(int16_t),
-                                           pdMS_TO_TICKS(150));
-    return rc < 0 ? ESP_FAIL : ESP_OK;
+    return send_stt_frame_timeout(samples, n_samples, seq, pdMS_TO_TICKS(20));
+}
+
+esp_err_t oe_ws_send_stt_backlog(const char *turn_id, uint8_t wake_slot,
+                                 uint8_t wake_avg_prob, const char *agent_id,
+                                 const int16_t *samples, size_t n_samples,
+                                 uint32_t budget_ms, uint32_t *out_next_seq)
+{
+    if (!samples || n_samples == 0 || budget_ms == 0 || !out_next_seq) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_next_seq = 0;
+
+    const int64_t deadline_us =
+        esp_timer_get_time() + (int64_t)budget_ms * 1000;
+    TickType_t begin_ticks = pdMS_TO_TICKS(budget_ms < 20 ? budget_ms : 20);
+    if (begin_ticks == 0) begin_ticks = 1;
+    esp_err_t err = send_stt_begin_timeout(
+        turn_id, wake_slot, wake_avg_prob, agent_id, begin_ticks);
+    if (err != ESP_OK) return err;
+
+    uint32_t seq = 0;
+    for (size_t off = 0; off < n_samples; off += OE_STT_FRAME_MAX_SAMPLES) {
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) return ESP_ERR_TIMEOUT;
+        uint32_t remaining_ms = (uint32_t)((remaining_us + 999) / 1000);
+        uint32_t send_ms = remaining_ms < 20 ? remaining_ms : 20;
+        TickType_t send_ticks = pdMS_TO_TICKS(send_ms);
+        if (send_ticks == 0) send_ticks = 1;
+
+        size_t chunk = n_samples - off;
+        if (chunk > OE_STT_FRAME_MAX_SAMPLES) {
+            chunk = OE_STT_FRAME_MAX_SAMPLES;
+        }
+        err = send_stt_frame_timeout(samples + off, chunk, seq, send_ticks);
+        if (err != ESP_OK) return err;
+        seq++;
+    }
+    *out_next_seq = seq;
+    return ESP_OK;
 }
 
 esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples)

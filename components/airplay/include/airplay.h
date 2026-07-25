@@ -13,11 +13,14 @@
  *   airplay_resume()          — resume after TTS-done.
  *   airplay_stop()            — explicit stop (mute switch, "stop
  *                               music" intent). Drops the RTSP session.
- *   airplay_is_streaming()    — true while iOS is actively pushing.
+ *   airplay_is_streaming()    — true while an iOS RTSP session is active.
+ *   airplay_is_playing()      — true only while that source is playing and
+ *                               no AirPlay-local pause/hold masks it.
  *   airplay_deinit()          — full tear-down.
  *
- * Stream start/stop is observable via airplay_is_streaming(); there is no
- * event-group side channel (the old g_dev_events layer was removed 2026-07-04).
+ * Session and audible-source state are observable via airplay_is_streaming()
+ * and airplay_is_playing(); there is no event-group side channel (the old
+ * g_dev_events layer was removed 2026-07-04).
  *
  * License: MIT.
  */
@@ -37,6 +40,20 @@ void      airplay_deinit(void);
 void airplay_pause(void);
 void airplay_resume(void);
 void airplay_stop(void);
+// Immediate, network-free destructive half used while physical mute owns the
+// firmware lifecycle. Clears both wake/user pause latches and drops local PCM.
+void airplay_mute_local(void);
+// Potentially blocking DACP request. Call only after releasing lifecycle
+// mutexes; local mute/stop must already have made the speaker safe.
+void airplay_send_stop(void);
+
+// Non-destructive provisional wake hold. It only gates incoming AirPlay PCM:
+// no ring flush and no DACP command. The flag is independent of wake/user
+// pause state, so RAOP PLAY/RESUME, airplay_resume(), and
+// airplay_user_resume() cannot release it.
+void airplay_verify_hold(void);
+void airplay_verify_release(void);
+bool airplay_verify_is_held(void);
 
 // Main firmware may force the shared XVF amp off after TTS/alarm/ambient audio.
 // Tell AirPlay so its lazy amp latch re-enables the speaker on the next RTP PCM.
@@ -59,6 +76,7 @@ void airplay_user_pause(void);
 void airplay_user_resume(void);
 
 bool airplay_is_streaming(void);
+bool airplay_is_playing(void);
 
 /**
  * @brief     Refresh the mDNS instance name without tearing down the

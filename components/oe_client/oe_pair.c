@@ -78,9 +78,14 @@ esp_err_t oe_pair_redeem(const char *server_url, const char *pair_code,
     const cJSON *jt = cJSON_GetObjectItem(j, "token");
     const cJSON *ju = cJSON_GetObjectItem(j, "userId");
     const cJSON *jh = cJSON_GetObjectItem(j, "server_hint");
+    const cJSON *jd = cJSON_GetObjectItem(j, "deviceId");
     if (jt && cJSON_IsString(jt)) strncpy(out->token, jt->valuestring, sizeof(out->token) - 1);
     if (ju && cJSON_IsString(ju)) strncpy(out->user_id, ju->valuestring, sizeof(out->user_id) - 1);
     if (jh && cJSON_IsString(jh)) strncpy(out->server_hint, jh->valuestring, sizeof(out->server_hint) - 1);
+    if (jd && cJSON_IsString(jd) &&
+        strnlen(jd->valuestring, sizeof(out->device_id)) < sizeof(out->device_id)) {
+        snprintf(out->device_id, sizeof(out->device_id), "%s", jd->valuestring);
+    }
     cJSON_Delete(j);
 
     if (out->token[0] == 0) {

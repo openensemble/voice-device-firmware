@@ -13,11 +13,10 @@
 // Per-slot model loading: tflite files live in /ww/slotN.tflite on a
 // dedicated SPIFFS partition (mounted by wakeword_mount_partition).
 // Per-model probability cutoff + sliding window size + tensor arena size
-// are read from a sibling /ww/slotN.json manifest at load time. If the
-// manifest is missing or malformed we fall back to okay_nabu defaults
-// (0.97 cutoff, 5-window, 26080-byte arena). Manifest schema mirrors the
-// esphome/micro-wake-word-models v2 format — see slot0.okay_nabu.bak.json
-// for the canonical example.
+// are read from a sibling /ww/slotN.json manifest at load time. Numeric fields
+// fall back to okay_nabu defaults (0.97 cutoff, 5-window, 26080-byte arena),
+// but manifest.wake_word is required because it is the verifier identity.
+// Manifest schema mirrors the esphome/micro-wake-word-models v2 format.
 
 #include "wakeword.h"
 
@@ -59,6 +58,7 @@ static const uint8_t  WW_DEFAULT_FEATURE_STEP_MS    = 10;
 struct wakeword_s {
     wakeword_config_t           cfg;
     uint8_t                     active_slot;
+    char                        last_wake_slug[WW_WAKE_SLUG_MAX];
 
     // Streaming wake-word model + model bytes lifetime-tied to it.
     std::unique_ptr<WakeWordModel> model;
@@ -176,48 +176,98 @@ void wakeword_destroy(wakeword_t *ww) {
     delete ww;
 }
 
-// Per-slot manifest values, populated by read_slot_manifest. Mirrors the
-// fields in slot<N>.json's "micro" object. All fields fall back to the
-// hardcoded defaults if the manifest is missing or malformed.
+// Per-slot manifest values, populated by read_slot_manifest. Numeric inference
+// fields fall back to the hardcoded defaults, but wake_word is required: a
+// detector without an identity cannot participate in strict verification.
 struct slot_manifest_t {
     uint8_t probability_cutoff;   // uint8 in 0..255 (= float cutoff * 255 + 0.5)
     size_t  sliding_window_size;
     size_t  tensor_arena_size;
+    char    wake_slug[WW_WAKE_SLUG_MAX];
 };
 
-static void read_slot_manifest(uint8_t slot, slot_manifest_t *m) {
+// Keep this byte-for-byte compatible with OE's manifest contract: lowercase
+// ASCII alphanumeric tokens, any run of non-alphanumeric ASCII becomes one
+// underscore, leading/trailing separators are discarded, and the result must
+// fit in 39 characters. Controls, DEL, non-ASCII input, and overflow are
+// rejected instead of being lossy-normalized into a different wake word.
+static bool normalize_wake_slug(const char *wake_word, char *out, size_t out_len) {
+    if (!wake_word || !out || out_len == 0) return false;
+    size_t used = 0;
+    bool separator_pending = false;
+    for (const unsigned char *p = (const unsigned char *)wake_word; *p; ++p) {
+        unsigned char c = *p;
+        if (c < 0x20 || c == 0x7f || c >= 0x80) {
+            out[0] = '\0';
+            return false;
+        }
+        bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        bool digit = c >= '0' && c <= '9';
+        if (!alpha && !digit) {
+            if (used > 0) separator_pending = true;
+            continue;
+        }
+        if (separator_pending) {
+            if (used + 1 >= out_len) {
+                out[0] = '\0';
+                return false;
+            }
+            out[used++] = '_';
+            separator_pending = false;
+        }
+        if (used + 1 >= out_len) {
+            out[0] = '\0';
+            return false;
+        }
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+        out[used++] = (char)c;
+    }
+    out[used] = '\0';
+    return used > 0;
+}
+
+static bool read_slot_manifest(uint8_t slot, slot_manifest_t *m) {
     // Defaults match okay_nabu (matches the comment block at file head).
     m->probability_cutoff = WW_DEFAULT_PROBABILITY_CUTOFF;
     m->sliding_window_size = WW_DEFAULT_SLIDING_WINDOW;
     m->tensor_arena_size  = WW_DEFAULT_TENSOR_ARENA;
+    m->wake_slug[0] = '\0';
 
     char path[64];
     snprintf(path, sizeof(path), "/ww/slot%u.json", (unsigned) slot);
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGW(TAG, "no manifest at %s, using defaults", path);
-        return;
+        ESP_LOGE(TAG, "no manifest at %s — wake identity unavailable", path);
+        return false;
     }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (len <= 0 || len > 4096) {
         fclose(f);
-        ESP_LOGW(TAG, "manifest %s size %ld out of range, using defaults", path, len);
-        return;
+        ESP_LOGE(TAG, "manifest %s size %ld out of range", path, len);
+        return false;
     }
     char *buf = (char *) malloc(len + 1);
-    if (!buf) { fclose(f); return; }
+    if (!buf) { fclose(f); return false; }
     size_t r = fread(buf, 1, len, f);
     fclose(f);
-    if (r != (size_t) len) { free(buf); return; }
+    if (r != (size_t) len) { free(buf); return false; }
     buf[len] = '\0';
 
     cJSON *root = cJSON_Parse(buf);
     free(buf);
     if (!root) {
-        ESP_LOGW(TAG, "manifest %s parse failed, using defaults", path);
-        return;
+        ESP_LOGE(TAG, "manifest %s parse failed", path);
+        return false;
+    }
+    cJSON *wake_word = cJSON_GetObjectItemCaseSensitive(root, "wake_word");
+    if (!cJSON_IsString(wake_word) ||
+        !normalize_wake_slug(wake_word->valuestring,
+                             m->wake_slug, sizeof(m->wake_slug))) {
+        ESP_LOGE(TAG, "manifest %s has invalid wake_word", path);
+        cJSON_Delete(root);
+        return false;
     }
     cJSON *micro = cJSON_GetObjectItem(root, "micro");
     if (cJSON_IsObject(micro)) {
@@ -238,11 +288,13 @@ static void read_slot_manifest(uint8_t slot, slot_manifest_t *m) {
         }
     }
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "slot %u manifest: cutoff=%u/255 window=%u arena=%u",
+    ESP_LOGI(TAG, "slot %u manifest: wake=%s cutoff=%u/255 window=%u arena=%u",
              slot,
+             m->wake_slug,
              (unsigned) m->probability_cutoff,
              (unsigned) m->sliding_window_size,
              (unsigned) m->tensor_arena_size);
+    return true;
 }
 
 static esp_err_t load_model_file(uint8_t slot, uint8_t **out_buf, size_t *out_len) {
@@ -277,6 +329,15 @@ esp_err_t wakeword_load_slot(wakeword_t *ww, uint8_t slot) {
     // down + rebuild it. Worst-case wait is one slice (~10 ms inference).
     xSemaphoreTake(ww->model_mutex, portMAX_DELAY);
 
+    // A model without a valid manifest wake_word cannot be verified. Parse the
+    // complete <=4 KB manifest before tearing down the currently-live model so
+    // a malformed hot-swap cannot replace a working slot with an ungateable one.
+    slot_manifest_t manifest;
+    if (!read_slot_manifest(slot, &manifest)) {
+        xSemaphoreGive(ww->model_mutex);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     if (ww->model) {
         ww->model->unload_model();
         ww->model.reset();
@@ -293,17 +354,11 @@ esp_err_t wakeword_load_slot(wakeword_t *ww, uint8_t slot) {
         return e;
     }
 
-    // The friendly name + id stay generic at this layer — the manifest+name
-    // mapping is a UI concern in OE (the Settings page already shows the
-    // slot label).
+    // The model id stays slot-scoped, while the wake identity comes only from
+    // manifest.wake_word. Model filenames are packaging details and are not a
+    // verifier contract.
     char id_buf[16];
     snprintf(id_buf, sizeof(id_buf), "slot%u", (unsigned) slot);
-
-    // Pull probability_cutoff / sliding_window_size / tensor_arena_size from
-    // the slot's JSON manifest so heterogeneous slots (e.g. okay_nabu @ 0.97
-    // alongside a custom single-word model @ 0.78) load with the right thresholds.
-    slot_manifest_t manifest;
-    read_slot_manifest(slot, &manifest);
 
     // Exceptions are disabled in ESP-IDF, so plain `new` here. The vector
     // resize() inside the ctor cannot recover from OOM with -fno-exceptions
@@ -315,7 +370,7 @@ esp_err_t wakeword_load_slot(wakeword_t *ww, uint8_t slot) {
         ww->model_buf,
         manifest.probability_cutoff,
         manifest.sliding_window_size,
-        std::string(id_buf),
+        std::string(manifest.wake_slug),
         manifest.tensor_arena_size,
         /*default_enabled=*/true));
     if (!ww->model) {
@@ -372,6 +427,17 @@ uint8_t wakeword_active_slot(const wakeword_t *ww) {
 
 uint8_t wakeword_last_wake_prob(const wakeword_t *ww) {
     return ww ? ww->last_wake_avg_prob : 0;
+}
+
+bool wakeword_last_wake_slug(const wakeword_t *ww, char *out, size_t out_len) {
+    if (!ww || !out || out_len == 0) return false;
+    out[0] = '\0';
+    if (xSemaphoreTake(ww->model_mutex, portMAX_DELAY) != pdTRUE) return false;
+    size_t n = strnlen(ww->last_wake_slug, sizeof(ww->last_wake_slug));
+    bool ok = n > 0 && n < sizeof(ww->last_wake_slug) && n + 1 <= out_len;
+    if (ok) memcpy(out, ww->last_wake_slug, n + 1);
+    xSemaphoreGive(ww->model_mutex);
+    return ok;
 }
 
 // Scale FrontendOutput.values[] (uint16, ~0..670) to INT8 expected by the
@@ -477,6 +543,8 @@ bool wakeword_feed(wakeword_t *ww, const int16_t *samples, size_t n_samples) {
         if (now - ww->last_detection_us < (int64_t) ww->cfg.cooldown_ms * 1000) continue;
         ww->last_detection_us = now;
         ww->last_wake_avg_prob = ev.average_probability;
+        snprintf(ww->last_wake_slug, sizeof(ww->last_wake_slug), "%s",
+                 ev.wake_word ? ev.wake_word->c_str() : "");
         ww->model->reset_probabilities();
 
         const char *name = ev.wake_word ? ev.wake_word->c_str() : "?";

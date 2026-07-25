@@ -83,6 +83,28 @@ bool nvs_creds_has_wifi(void)
 esp_err_t nvs_creds_set_server(const char *url)     { return set_str("server", url); }
 esp_err_t nvs_creds_get_server(char *url, size_t n) { return get_str("server", url, n); }
 
+esp_err_t nvs_creds_set_verify_gate_path(const char *path)     { return set_str("vgate_url", path); }
+esp_err_t nvs_creds_get_verify_gate_path(char *path, size_t n) { return get_str("vgate_url", path, n); }
+
+esp_err_t nvs_creds_set_device_id(const char *device_id)     { return set_str("device_id", device_id); }
+esp_err_t nvs_creds_get_device_id(char *device_id, size_t n) { return get_str("device_id", device_id, n); }
+
+esp_err_t nvs_creds_set_verify_gate_config(const char *device_id, const char *path)
+{
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NVS_CREDS_NAMESPACE, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    // NVS updates are not a transactional pair. Write policy first: if power
+    // fails while enabling, the next boot sees an enabled path with a missing
+    // or stale identity and therefore blocks. Writing identity first could
+    // leave the prior empty path and silently bypass verification.
+    e = nvs_set_str(h, "vgate_url", path);
+    if (e == ESP_OK) e = nvs_set_str(h, "device_id", device_id);
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    return e;
+}
+
 esp_err_t nvs_creds_set_token(const char *token)     { return set_str("token", token); }
 esp_err_t nvs_creds_get_token(char *token, size_t n) { return get_str("token", token, n); }
 
@@ -103,6 +125,32 @@ esp_err_t nvs_creds_get_volume(uint8_t *pct) { return get_u8("volume", pct); }
 
 esp_err_t nvs_creds_set_headphone_mode(uint8_t e)  { return set_u8("hp_mode", e); }
 esp_err_t nvs_creds_get_headphone_mode(uint8_t *e) { return get_u8("hp_mode", e); }
+
+esp_err_t nvs_creds_set_ota_retry_state(uint8_t state)
+{
+    if (state > 2) return ESP_ERR_INVALID_ARG;
+    if (state != 0) return set_u8("ota_retry", state);
+
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NVS_CREDS_NAMESPACE, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    e = nvs_erase_key(h, "ota_retry");
+    if (e == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    return e;
+}
+
+esp_err_t nvs_creds_get_ota_retry_state(uint8_t *state)
+{
+    if (!state) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = get_u8("ota_retry", state);
+    if (e == ESP_ERR_NVS_NOT_FOUND) {
+        *state = 0;
+        return ESP_OK;
+    }
+    return e;
+}
 
 esp_err_t nvs_creds_set_server_cert(const uint8_t *pem, size_t pem_len)
 {

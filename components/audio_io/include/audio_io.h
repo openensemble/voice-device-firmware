@@ -60,8 +60,31 @@ esp_err_t audio_io_stop_playback(void);
 size_t audio_io_write_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate);
 size_t audio_io_write_speech_pcm(const int16_t *pcm_stereo, size_t samples, uint32_t source_rate);
 void audio_io_flush_playback(void);        // flushes BOTH lanes
+void audio_io_flush_music(void);           // music lane only (AirPlay/alarm paths)
 void audio_io_flush_speech(void);          // speech lane only (barge/abort paths)
 bool audio_io_playback_active(void);
+
+// Fence producers around an accepted verify commit or physical mute. Blocking
+// advances a lane cancellation generation: a previously-admitted writer polls
+// it at <=5-ms ring-send intervals and exits promptly; later writers fail fast.
+// Keep the lane blocked through the destructive flush, then allow it again.
+// Normal MUSIC callbacks are serialized internally because ambient, AirPlay,
+// and alarms share the stateful 44.1-kHz resampler.
+void audio_io_block_music_writes(void);
+void audio_io_allow_music_writes(void);
+bool audio_io_music_writers_idle(void);
+void audio_io_block_speech_writes(void);
+void audio_io_allow_speech_writes(void);
+bool audio_io_speech_writers_idle(void);
+
+// While the verify gate is asserted and music writers are fenced, service a
+// previously-requested music flush synchronously. Drain and the shared 44.1-kHz
+// resampler reset occur behind the same admission fence. The speech counterpart
+// lets ACCEPT synchronously finish both destructive lane flushes before it
+// reopens admission. Each returns true only when that lane has no pending flush;
+// false means no acknowledged gate or an old writer is not yet idle.
+bool audio_io_gate_service_pending_music_flush(void);
+bool audio_io_gate_service_pending_speech_flush(void);
 
 // Software playback volume (0-100 %, linear). Applied per-sample inside
 // playback_task before the int16→int32 shift. Persists across boots via
@@ -77,6 +100,18 @@ uint8_t audio_io_get_volume(void);
 esp_err_t audio_io_pause_playback(void);
 esp_err_t audio_io_resume_playback(void);
 bool      audio_io_is_paused(void);
+
+// Verify-gate playback ownership. Hold acquisition waits (bounded to 250 ms)
+// for playback_task to acknowledge a quiescent loop boundary, after any prior
+// flush/dequeue/I2S write. ESP_OK therefore guarantees that neither lane will
+// be consumed until release. Timeout/invalid-state returns leave no hold set;
+// callers must check the result and fail closed. This hold is independent of
+// the normal pause flag and only gate_release can clear it. It is intentionally
+// single-owner/non-refcounted; the verify lifecycle must serialize hold/release.
+esp_err_t audio_io_gate_hold_playback(void);
+esp_err_t audio_io_gate_release_playback(void);
+// Reports only an acknowledged durable hold, not a request still quiescing.
+bool      audio_io_is_gate_held(void);
 
 // Peak RMS of the captured 16 kHz mono stream over the most recent ~1 s
 // window. 0 until at least one window has rolled over. Used by main.c's

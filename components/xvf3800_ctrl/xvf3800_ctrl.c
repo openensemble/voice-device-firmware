@@ -58,7 +58,8 @@ esp_err_t xvf3800_xmos_write(uint8_t resid, uint8_t cmd, const uint8_t *data, ui
     return e;
 }
 
-esp_err_t xvf3800_xmos_read(uint8_t resid, uint8_t cmd, uint8_t *out, uint8_t len)
+esp_err_t xvf3800_xmos_read_raw(uint8_t resid, uint8_t cmd, uint8_t *status_out,
+                                uint8_t *out, uint8_t len)
 {
     if (!s_dev) return ESP_ERR_INVALID_STATE;
     if ((size_t)len + 1 > 33) return ESP_ERR_INVALID_SIZE;
@@ -77,15 +78,23 @@ esp_err_t xvf3800_xmos_read(uint8_t resid, uint8_t cmd, uint8_t *out, uint8_t le
 
     uint8_t rx[1 + 32];
     e = i2c_master_receive(s_dev, rx, 1 + len, pdMS_TO_TICKS(200));
-    if (e != ESP_OK) { xmos_unlock(); return e; }
-    if (rx[0] != 0) {
+    xmos_unlock();
+    if (e != ESP_OK) return e;
+    if (status_out) *status_out = rx[0];
+    if (out && len) memcpy(out, rx + 1, len);
+    return ESP_OK;
+}
+
+esp_err_t xvf3800_xmos_read(uint8_t resid, uint8_t cmd, uint8_t *out, uint8_t len)
+{
+    uint8_t status = 0;
+    esp_err_t e = xvf3800_xmos_read_raw(resid, cmd, &status, out, len);
+    if (e != ESP_OK) return e;
+    if (status != 0) {
         ESP_LOGW(TAG, "xmos read resid=%u cmd=%u status=0x%02x (non-zero = command rejected)",
-                 resid, cmd, rx[0]);
-        xmos_unlock();
+                 resid, cmd, status);
         return ESP_FAIL;
     }
-    if (out && len) memcpy(out, rx + 1, len);
-    xmos_unlock();
     return ESP_OK;
 }
 

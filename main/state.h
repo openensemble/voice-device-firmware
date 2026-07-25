@@ -7,6 +7,7 @@
 #define OE_AGENT_ID_MAX   64
 #define OE_TOKEN_MAX      128
 #define OE_URL_MAX        256
+#define OE_DEVICE_ID_MAX  64
 #define OE_DEVICE_NAME_MAX 64
 
 // NOTE: this header used to also declare a dev_state_t/g_dev_state enum and a
@@ -19,6 +20,15 @@
 typedef struct {
     char token[OE_TOKEN_MAX];
     char server_url[OE_URL_MAX];
+    // Exact relative path of OE's authenticated wake-verification proxy.
+    // Empty = explicitly disabled. No independent verifier origin is accepted:
+    // the client resolves this path only against the paired HTTPS server.
+    // Stored in the existing vgate_url NVS slot for upgrade compatibility.
+    char verify_gate_path[OE_URL_MAX];
+    // Canonical server-assigned id (currently vdev_*). The verify gate keys
+    // shadow/enforce mode and statistics on this value, so a MAC-derived
+    // substitute must never be used.
+    char device_id[OE_DEVICE_ID_MAX];
     char device_name[OE_DEVICE_NAME_MAX];
     char default_agent_id[OE_AGENT_ID_MAX];
     uint8_t wake_word_slot;
