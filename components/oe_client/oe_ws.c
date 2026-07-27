@@ -8,6 +8,11 @@
 #include "esp_log.h"
 #include "esp_app_desc.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "cJSON.h"
 
 static const char *TAG = "oe_ws";
@@ -40,16 +45,142 @@ static void emit_turn(oe_ws_event_t t, const char *text, size_t len, const cJSON
     s_cb(&p, s_cb_user);
 }
 
+// ── WS transmit path ────────────────────────────────────────────────────────
+// INVARIANT: no finite timeout may ever reach esp_websocket_client_send_*.
+//
+// In this client a send timeout is NOT a soft failure. esp_transport_ws_send_raw
+// returns 0 when its poll expires, and the client's reaction to a zero-length
+// write is esp_websocket_client_abort_connection() — it tears the socket down,
+// the server sees a 1006, and every in-flight turn dies with it. A merely
+// congested link (host loaded, whisper backed up) would therefore strand the
+// device rather than delay a frame. That is what dropped gate-accepted wakes:
+// oe_ws_send_stt_backlog bursts the whole buffered wake window, the TCP window
+// fills after ~1 frame, the next 20 ms send returns 0, and the socket dies.
+//
+// So all sends are issued from ONE dedicated TX task using portMAX_DELAY — the
+// client maps that to an infinite transport poll, which can never time out, so
+// only a genuine socket error can abort. Callers hand their payload to a
+// bounded queue instead, and their timeout now bounds QUEUE ADMISSION only: a
+// full queue is a soft ESP_ERR_TIMEOUT that the existing buffered-HTTP
+// fallbacks already handle, and it never touches the socket. Hot paths (the
+// capture loop, whose ring holds only ~512 ms) still never block on the network.
+//
+// A genuinely dead peer is still caught: LWIP TCP keepalive (idle 10 /
+// interval 5 / count 3, set in oe_ws_start) errors the blocked write within
+// ~25 s and drives the normal auto-reconnect. Waiting is correct; teardown is
+// reserved for a socket that is actually gone.
+//
+// The single TX task also preserves frame ordering, which a per-caller send
+// could not guarantee once sends are allowed to block.
+#define OE_WS_TX_QUEUE_DEPTH  48
+#define OE_WS_TX_MAX_BACKLOG  (160 * 1024)   // ≈2× a 2.5 s gate replay burst
+
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+    bool     is_text;
+} ws_tx_msg_t;
+
+static QueueHandle_t     s_tx_q     = NULL;
+static SemaphoreHandle_t s_tx_mtx   = NULL;   // guards s_tx_bytes only
+static TaskHandle_t      s_tx_task  = NULL;
+static size_t            s_tx_bytes = 0;
+static volatile bool     s_tx_run   = false;
+
+// Reserve/release the queued-byte budget. Reserving under the mutex keeps the
+// check and the increment atomic, so a burst can't race past the cap.
+static bool tx_reserve(size_t n)
+{
+    if (!s_tx_mtx) return false;
+    bool ok = false;
+    xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
+    if (s_tx_bytes + n <= OE_WS_TX_MAX_BACKLOG) { s_tx_bytes += n; ok = true; }
+    xSemaphoreGive(s_tx_mtx);
+    return ok;
+}
+
+static void tx_release(size_t n)
+{
+    if (!s_tx_mtx) return;
+    xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
+    s_tx_bytes = (s_tx_bytes > n) ? s_tx_bytes - n : 0;
+    xSemaphoreGive(s_tx_mtx);
+}
+
+// Drop everything still queued. Called on disconnect so a reconnected socket
+// never receives audio frames belonging to the previous session.
+static void tx_drain(void)
+{
+    if (!s_tx_q) return;
+    ws_tx_msg_t m;
+    while (xQueueReceive(s_tx_q, &m, 0) == pdTRUE) {
+        tx_release(m.len);
+        free(m.data);
+    }
+}
+
+static void ws_tx_task(void *arg)
+{
+    (void)arg;
+    ws_tx_msg_t m;
+    while (s_tx_run) {
+        // Bounded receive so shutdown is noticed even with an idle queue.
+        if (xQueueReceive(s_tx_q, &m, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+        if (s_ws && esp_websocket_client_is_connected(s_ws)) {
+            // portMAX_DELAY is the whole point: block for as long as the peer
+            // needs. Anything finite would abort the connection instead.
+            int rc = m.is_text
+                ? esp_websocket_client_send_text(s_ws, (const char *)m.data, (int)m.len, portMAX_DELAY)
+                : esp_websocket_client_send_bin (s_ws, (const char *)m.data, (int)m.len, portMAX_DELAY);
+            if (rc != (int)m.len) {
+                // Only a real transport error lands here; the client has
+                // already aborted and auto-reconnect is scheduled.
+                ESP_LOGW(TAG, "tx: send returned %d for %u bytes", rc, (unsigned)m.len);
+            }
+        }
+        tx_release(m.len);
+        free(m.data);
+    }
+    s_tx_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// Queue one frame, optionally assembled from a header + payload so callers
+// don't need a staging buffer. `admit` bounds queue admission only.
+static esp_err_t ws_tx_submit2(const void *a, size_t alen,
+                               const void *b, size_t blen,
+                               bool is_text, TickType_t admit)
+{
+    const size_t len = alen + blen;
+    if (!s_tx_q || !oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    if (len == 0) return ESP_ERR_INVALID_ARG;
+    // Budget first: a rejected frame must not allocate.
+    if (!tx_reserve(len)) return ESP_ERR_TIMEOUT;
+    // PSRAM by preference — a 2.5 s replay burst is ~80 KB and internal SRAM
+    // is the scarce pool. Falls back to internal if PSRAM is unavailable.
+    uint8_t *copy = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!copy) copy = malloc(len);
+    if (!copy) { tx_release(len); return ESP_ERR_NO_MEM; }
+    memcpy(copy, a, alen);
+    if (blen) memcpy(copy + alen, b, blen);
+    ws_tx_msg_t m = { .data = copy, .len = len, .is_text = is_text };
+    if (xQueueSend(s_tx_q, &m, admit) != pdTRUE) {
+        free(copy);
+        tx_release(len);
+        return ESP_ERR_TIMEOUT;   // soft: caller falls back, socket untouched
+    }
+    return ESP_OK;
+}
+
 static esp_err_t ws_send_json(cJSON *o, TickType_t timeout)
 {
     if (!o) return ESP_ERR_NO_MEM;
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     char *s = cJSON_PrintUnformatted(o);
     if (!s) return ESP_ERR_NO_MEM;
-    size_t len = strlen(s);
-    int rc = esp_websocket_client_send_text(s_ws, s, len, timeout);
+    esp_err_t err = ws_tx_submit2(s, strlen(s), NULL, 0, true, timeout);
     free(s);
-    return rc == (int)len ? ESP_OK : ESP_FAIL;
+    return err;
 }
 
 static void handle_message(const char *data, size_t len)
@@ -196,6 +327,10 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "ws disconnected");
             s_msg_accum_len = 0;
+            // Drop queued frames: they belong to the session that just died,
+            // and replaying them onto a reconnected socket would inject stale
+            // audio into whatever turn comes next.
+            tx_drain();
             emit(OE_WS_EVT_DISCONNECTED, NULL, 0);
             break;
         case WEBSOCKET_EVENT_DATA:
@@ -284,6 +419,27 @@ esp_err_t oe_ws_start(const char *server_url, const char *token,
         .keep_alive_count       = 3,
         .crt_bundle_attach      = esp_crt_bundle_attach,
     };
+    // TX plumbing must exist before the client can connect: send_auth() runs
+    // from the CONNECTED event and goes through the queue like everything else.
+    if (!s_tx_mtx) s_tx_mtx = xSemaphoreCreateMutex();
+    if (!s_tx_q)   s_tx_q   = xQueueCreate(OE_WS_TX_QUEUE_DEPTH, sizeof(ws_tx_msg_t));
+    if (!s_tx_mtx || !s_tx_q) {
+        ESP_LOGE(TAG, "tx: queue alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    // Re-arm before the existence check: a restart can land here while a prior
+    // task is still draining its way out of oe_ws_stop. Setting the flag first
+    // lets that task simply keep serving instead of exiting into a dead queue.
+    s_tx_run = true;
+    if (!s_tx_task) {
+        if (xTaskCreate(ws_tx_task, "oe_ws_tx", 3072, NULL, 5, &s_tx_task) != pdPASS) {
+            s_tx_run = false;
+            s_tx_task = NULL;
+            ESP_LOGE(TAG, "tx: task create failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     s_ws = esp_websocket_client_init(&cfg);
     if (!s_ws) return ESP_FAIL;
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
@@ -293,7 +449,20 @@ esp_err_t oe_ws_start(const char *server_url, const char *token,
 esp_err_t oe_ws_stop(void)
 {
     if (!s_ws) return ESP_OK;
+    // Stop the client FIRST: it aborts the transport, which unblocks a TX task
+    // parked in an unbounded send so it can observe s_tx_run and exit.
     esp_websocket_client_stop(s_ws);
+    s_tx_run = false;
+    for (int i = 0; i < 100 && s_tx_task; ++i) vTaskDelay(pdMS_TO_TICKS(10));
+    tx_drain();
+    // Only reclaim the queue once the task is provably gone — tearing it down
+    // underneath a live consumer would be a use-after-free.
+    if (!s_tx_task) {
+        if (s_tx_q)   { vQueueDelete(s_tx_q);      s_tx_q = NULL; }
+        if (s_tx_mtx) { vSemaphoreDelete(s_tx_mtx); s_tx_mtx = NULL; }
+    } else {
+        ESP_LOGW(TAG, "tx: task still running at stop — queue retained");
+    }
     esp_websocket_client_destroy(s_ws);
     s_ws = NULL;
     free(s_msg_accum);
@@ -448,33 +617,32 @@ esp_err_t oe_ws_send_stt_begin(const char *turn_id, uint8_t wake_slot,
                                   pdMS_TO_TICKS(1000));
 }
 
-// Binary frame: 'OEA1' + u32 LE seq + payload. Static buffer is safe — only
-// the capture/drive task streams frames, one at a time.
+// Binary frame: 'OEA1' + u32 LE seq + payload. Assembled straight into the
+// queue allocation, so there is no shared staging buffer to serialize on.
 static esp_err_t send_stt_frame_timeout(const int16_t *samples,
                                         size_t n_samples, uint32_t seq,
                                         TickType_t timeout)
 {
-    static uint8_t buf[8 + OE_STT_FRAME_MAX_SAMPLES * sizeof(int16_t)];
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     if (!samples || n_samples == 0 || n_samples > OE_STT_FRAME_MAX_SAMPLES) return ESP_ERR_INVALID_ARG;
-    buf[0] = 'O'; buf[1] = 'E'; buf[2] = 'A'; buf[3] = '1';
-    buf[4] = (uint8_t)(seq & 0xFF);
-    buf[5] = (uint8_t)((seq >> 8) & 0xFF);
-    buf[6] = (uint8_t)((seq >> 16) & 0xFF);
-    buf[7] = (uint8_t)((seq >> 24) & 0xFF);
-    memcpy(buf + 8, samples, n_samples * sizeof(int16_t));
-    const int frame_bytes = 8 + (int)(n_samples * sizeof(int16_t));
-    int rc = esp_websocket_client_send_bin(s_ws, (const char *)buf,
-                                           frame_bytes,
-                                           timeout);
-    return rc == frame_bytes ? ESP_OK : ESP_FAIL;
+    uint8_t hdr[8];
+    hdr[0] = 'O'; hdr[1] = 'E'; hdr[2] = 'A'; hdr[3] = '1';
+    hdr[4] = (uint8_t)(seq & 0xFF);
+    hdr[5] = (uint8_t)((seq >> 8) & 0xFF);
+    hdr[6] = (uint8_t)((seq >> 16) & 0xFF);
+    hdr[7] = (uint8_t)((seq >> 24) & 0xFF);
+    return ws_tx_submit2(hdr, sizeof(hdr), samples,
+                         n_samples * sizeof(int16_t), false, timeout);
 }
 
 esp_err_t oe_ws_send_stt_frame(const int16_t *samples, size_t n_samples, uint32_t seq)
 {
-    // Short timeout: at the 80 ms frame cadence a congested socket must fail
-    // fast so the caller can flip to the buffered-HTTP fallback rather than
-    // stalling the capture loop (the 16 KB capture ring only holds ~0.5 s).
+    // Short timeout, but it now bounds QUEUE ADMISSION rather than the socket
+    // write: at the 80 ms frame cadence a backed-up TX queue must fail fast so
+    // the caller can flip to the buffered-HTTP fallback rather than stalling
+    // the capture loop (the 16 KB capture ring only holds ~0.5 s). The frame
+    // itself is then sent with an unbounded wait, so congestion delays audio
+    // instead of tearing the socket down.
     return send_stt_frame_timeout(samples, n_samples, seq, pdMS_TO_TICKS(20));
 }
 

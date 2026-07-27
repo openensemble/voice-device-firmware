@@ -8,6 +8,8 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "oe_stt";
 
@@ -252,6 +254,31 @@ esp_err_t oe_stt_post(const char *server_url, const char *token,
 // verdict-returning + non-persisting (no /api/wake-capture, no disk).
 #define VG_BOUNDARY "----oevdverifygateboundary9k2"
 
+// --- verify-gate POST abort (self-heal for a wedged gate request) ----------
+// A gate POST that wedges on a half-open socket (e.g. the OE server mid-
+// restart) would otherwise block verify_worker_task forever, pinning
+// s_verify_inflight and deafening the device to every wake. The capture task's
+// watchdog and the WS-disconnect handler call oe_verify_gate_abort() to close
+// the in-flight connection, which unblocks esp_http_client_perform() so the
+// worker can unwind and clear the flag IN ORDER (it still owns the wake-window
+// buffer). The mutex serializes close() against the worker's cleanup(); the
+// perform() itself runs WITHOUT the mutex so the aborter can take it.
+static SemaphoreHandle_t s_vg_client_mtx = NULL;
+static esp_http_client_handle_t s_vg_client = NULL;
+
+void oe_verify_gate_init(void)
+{
+    if (!s_vg_client_mtx) s_vg_client_mtx = xSemaphoreCreateMutex();
+}
+
+void oe_verify_gate_abort(void)
+{
+    if (!s_vg_client_mtx) return;
+    xSemaphoreTake(s_vg_client_mtx, portMAX_DELAY);
+    if (s_vg_client) esp_http_client_close(s_vg_client);
+    xSemaphoreGive(s_vg_client_mtx);
+}
+
 esp_err_t oe_verify_gate_post(const char *server_url, const char *gate_path,
                               const char *token,
                               const char *session_id, const char *device_id,
@@ -346,9 +373,24 @@ esp_err_t oe_verify_gate_post(const char *server_url, const char *gate_path,
     esp_http_client_set_header(c, "Content-Type", "multipart/form-data; boundary=" VG_BOUNDARY);
     esp_http_client_set_post_field(c, (const char *)body, total);
 
+    // Publish the handle so oe_verify_gate_abort() can close it if this POST
+    // wedges. perform() runs WITHOUT the mutex (so the aborter can take it);
+    // cleanup() runs UNDER the mutex so it can never race a concurrent close().
+    if (s_vg_client_mtx) {
+        xSemaphoreTake(s_vg_client_mtx, portMAX_DELAY);
+        s_vg_client = c;
+        xSemaphoreGive(s_vg_client_mtx);
+    }
     esp_err_t e = esp_http_client_perform(c);
     int status = esp_http_client_get_status_code(c);
-    esp_http_client_cleanup(c);
+    if (s_vg_client_mtx) {
+        xSemaphoreTake(s_vg_client_mtx, portMAX_DELAY);
+        s_vg_client = NULL;
+        esp_http_client_cleanup(c);
+        xSemaphoreGive(s_vg_client_mtx);
+    } else {
+        esp_http_client_cleanup(c);
+    }
     free(body);
 
     if (e != ESP_OK) { ESP_LOGW(TAG, "verify perform: %s (fail-closed)", esp_err_to_name(e)); return e; }

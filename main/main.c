@@ -1847,6 +1847,12 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // The capture task will roll back its gate-owned hold on the next
             // frame; keeping cleanup there preserves single-owner ordering.
             vg_request_cancel();
+            // A verify POST in flight when the socket dies wedges on the now-
+            // dead connection; its worker holds s_verify_inflight, which blocks
+            // EVERY future wake (verify_gate_state → worker_busy). Abort it so
+            // the worker unwinds — the fast path for the same deafness the
+            // s_awaiting_reply clear below already guards against.
+            oe_verify_gate_abort();
             s_wait_led_until_us = 0;
             s_stream_end_pending = false;
             // Forget capabilities — the socket may reconnect to an older
@@ -2698,6 +2704,7 @@ static bool transcript_is_filler(const char *t)
 #define VG_TAIL_SAMPLES  (16000 *  500 / 1000)              // 0.5 s post-fire  (8000)
 #define VG_WIN_SAMPLES   (VG_PRE_SAMPLES + VG_TAIL_SAMPLES) // 2.5 s window    (40000)
 #define VG_DEADLINE_MS   1200                               // client long-poll deadline
+#define VG_INFLIGHT_HARD_MS 4000                            // gate POST wedged past this → self-heal abort
 #define VG_STT_REPLAY_BUDGET_MS 160                         // ample margin under 512 ms ring
 #define VG_CONTROL_SEND_TIMEOUT_MS 20                       // never starve capture
 
@@ -2813,6 +2820,9 @@ static int64_t      s_prov_deadline_us = 0;
 static SemaphoreHandle_t s_verify_job_sem  = NULL;
 static TaskHandle_t      s_verify_worker_handle = NULL;
 static volatile bool     s_verify_inflight = false;
+// esp_timer time the current gate job was dispatched (capture-task-owned; 0 =
+// not tracking). Drives the wedged-POST self-heal watchdog in the capture loop.
+static volatile int64_t  s_verify_inflight_since_us = 0;
 static volatile bool     s_verify_done     = false;
 static volatile int      s_verify_effective = (int)OE_VERIFY_ERROR;
 static char              s_verify_res_turn[24] = "";   // turn the published result belongs to
@@ -3720,6 +3730,7 @@ static vad_end_reason_t vg_provisional_step(const int16_t *frame, size_t n)
                                         s_verify_job_device_id);
             s_verify_done     = false;
             s_verify_inflight = true;
+            s_verify_inflight_since_us = esp_timer_get_time();
             s_prov_deadline_us = esp_timer_get_time() + (int64_t)(VG_DEADLINE_MS + 300) * 1000;
             s_prov_state = PROV_AWAIT_VERDICT;
             if (xSemaphoreGive(s_verify_job_sem) != pdTRUE) {
@@ -3771,6 +3782,11 @@ static vad_end_reason_t vg_provisional_step(const int16_t *frame, size_t n)
         oe_udplog_send(eff == OE_VERIFY_REJECT
                            ? "[verify] reject — fire dropped silently"
                            : "[verify] error — fire dropped fail-closed");
+        // Optimistic-ack retract: the LED flashed LISTENING at the fire; pull
+        // it back to IDLE now that the gate did not accept (leave mute/alarm
+        // visuals to their own owners).
+        if (!leds_buttons_is_muted() && !alarm_is_firing())
+            set_ui_state(UI_STATE_IDLE);
         s_capture_used = 0;
         s_in_utterance = false;
         s_prov_state = PROV_NONE;
@@ -3790,6 +3806,10 @@ static vad_end_reason_t vg_provisional_step(const int16_t *frame, size_t n)
         // the STOP attempt may already have retired old speech, but commit
         // clears its hold before returning false; rollback is intentionally
         // idempotent in both cases.
+        // Optimistic-ack retract (see reject path above): the LED flashed
+        // LISTENING at the fire; the commit did not land, so pull it to IDLE.
+        if (!leds_buttons_is_muted() && !alarm_is_firing())
+            set_ui_state(UI_STATE_IDLE);
         s_capture_used = 0;
         s_in_utterance = false;
         s_prov_state = PROV_NONE;
@@ -3918,6 +3938,21 @@ static void capture_and_drive_task(void *arg)
         }
         size_t n = audio_io_read_frame(frame, WW_FRAME_SAMPLES, 200);
         if (n < WW_FRAME_SAMPLES) continue;
+
+        // Verify-gate self-heal: a gate POST wedged on a half-open socket (e.g.
+        // OE mid-restart) pins s_verify_inflight, so verify_gate_state() returns
+        // worker_busy and EVERY wake is dropped — IDLE but deaf, and nothing
+        // ever clears it (the deadline-reject and the WS-disconnect handler both
+        // miss this flag; only the worker's own return does). Abort the POST so
+        // the worker unwinds and clears the flag in order. Re-arm the timer so a
+        // still-stuck worker is retried rather than hammered every frame.
+        if (s_verify_inflight && s_verify_inflight_since_us != 0 &&
+            esp_timer_get_time() - s_verify_inflight_since_us >
+                (int64_t) VG_INFLIGHT_HARD_MS * 1000) {
+            oe_udplog_send("[verify] gate POST wedged — aborting to self-heal wake pipeline");
+            oe_verify_gate_abort();
+            s_verify_inflight_since_us = esp_timer_get_time();
+        }
 
         // Keep the pre-roll ring warm while not capturing, so a follow-up
         // VAD-start can prepend the speech onset it (by definition) missed.
@@ -4339,11 +4374,15 @@ static void capture_and_drive_task(void *arg)
                 // alarm-dismiss branch below overrides this back to a
                 // short LISTENING-then-IDLE flash on its own.
                 //
-                // With the verify gate active we DEFER this ack until the gate
-                // returns an explicit accept (vg_provisional_step), so a
-                // rejected/error fire dies invisibly. Alarm dismiss still
-                // flashes below.
-                if (!vg_on) set_ui_state(UI_STATE_LISTENING);
+                // Optimistic ack (2026-07-27): flip LISTENING now for BOTH the
+                // gated and ungated paths so the wake feels instant like it did
+                // pre-gate. Under the verify gate the STT/action stays deferred
+                // until an explicit accept (vg_provisional_step); a reject/error/
+                // timeout retracts the LED back to IDLE there, so a false fire
+                // flashes briefly instead of dying invisibly. Alarm dismiss
+                // still flashes below. (Wake cannot reach here while muted or
+                // during an alarm — those are handled/consumed upstream.)
+                set_ui_state(UI_STATE_LISTENING);
 
                 // Alarm dismiss takes precedence over normal wake flow: if
                 // any alarm is currently firing, treat the wake as a local
@@ -4470,7 +4509,8 @@ static void capture_and_drive_task(void *arg)
                     // the now-frozen pre-roll ring (preroll_append stops once
                     // s_in_utterance is set below). The +0.5 s tail fills over
                     // the next frames in the capture branch, then we POST +
-                    // await the verdict. No LED, no stt_begin until commit.
+                    // await the verdict. LED already flashed LISTENING at the
+                    // fire (optimistic ack); no stt_begin until commit.
                     s_verify_pre_len = preroll_copy_out(s_verify_wav, VG_PRE_SAMPLES);
                     s_verify_win_len = s_verify_pre_len;
                     s_prov_vad_end = VAD_END_NONE;
@@ -5383,6 +5423,7 @@ static void boot_operational(void)
         ESP_LOGW(TAG, "verify-gate window alloc failed — configured gate will fail-closed");
     } else {
         s_verify_job_sem = xSemaphoreCreateBinary();
+        oe_verify_gate_init();   // abort mutex must exist before the worker posts
         if (!s_verify_job_sem) {
             ESP_LOGW(TAG, "verify-gate sem alloc failed — configured gate will fail-closed");
             heap_caps_free(s_verify_wav);

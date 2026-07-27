@@ -4,6 +4,10 @@ build-*/
 sdkconfig.old
 dependencies.lock.old
 
+# Flashed image snapshots kept for rollback (oe-0.2.75, diag-0.2.77, …).
+# Build outputs, not sources — reproducible from a tag + idf.py build.
+artifacts/
+
 # IDF-managed components — resolved from main/idf_component.yml at
 # configure time; dependencies.lock pins the exact versions.
 managed_components/

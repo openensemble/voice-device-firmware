@@ -284,6 +284,15 @@ esp_err_t oe_verify_gate_post(const char *server_url, const char *gate_path,
                               const int16_t *pcm_16k_mono, size_t n_samples,
                               int timeout_ms, oe_verify_result_t *out_effective);
 
+// Create the abort mutex. Call once at boot before the verify worker starts.
+void oe_verify_gate_init(void);
+
+// Abort an in-flight oe_verify_gate_post() by closing its socket, unblocking a
+// wedged esp_http_client_perform(). Safe from any task; a no-op when no POST is
+// in flight. The worker then unwinds and clears s_verify_inflight in order.
+// Self-heal for a gate request stuck on a half-open socket (OE mid-restart).
+void oe_verify_gate_abort(void);
+
 typedef void (*oe_tts_pcm_cb_t)(const int16_t *pcm_mono, size_t samples, uint32_t rate, void *user);
 
 // `abort` (optional, may be NULL): flip true to abort the streaming read
