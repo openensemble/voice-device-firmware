@@ -80,7 +80,35 @@ bool nvs_creds_has_wifi(void)
     return get_str("wifi_ssid", ssid, sizeof(ssid)) == ESP_OK;
 }
 
-esp_err_t nvs_creds_set_server(const char *url)     { return set_str("server", url); }
+bool nvs_creds_normalize_server_url(char *url)
+{
+    if (!url) return false;
+    bool changed = false;
+    // RFC 3986: the scheme is case-insensitive and should be normalized to
+    // lowercase. Only the scheme is touched — the authority is left exactly as
+    // provisioned. A value typed as "HTTP://" is otherwise persisted verbatim,
+    // leaving every consumer of server_url obliged to remember a
+    // case-insensitive compare; the one that forgot (the verify-gate origin
+    // check) silently gated a device off for nine days.
+    for (size_t i = 0; url[i]; ++i) {
+        if (url[i] == ':') break;              // end of scheme
+        if (url[i] >= 'A' && url[i] <= 'Z') {
+            url[i] = (char)(url[i] - 'A' + 'a');
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+esp_err_t nvs_creds_set_server(const char *url)
+{
+    if (!url) return ESP_ERR_INVALID_ARG;
+    char norm[NVS_CREDS_SERVER_URL_MAX];
+    if (strlen(url) >= sizeof(norm)) return ESP_ERR_INVALID_SIZE;
+    strcpy(norm, url);
+    nvs_creds_normalize_server_url(norm);
+    return set_str("server", norm);
+}
 esp_err_t nvs_creds_get_server(char *url, size_t n) { return get_str("server", url, n); }
 
 esp_err_t nvs_creds_set_verify_gate_path(const char *path)     { return set_str("vgate_url", path); }

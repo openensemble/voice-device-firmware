@@ -5217,6 +5217,15 @@ static void boot_operational(void)
     }
 
     nvs_creds_get_server(g_dev_config.server_url, sizeof(g_dev_config.server_url));
+    // Heal a value persisted before the scheme was normalized. Writing it back
+    // means every consumer sees a canonical origin, rather than each one having
+    // to remember a case-insensitive compare — which is exactly the mistake that
+    // left this device's wake gate blocked. One write, only when it differs.
+    if (nvs_creds_normalize_server_url(g_dev_config.server_url)) {
+        esp_err_t norm_e = nvs_creds_set_server(g_dev_config.server_url);
+        ESP_LOGW(TAG, "server URL scheme was not lowercase; normalized%s",
+                 norm_e == ESP_OK ? " and persisted" : " in memory only");
+    }
     nvs_creds_get_token(g_dev_config.token, sizeof(g_dev_config.token));
     nvs_creds_get_device_name(g_dev_config.device_name, sizeof(g_dev_config.device_name));
 

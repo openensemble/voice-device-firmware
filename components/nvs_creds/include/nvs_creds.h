@@ -12,6 +12,18 @@ esp_err_t nvs_creds_set_wifi(const char *ssid, const char *password);
 esp_err_t nvs_creds_get_wifi(char *ssid, size_t ssid_len, char *password, size_t password_len);
 bool      nvs_creds_has_wifi(void);
 
+// Matches OE_URL_BUF in oe_client.h. Kept as its own constant so this
+// low-level component does not have to depend on the client header.
+#define NVS_CREDS_SERVER_URL_MAX 256
+
+// Lowercase the URL scheme in place (RFC 3986 makes it case-insensitive and
+// calls for lowercase); the authority is left untouched. Returns true if the
+// value changed. nvs_creds_set_server() applies this before writing, so every
+// consumer of server_url can rely on a lowercase scheme regardless of how it
+// was typed at provisioning. Exposed so boot can heal a value stored before
+// this normalization existed.
+bool nvs_creds_normalize_server_url(char *url);
+
 esp_err_t nvs_creds_set_server(const char *url);
 esp_err_t nvs_creds_get_server(char *url, size_t url_len);
 
