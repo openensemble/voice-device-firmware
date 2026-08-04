@@ -270,8 +270,8 @@ static bool server_verify_gate_path_valid(const char *path)
 
 // Follow-up and conversation-mode barge intentionally open capture without a
 // wake word. UNKNOWN policy never authorizes them. Enabled policy requires an
-// allowed paired origin: HTTPS, or numeric private-LAN HTTP by deployment
-// policy. Explicit-disabled policy preserves the legacy behavior.
+// allowed paired origin: HTTPS, or local-network HTTP by deployment policy.
+// Explicit-disabled policy preserves the legacy behavior.
 static bool server_control_may_open_ungated_capture(void)
 {
     bool known;
@@ -287,9 +287,20 @@ static bool server_control_may_open_ungated_capture(void)
 
 static void apply_verify_gate_server_caps(const cJSON *j)
 {
-    // Gate policy arrives on the operational WebSocket. Plaintext is accepted
-    // only when the paired target is a numeric private-LAN IPv4 origin.
-    if (!oe_verify_gate_origin_allowed(g_dev_config.server_url)) {
+    // Gate policy arrives on the operational WebSocket, which means the network
+    // is up — resolve the paired origin here so the wake path only ever reads a
+    // cached verdict. Plaintext is accepted when that origin is on the local
+    // network, written as an IPv4 literal or as a name that resolves to one.
+    // The paired origin lives only in device NVS and cannot be read from the
+    // server side, so report it here — it is the one input that decides whether
+    // the gate ever leaves gate_policy_pending.
+    {
+        char line[OE_URL_BUF + 48];
+        snprintf(line, sizeof(line), "[verify] server_caps rx origin=%s",
+                 g_dev_config.server_url[0] ? g_dev_config.server_url : "(unset)");
+        oe_udplog_send(line);
+    }
+    if (!oe_verify_gate_origin_refresh(g_dev_config.server_url)) {
         ESP_LOGW(TAG, "server_caps: gate config ignored on disallowed OE origin");
         return;
     }

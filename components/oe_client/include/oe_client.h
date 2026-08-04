@@ -251,8 +251,8 @@ esp_err_t oe_stt_post(const char *server_url, const char *token,
 // ── Wake-word verify gate client (Option A, device-owned provisional session) ─
 // Second-stage wake verification. POSTs the wake window as multipart/form-data
 // to OE_VERIFY_GATE_PATH on the already-paired OE origin. HTTP is accepted only
-// for a numeric private-LAN IPv4 origin; HTTPS remains accepted for deployments
-// that use it. OE authenticates the voice-device session, derives the canonical
+// when that origin is on the local network — written as an IPv4 literal or as a
+// name that resolves to one; HTTPS is accepted for any host. OE authenticates the voice-device session, derives the canonical
 // device id, and privately relays to the loopback verifier. The response carries
 // no transcript text.
 typedef enum {
@@ -262,7 +262,7 @@ typedef enum {
 } oe_verify_result_t;
 
 // server_url    : the paired OE origin with no userinfo/query/fragment/path.
-//                 Plain HTTP is allowed only for a numeric RFC1918 IPv4 host.
+//                 Plain HTTP is allowed only for a local-network host.
 // gate_path     : must exactly equal OE_VERIFY_GATE_PATH.
 // session_id    : device turn_id (<=24 chars, required).
 // device_id     : stable device id (required).
@@ -275,7 +275,20 @@ typedef enum {
 //                 echo the exact device_id and session_id before its verdict
 //                 is consumed. Return value is for logging only — callers act
 //                 on *out_effective.
+// Whether the paired origin may carry the gate POST. HTTPS is accepted for any
+// host; plain HTTP only when the origin is on the local network. Cheap and
+// non-blocking — safe on the wake path. A hostname (or a non-canonical IPv4
+// literal) is answered from the cache oe_verify_gate_origin_refresh() fills, so
+// it reads false until that has run at least once for this origin.
 bool oe_verify_gate_origin_allowed(const char *server_url);
+
+// Resolve the paired origin and publish the verdict for the call above, then
+// return it. Performs a blocking DNS lookup, so call it only from a task with
+// the network up and no critical section held — server_caps handling is the
+// intended site. Cheap no-op for HTTPS and for canonical IPv4 literals, which
+// need no lookup. A resolver failure is not cached, so it retries on the next
+// reconnect rather than latching a device off.
+bool oe_verify_gate_origin_refresh(const char *server_url);
 esp_err_t oe_verify_gate_post(const char *server_url, const char *gate_path,
                               const char *token,
                               const char *session_id, const char *device_id,

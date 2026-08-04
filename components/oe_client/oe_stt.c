@@ -3,6 +3,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <strings.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
@@ -20,12 +26,28 @@ static void build_api_url(char *out, size_t out_len, const char *server_url, con
     snprintf(out, out_len, "%.*s%s", (int)n, server_url, path);
 }
 
-static bool private_ipv4_authority(const char *authority, size_t len)
+// Address classes that count as "on the local network". Cleartext HTTP is
+// confined to these. One predicate backs both the literal fast path and the
+// resolved lookup, so an RFC1918 literal and a DNS name pointing at that same
+// host are judged identically — the rule is about where the origin IS, not how
+// it is spelled.
+static bool ipv4_is_local(const unsigned octets[4])
 {
-    size_t host_len = len;
+    return octets[0] == 10 ||                                       // RFC1918
+           (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
+           (octets[0] == 192 && octets[1] == 168) ||
+           octets[0] == 127 ||                                      // loopback
+           (octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127) ||  // CGNAT
+           (octets[0] == 169 && octets[1] == 254);                  // link-local
+}
+
+// Split an authority into its host extent, rejecting a malformed or zero port.
+static bool authority_host(const char *authority, size_t len, size_t *host_len)
+{
+    *host_len = len;
     for (size_t i = 0; i < len; ++i) {
         if (authority[i] != ':') continue;
-        host_len = i;
+        *host_len = i;
         if (++i >= len) return false;
         unsigned port = 0;
         for (; i < len; ++i) {
@@ -37,50 +59,57 @@ static bool private_ipv4_authority(const char *authority, size_t len)
         if (port == 0) return false;
         break;
     }
+    return *host_len > 0;
+}
 
-    unsigned octets[4] = {0};
+// Canonical dotted-decimal only. lwIP's IPv4 parser treats a leading zero as
+// octal, so "010.0.0.1" must not be read here as decimal 10/8. A non-canonical
+// literal simply falls through to the resolved path, which judges the address
+// the transport will actually connect to.
+static bool parse_ipv4_literal(const char *host, size_t host_len,
+                               unsigned octets[4])
+{
     size_t pos = 0;
     for (size_t part = 0; part < 4; ++part) {
         if (pos >= host_len) return false;
-        // Require canonical dotted-decimal octets. lwIP's IPv4 parser treats
-        // a leading zero as octal, so accepting "010.0.0.1" here as decimal
-        // 10/8 would let the transport resolve the supposedly-private origin
-        // as public 8.0.0.1.
-        if (authority[pos] == '0' && pos + 1 < host_len &&
-            authority[pos + 1] >= '0' && authority[pos + 1] <= '9') {
+        if (host[pos] == '0' && pos + 1 < host_len &&
+            host[pos + 1] >= '0' && host[pos + 1] <= '9') {
             return false;
         }
         unsigned value = 0;
         size_t digits = 0;
-        while (pos < host_len && authority[pos] >= '0' &&
-               authority[pos] <= '9') {
-            value = value * 10u + (unsigned)(authority[pos] - '0');
+        while (pos < host_len && host[pos] >= '0' && host[pos] <= '9') {
+            value = value * 10u + (unsigned)(host[pos] - '0');
             if (value > 255u || ++digits > 3) return false;
             pos++;
         }
         if (digits == 0) return false;
         octets[part] = value;
         if (part < 3) {
-            if (pos >= host_len || authority[pos++] != '.') return false;
+            if (pos >= host_len || host[pos++] != '.') return false;
         } else if (pos != host_len) {
             return false;
         }
     }
-    return octets[0] == 10 ||
-           (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
-           (octets[0] == 192 && octets[1] == 168);
+    return true;
 }
 
-bool oe_verify_gate_origin_allowed(const char *server_url)
+// Validate that the paired value is an origin and hand back its authority.
+static bool origin_authority(const char *server_url, const char **authority,
+                             size_t *authority_len, bool *is_http)
 {
     if (!server_url) return false;
     size_t prefix_len;
-    bool private_http = false;
-    if (strncmp(server_url, "https://", 8) == 0) {
+    // Case-insensitive, like build_ws_url() in oe_ws.c and every URL parser the
+    // rest of the stack uses. A scheme typed as "HTTP://" during provisioning is
+    // stored verbatim in NVS, and comparing it case-sensitively here rejected an
+    // ordinary LAN origin as malformed — silently gating the device off forever.
+    if (strncasecmp(server_url, "https://", 8) == 0) {
         prefix_len = 8;
-    } else if (strncmp(server_url, "http://", 7) == 0) {
+        *is_http = false;
+    } else if (strncasecmp(server_url, "http://", 7) == 0) {
         prefix_len = 7;
-        private_http = true;
+        *is_http = true;
     } else {
         return false;
     }
@@ -98,8 +127,138 @@ bool oe_verify_gate_origin_allowed(const char *server_url)
             return false;
         }
     }
-    return !private_http ||
-           private_ipv4_authority(server_url + prefix_len, n - prefix_len);
+    *authority = server_url + prefix_len;
+    *authority_len = n - prefix_len;
+    return true;
+}
+
+// Resolved-origin verdict cache. oe_verify_gate_origin_allowed() runs on the
+// wake path and must never block on DNS, so oe_verify_gate_origin_refresh()
+// performs the lookup from a network-context task and publishes the answer
+// here. Keyed by a hash of the host so a re-pair to a different origin can
+// never read a stale verdict.
+static portMUX_TYPE s_origin_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t     s_origin_key;      // 0 == nothing cached
+static bool         s_origin_allowed;
+
+static uint32_t origin_key(const char *s, size_t n)
+{
+    uint32_t h = 2166136261u;                  // FNV-1a
+    for (size_t i = 0; i < n; ++i) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1u;                         // never collide with "unset"
+}
+
+static bool origin_cached(uint32_t key, bool *allowed)
+{
+    bool hit;
+    portENTER_CRITICAL(&s_origin_mux);
+    hit = (s_origin_key == key);
+    if (hit) *allowed = s_origin_allowed;
+    portEXIT_CRITICAL(&s_origin_mux);
+    return hit;
+}
+
+bool oe_verify_gate_origin_allowed(const char *server_url)
+{
+    const char *authority;
+    size_t authority_len;
+    bool is_http;
+    if (!origin_authority(server_url, &authority, &authority_len, &is_http)) {
+        return false;
+    }
+    // HTTPS carries the bearer and the wake audio under TLS to whatever host
+    // the deployment uses, so no reachability constraint applies.
+    if (!is_http) return true;
+
+    size_t host_len;
+    if (!authority_host(authority, authority_len, &host_len)) return false;
+
+    unsigned octets[4];
+    if (parse_ipv4_literal(authority, host_len, octets)) {
+        return ipv4_is_local(octets);
+    }
+    // A name (or a non-canonical literal) is judged by what it resolves to,
+    // which only oe_verify_gate_origin_refresh() is allowed to find out.
+    bool allowed = false;
+    return origin_cached(origin_key(authority, host_len), &allowed) && allowed;
+}
+
+bool oe_verify_gate_origin_refresh(const char *server_url)
+{
+    const char *authority;
+    size_t authority_len;
+    bool is_http;
+    if (!origin_authority(server_url, &authority, &authority_len, &is_http)) {
+        oe_udplog_send("[verify] origin refused: malformed origin");
+        return false;
+    }
+    if (!is_http) return true;
+
+    size_t host_len;
+    if (!authority_host(authority, authority_len, &host_len)) {
+        oe_udplog_send("[verify] origin refused: bad port");
+        return false;
+    }
+
+    unsigned octets[4];
+    if (parse_ipv4_literal(authority, host_len, octets)) {
+        const bool ok = ipv4_is_local(octets);
+        oe_udplog_send(ok ? "[verify] origin literal on-LAN — allowed"
+                          : "[verify] origin literal off-LAN — refused");
+        return ok;
+    }
+
+    char host[OE_URL_BUF];
+    if (host_len >= sizeof(host)) return false;
+    memcpy(host, authority, host_len);
+    host[host_len] = '\0';
+
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+        // Transient resolver failure. Leave any previous verdict untouched and
+        // stay closed for now; server_caps arrives on every reconnect, so a
+        // recoverable DNS hiccup retries on its own.
+        if (res) freeaddrinfo(res);
+        ESP_LOGW(TAG, "verify gate: paired origin did not resolve");
+        oe_udplog_send("[verify] paired origin did not resolve — gate pending");
+        return false;
+    }
+
+    // Every answer must be local. A name that also carries a public record —
+    // split-horizon DNS seen from the wrong side — must not pass.
+    bool allowed = true;
+    unsigned n_addr = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
+        const uint32_t a =
+            ntohl(((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr);
+        unsigned o[4] = { (a >> 24) & 0xffu, (a >> 16) & 0xffu,
+                          (a >> 8) & 0xffu, a & 0xffu };
+        n_addr++;
+        if (!ipv4_is_local(o)) { allowed = false; break; }
+    }
+    if (n_addr == 0) allowed = false;          // IPv6-only is not judged local
+    freeaddrinfo(res);
+
+    portENTER_CRITICAL(&s_origin_mux);
+    s_origin_key = origin_key(authority, host_len);
+    s_origin_allowed = allowed;
+    portEXIT_CRITICAL(&s_origin_mux);
+
+    // Mirror the verdict to udplog: a device with no USB attached is otherwise
+    // unobservable here, and this is the one fact that decides whether the gate
+    // ever leaves gate_policy_pending.
+    char line[96];
+    snprintf(line, sizeof(line), "[verify] paired origin %s",
+             allowed ? "resolves on-LAN — gate allowed"
+                     : "resolves off-LAN — cleartext gate refused");
+    ESP_LOGI(TAG, "%s", line);
+    oe_udplog_send(line);
+    return allowed;
 }
 
 // Build the verifier URL only from the paired OE origin and the single
