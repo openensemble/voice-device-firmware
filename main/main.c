@@ -974,7 +974,8 @@ static void set_followup_until_us(int64_t v)
     portEXIT_CRITICAL(&s_time_mux);
 }
 
-static void set_ui_state(ui_state_t s) { leds_buttons_set_state(s); }
+static ui_state_t s_ui_state = UI_STATE_BOOT;
+static void set_ui_state(ui_state_t s) { s_ui_state = s; leds_buttons_set_state(s); }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -2912,6 +2913,29 @@ static verify_gate_state_t verify_gate_state(const char **blocked_reason)
     return VG_READY;
 }
 
+// A blocked wake is either a VERDICT or a FAULT, and they deserve opposite
+// treatment. A gate REJECT must stay invisible — that silence is the whole
+// privacy contract, and it is why the readiness check runs before any LED,
+// playback or WS side effect. A FAULT is different: the gate never ran, so no
+// verdict exists to disclose, and staying silent turns a one-line
+// misconfiguration into a device that is deaf with no LED, no sound, and
+// nothing in any server-side log to find it by.
+//
+// worker_busy is deliberately excluded: it is transient and the self-heal in
+// the capture loop already unwedges it, so lighting an error for it would cry
+// wolf. Every other reason means an operator has to change something.
+static bool vg_reason_is_fault(const char *reason)
+{
+    if (!reason) return true;                   // unknown → assume fault
+    return strcmp(reason, "worker_busy") != 0;
+}
+
+// How long the fault indication holds before the capture loop clears it. Long
+// enough to be seen by someone who just spoke the wake word, short enough not
+// to sit red forever once the fault is fixed.
+#define VG_FAULT_LED_MS 2500
+static int64_t s_vg_fault_led_until_us;
+
 static void vg_restore_rejected_identity(void)
 {
     if (!s_prov_identity_valid) return;
@@ -3965,6 +3989,15 @@ static void capture_and_drive_task(void *arg)
             s_verify_inflight_since_us = esp_timer_get_time();
         }
 
+        // Clear a gate-fault indication once it has been shown long enough.
+        // Only if nothing else has claimed the LEDs since — a turn that started
+        // meanwhile owns the state, and we just drop our claim silently.
+        if (s_vg_fault_led_until_us != 0 &&
+            esp_timer_get_time() > s_vg_fault_led_until_us) {
+            s_vg_fault_led_until_us = 0;
+            if (s_ui_state == UI_STATE_ERROR) set_ui_state(UI_STATE_IDLE);
+        }
+
         // Keep the pre-roll ring warm while not capturing, so a follow-up
         // VAD-start can prepend the speech onset it (by definition) missed.
         // Reset at every window-arm point, so by the time a window is open
@@ -4348,6 +4381,17 @@ static void capture_and_drive_task(void *arg)
                                  blocked_reason ? blocked_reason : "not_ready");
                         ESP_LOGW(TAG, "%s", line);
                         oe_udplog_send(line);
+                        // Show a fault. The wake word WAS heard — telling the
+                        // person in the room that something is broken beats the
+                        // device appearing simply not to have listened. Only for
+                        // faults; a reject stays silent (see vg_reason_is_fault).
+                        if (vg_reason_is_fault(blocked_reason) &&
+                            s_ui_state == UI_STATE_IDLE) {
+                            set_ui_state(UI_STATE_ERROR);
+                            s_vg_fault_led_until_us =
+                                esp_timer_get_time() +
+                                (int64_t) VG_FAULT_LED_MS * 1000;
+                        }
                         vg_restore_rejected_identity();
                         continue;
                     }
