@@ -4231,31 +4231,86 @@ static void capture_and_drive_task(void *arg)
                         // is minted at stage-C commit; until then pause/
                         // resume flow control still names the CURRENT turn.
                     } else if (s_barge_verify_frames >= BARGE_VERIFY_WINDOW_FRAMES) {
-                        // False alarm — resume the reply where it paused.
+                        // Stage B found too little speech. That does NOT mean
+                        // the room was silent: a single bare "stop" (~300-400
+                        // ms) is OVER by the time three consecutive loud frames
+                        // have made it a candidate, so the verify window opens
+                        // onto silence and reads 0 ms — while the word itself is
+                        // sitting in the pre-roll ring right behind us
+                        // (field-confirmed 2026-07-04 and again 2026-08-05,
+                        // where three "stop"s in one reply each landed here).
                         //
-                        // TODO(short-word barge): a single bare "stop" lands
-                        // here as "0ms speech" — the word ENDS right as the
-                        // candidate triggers, so the verify window opens onto
-                        // silence and the reply resumes (field-confirmed
-                        // 2026-07-04). The word itself is already sitting in
-                        // the pre-roll ring at this point: instead of
-                        // instantly resuming, ship the pre-roll snippet to
-                        // STT and let the transcript decide (same contract as
-                        // stage C). Cost: TV-noise false candidates hold the
-                        // pause ~1.5s instead of 1s. Deferred — multi-word
-                        // phrases ("that's enough", "you can stop") and
-                        // "<wake> stop" cover it today.
-                        char bl[64];
-                        snprintf(bl, sizeof(bl), "[barge] false alarm (%ums speech) — resume",
+                        // Energy cannot tell that apart from a self-triggered
+                        // TTS peak — both are loud then quiet — so don't try.
+                        // Ship the pre-roll to STT and let stage C's transcript
+                        // check arbitrate, exactly as it already does for a
+                        // confirmed barge. "stop" commits; our own reply bleed
+                        // or a TV transient comes back empty/filler and resumes.
+                        //
+                        // Cost: an ambiguous candidate now holds the pause
+                        // ~1.5 s instead of 1 s and spends one STT call. A
+                        // missed "stop" costs the user their turn, so that is
+                        // the right side to err on.
+                        char bl[80];
+                        snprintf(bl, sizeof(bl),
+                                 "[barge] %ums speech — asking STT instead of resuming",
                                  (unsigned)s_barge_speech_ms);
                         ESP_LOGI(TAG, "%s", bl); oe_udplog_send(bl);
+                        // Stay paused and stay in BARGE_VERIFYING's successor
+                        // state: the capture path below owns resume-vs-commit
+                        // from here, and it is the ONLY thing that may clear
+                        // s_paused_for_barge — clearing it here would let the
+                        // reply resume underneath the verdict.
                         s_barge_state = BARGE_NONE;
-                        s_paused_for_barge = false;
-                        s_barge_cooldown_until_us = now_us + (int64_t)BARGE_FALSE_ALARM_COOLDOWN_MS * 1000;
-                        xvf3800_enable_amplifier(true);
-                        audio_io_resume_playback();
-                        set_ui_state(UI_STATE_SPEAKING);
-                        if (s_caps_tts_pause) oe_ws_send_tts_resume(s_turn_id);
+                        {
+                            size_t want = ((size_t)s_barge_verify_frames * 80
+                                           + BARGE_PREROLL_LEAD_MS) * 16;
+                            if (want > PREROLL_SAMPLES) want = PREROLL_SAMPLES;
+                            s_capture_used = preroll_copy_out(s_capture_buf, want);
+                        }
+                        // Replay the stashed pre-roll through the VAD, frame by
+                        // frame. Two reasons it must be chunked and must happen
+                        // at all: vad_feed() computes ONE rms per call, so
+                        // handing it the whole buffer would average a 300 ms
+                        // word into 1 s of silence; and the VAD otherwise only
+                        // ever sees LIVE audio, so it would find no speech,
+                        // wait out no_speech_ms_to_end (5 s), and close with
+                        // VAD_END_NO_SPEECH — which DROPS the audio instead of
+                        // posting it. Replaying makes the word that already
+                        // happened count, so 500 ms of live silence then closes
+                        // the utterance normally and stage C gets a transcript.
+                        vad_reset(s_vad);
+                        bool preroll_had_speech = false;
+                        for (size_t off = 0; off + WW_FRAME_SAMPLES <= s_capture_used;
+                             off += WW_FRAME_SAMPLES) {
+                            vad_end_reason_t pre_end = VAD_END_NONE;
+                            if (vad_feed(s_vad, &s_capture_buf[off], WW_FRAME_SAMPLES,
+                                         &pre_end)) {
+                                preroll_had_speech = true;
+                            }
+                        }
+                        if (!preroll_had_speech) {
+                            // Nothing speech-like behind us either — a genuine
+                            // false alarm. Resume immediately as before rather
+                            // than spending an STT call and a 5 s no-speech wait
+                            // on confirmed silence.
+                            oe_udplog_send("[barge] false alarm (silent pre-roll) — resume");
+                            s_capture_used = 0;
+                            s_paused_for_barge = false;
+                            s_barge_cooldown_until_us =
+                                now_us + (int64_t)BARGE_FALSE_ALARM_COOLDOWN_MS * 1000;
+                            xvf3800_enable_amplifier(true);
+                            audio_io_resume_playback();
+                            set_ui_state(UI_STATE_SPEAKING);
+                            if (s_caps_tts_pause) oe_ws_send_tts_resume(s_turn_id);
+                        } else {
+                            // Stay paused: the capture path owns resume-vs-commit
+                            // from here and is the ONLY thing that may clear
+                            // s_paused_for_barge.
+                            s_barge_capture = true;
+                            capture_sat_logged = false;
+                            s_in_utterance = true;
+                        }
                     }
                 }
             } else if (s_barge_state != BARGE_NONE || s_paused_for_barge || s_speak_floor != 0) {
