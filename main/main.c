@@ -4784,7 +4784,19 @@ static void capture_and_drive_task(void *arg)
                         // the paused reply and stop its turn server-side. The
                         // stop names the OLD turn; the chat below carries a
                         // freshly minted one.
-                        oe_udplog_send("[barge] interjection real — interrupting reply");
+                        {
+                            // Log what STT actually heard, same as the "not
+                            // real" branch already does. Without it the commit
+                            // side is a black box: you can see THAT a reply was
+                            // interrupted but not whether the words were yours
+                            // or our own reply bleeding into the pre-roll —
+                            // which is exactly the failure mode to watch for.
+                            char bl[128];
+                            snprintf(bl, sizeof(bl),
+                                     "[barge] interjection real (\"%.48s\") — interrupting reply",
+                                     transcript);
+                            oe_udplog_send(bl);
+                        }
                         s_paused_for_barge = false;
                         audio_io_resume_playback();   // release pause flag before stop
                         audio_io_stop_playback();
@@ -5574,8 +5586,13 @@ static void boot_operational(void)
         const uint32_t int_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
         char bl[160];
         snprintf(bl, sizeof(bl),
-                 "[boot] reset=%s heap_int=%luKB heap_int_largest=%luKB heap_psram=%luKB",
+                 // device_id lets a log reader map this IP to the registry
+                 // entry. udplog lines carry only the source IP, so without one
+                 // anchor per boot there is no way to say WHICH device a
+                 // barge/verify line came from.
+                 "[boot] reset=%s device_id=%s heap_int=%luKB heap_int_largest=%luKB heap_psram=%luKB",
                  reset_reason_str(esp_reset_reason()),
+                 g_dev_config.device_id[0] ? g_dev_config.device_id : "(pending)",
                  (unsigned long)(heap_caps_get_free_size(int_caps) / 1024),
                  (unsigned long)(heap_caps_get_largest_free_block(int_caps) / 1024),
                  (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
