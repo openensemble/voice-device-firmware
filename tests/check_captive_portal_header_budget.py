@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 
-MINIMUM_HEADER_BUDGET = 1024
+MINIMUM_HEADER_BUDGET = 4096
 
 
 def configured_header_budget(path: Path) -> int:
@@ -21,11 +21,13 @@ def configured_header_budget(path: Path) -> int:
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    actual = configured_header_budget(root / "sdkconfig.defaults")
-    assert actual >= MINIMUM_HEADER_BUDGET, (
-        "captive portal request-header budget is too small for mobile captive "
-        f"portal browsers: expected >= {MINIMUM_HEADER_BUDGET}, got {actual}"
-    )
+    for config_name in ("sdkconfig", "sdkconfig.defaults"):
+        actual = configured_header_budget(root / config_name)
+        assert actual >= MINIMUM_HEADER_BUDGET, (
+            f"{config_name}: captive portal request-header budget is too small "
+            "for mobile captive portal browsers: "
+            f"expected >= {MINIMUM_HEADER_BUDGET}, got {actual}"
+        )
 
 
 if __name__ == "__main__":
