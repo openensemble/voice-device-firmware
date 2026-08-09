@@ -33,6 +33,11 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 
+# Captive-portal browsers (especially Android/iOS captive-portal WebViews)
+# can send ordinary request headers beyond ESP-IDF's 512-byte default. The
+# portal must accept those requests before it can read the form body.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
 # HTTPS / mbedTLS — needed for OE's WSS + STT/TTS over TLS
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
