@@ -59,6 +59,13 @@ class StreamingModel {
 
   bool get_unprocessed_probability_status() const { return this->unprocessed_probability_status_; }
 
+  // OE addition. determine_detected() hard-returns average_probability = 0
+  // while this is negative (the post-detection ignore window), which makes a
+  // reported probability of 0 mean either "no activation" or "not scoring yet"
+  // — two very different diagnoses. Expose it so telemetry can tell them apart
+  // instead of leaving the reader to infer it from this source file.
+  int16_t get_ignore_windows() const { return this->ignore_windows_; }
+
   uint8_t get_default_probability_cutoff() const { return this->default_probability_cutoff_; }
   uint8_t get_probability_cutoff() const { return this->probability_cutoff_; }
   void set_probability_cutoff(uint8_t probability_cutoff) { this->probability_cutoff_ = probability_cutoff; }

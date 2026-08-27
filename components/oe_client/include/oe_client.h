@@ -210,8 +210,20 @@ esp_err_t oe_ws_send_stt_backlog(const char *turn_id, uint8_t wake_slot,
                                  uint8_t wake_avg_prob, const char *agent_id,
                                  const int16_t *samples, size_t n_samples,
                                  uint32_t budget_ms, uint32_t *out_next_seq);
-esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples);
+// end_reason / speech_ms / peak_energy / energy_threshold carry the VAD's
+// account of why listening stopped (see vad_utterance_stats_t). They travel
+// with stt_end so the server's turn journal can separate "user finished" from
+// "a pause was scored as silence" without a second round trip.
+esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples,
+                             const char *end_reason, uint32_t speech_ms,
+                             uint32_t peak_energy, uint32_t energy_threshold);
 esp_err_t oe_ws_send_stt_abort(const char *turn_id);
+// Abort that carries the VAD account, for the no_speech path — that abort is a
+// real turn outcome and its row should be as self-describing as a completed
+// turn's. The plain form above is for aborts with no utterance behind them.
+esp_err_t oe_ws_send_stt_abort_full(const char *turn_id, const char *end_reason,
+                                    uint32_t speech_ms, uint32_t peak_energy,
+                                    uint32_t energy_threshold);
 
 // Tell the server the device tore down ambient playback on its own (e.g.
 // the user hit the physical mute button). Without this the server keeps its

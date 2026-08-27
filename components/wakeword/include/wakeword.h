@@ -62,6 +62,43 @@ bool wakeword_last_wake_slug(const wakeword_t *ww, char *out, size_t out_len);
 void wakeword_notify_speaking_began(wakeword_t *ww);
 void wakeword_notify_speaking_ended(wakeword_t *ww);
 
+// Detector telemetry for one observation window, used to localize a "no wake"
+// failure along the capture path:
+//   audio_lvl     — peak |int16 sample| fed to the detector. 0 means I²S
+//                   delivered silence; a small non-zero value under normal
+//                   speech means the mic path is alive but starved (the
+//                   AGC-freeze failure mode: gain locked too low, so the
+//                   frontend never sees enough signal to build a confident
+//                   score).
+//   feat_max      — peak INT8 feature after the frontend. -128 = nothing but
+//                   silence is reaching the model.
+//   peak_avg_prob — highest sliding-window probability observed. This is the
+//                   near-miss metric and the reason this accessor exists:
+//                   wake_avg_prob only reaches the server when a fire clears
+//                   the cutoff, so every sub-cutoff attempt — exactly the
+//                   population you need to see when tuning sensitivity — is
+//                   otherwise unobservable off-device.
+//   slices        — feature slices processed, to confirm the window had data.
+//   scored/gated — how many probability windows the detector actually scored
+//                  vs. skipped because it was disabled or inside its
+//                  post-detection ignore window. determine_detected() reports
+//                  average_probability = 0 in the skipped case, so without
+//                  this split a peak of 0 cannot be read: "heard nothing" and
+//                  "wasn't scoring yet" produce the identical number.
+typedef struct {
+    int16_t  audio_lvl;
+    int8_t   feat_max;
+    uint8_t  peak_avg_prob;
+    uint32_t slices;
+    uint32_t scored_windows;
+    uint32_t gated_windows;
+} wakeword_stats_t;
+
+// Snapshot the telemetry window and reset it. The caller owns the window
+// cadence — nothing else resets these counters, so two concurrent readers
+// would each see only a partial window. Mutex-safe against wakeword_feed.
+void wakeword_read_stats(wakeword_t *ww, wakeword_stats_t *out);
+
 // Runtime probability-cutoff tuning. When audio is playing through the I²S
 // TX (TTS / AirPlay / ambient), per-frame inference probability builds
 // slower because the active TX line degrades the RX signal on this board.

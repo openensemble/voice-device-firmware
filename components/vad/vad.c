@@ -15,6 +15,11 @@ struct vad_state_s {
     // looks like during "silence" and tune energy_threshold accordingly.
     uint32_t stats_window_ms;
     uint32_t stats_max_rms;
+    // Per-utterance accounting, cleared by vad_reset. Reported at the end of
+    // every utterance so a truncated turn carries the evidence for WHY it
+    // ended rather than just the fact that it did.
+    uint32_t utt_peak_energy;
+    uint32_t utt_speech_ms;
 };
 
 vad_state_t *vad_create(const vad_config_t *cfg)
@@ -32,6 +37,33 @@ void vad_reset(vad_state_t *vad)
     vad->silence_ms = 0;
     vad->total_ms = 0;
     vad->any_speech_seen = false;
+    vad->utt_peak_energy = 0;
+    vad->utt_speech_ms = 0;
+}
+
+void vad_set_energy_threshold(vad_state_t *vad, uint32_t threshold)
+{
+    if (!vad || threshold == 0) return;
+    vad->cfg.energy_threshold = threshold;
+}
+
+void vad_get_utterance_stats(const vad_state_t *vad, vad_utterance_stats_t *out)
+{
+    if (!vad || !out) return;
+    out->peak_energy = vad->utt_peak_energy;
+    out->threshold   = vad->cfg.energy_threshold;
+    out->total_ms    = vad->total_ms;
+    out->speech_ms   = vad->utt_speech_ms;
+}
+
+const char *vad_end_reason_name(vad_end_reason_t r)
+{
+    switch (r) {
+        case VAD_END_SILENCE:       return "silence";
+        case VAD_END_NO_SPEECH:     return "no_speech";
+        case VAD_END_MAX_UTTERANCE: return "max_utterance";
+        default:                    return "none";
+    }
 }
 
 bool vad_feed(vad_state_t *vad, const int16_t *samples, size_t n_samples, vad_end_reason_t *end_reason)
@@ -48,10 +80,13 @@ bool vad_feed(vad_state_t *vad, const int16_t *samples, size_t n_samples, vad_en
     uint32_t chunk_ms = (uint32_t)((n_samples * 1000ULL) / vad->cfg.sample_rate);
     vad->total_ms += chunk_ms;
 
+    if (rms > vad->utt_peak_energy) vad->utt_peak_energy = rms;
+
     bool is_speech = rms > vad->cfg.energy_threshold;
     if (is_speech) {
         vad->any_speech_seen = true;
         vad->silence_ms = 0;
+        vad->utt_speech_ms += chunk_ms;
     } else {
         vad->silence_ms += chunk_ms;
     }

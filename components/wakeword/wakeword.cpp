@@ -78,20 +78,32 @@ struct wakeword_s {
     int64_t                      last_detection_us;
     uint8_t                      last_wake_avg_prob;
 
-    // Bring-up diagnostics: periodically dump audio-path activity. Layered
-    // so we can localize a "no wake" failure:
-    //   raw_max_abs  — max |int16 sample| in input buffers (0 → I²S dead)
-    //   feature_max  — max INT8 feature post-frontend (-128 → silence)
+    // Audio-path diagnostics, drained by wakeword_read_stats. Layered so we
+    // can localize a "no wake" failure:
+    //   raw_max_abs   — max |int16 sample| in input buffers (0 → I²S dead)
+    //   feature_max   — max INT8 feature post-frontend (-128 → silence)
     //   last_avg_prob — last sliding-window probability
+    //   peak_avg_prob — highest sliding-window probability over the window.
+    //                   Tracked separately from last_avg_prob because the
+    //                   near-miss is what matters when tuning sensitivity: a
+    //                   window whose peak sat just under the cutoff looks
+    //                   identical to dead silence if you only sample the last
+    //                   value, and never reaches the server at all (the
+    //                   wake_avg_prob channel reports fires only).
     // Initial extremes use INT8_MAX / INT8_MIN so the first reading shows
-    // the real range; the 5 s dump resets back to those sentinels.
-    int64_t                      stats_last_us;
+    // the real range; draining resets back to those sentinels.
     uint32_t                     stats_slices;
     uint32_t                     stats_calls;
     int16_t                      stats_raw_max_abs;
     int8_t                       stats_max_feature;
     int8_t                       stats_min_feature;
     uint8_t                      stats_last_avg_prob;
+    uint8_t                      stats_peak_avg_prob;
+    // Windows where the detector was actually scoring vs. gated (disabled or
+    // inside the post-detection ignore window). Without this split a peak of 0
+    // is unreadable: it means "heard nothing" and "wasn't listening yet" alike.
+    uint32_t                     stats_scored_windows;
+    uint32_t                     stats_gated_windows;
 
     // Guards the model pointer + arena lifetime across the hot-swap path.
     // wakeword_load_slot (called from the WS task on ww_upload) tears down
@@ -155,6 +167,9 @@ wakeword_t *wakeword_create(const wakeword_config_t *cfg) {
     ww->frontend_ready = true;
     ww->stats_max_feature = INT8_MIN;
     ww->stats_min_feature = INT8_MAX;
+    ww->stats_peak_avg_prob = 0;
+    ww->stats_scored_windows = 0;
+    ww->stats_gated_windows = 0;
     ww->model_mutex = xSemaphoreCreateMutex();
     if (!ww->model_mutex) {
         ESP_LOGE(TAG, "model_mutex alloc failed");
@@ -535,8 +550,21 @@ bool wakeword_feed(wakeword_t *ww, const int16_t *samples, size_t n_samples) {
 
         if (!ww->model->get_unprocessed_probability_status()) continue;
 
+        // Sample the detector's own gating state BEFORE reading the event:
+        // determine_detected() returns average_probability = 0 whenever the
+        // model is disabled or still inside its post-detection ignore window,
+        // so a scored-0 window and a not-scoring window are indistinguishable
+        // from the probability alone.
+        if (!ww->model->is_enabled() || ww->model->get_ignore_windows() < 0) {
+            ww->stats_gated_windows++;
+        } else {
+            ww->stats_scored_windows++;
+        }
         DetectionEvent ev = ww->model->determine_detected();
         ww->stats_last_avg_prob = ev.average_probability;
+        if (ev.average_probability > ww->stats_peak_avg_prob) {
+            ww->stats_peak_avg_prob = ev.average_probability;
+        }
         if (!ev.detected) continue;
 
         int64_t now = esp_timer_get_time();
@@ -555,31 +583,48 @@ bool wakeword_feed(wakeword_t *ww, const int16_t *samples, size_t n_samples) {
         // skip features. The caller will react on the returned bool.
     }
 
-    // Periodic stats — slim version (every ~10 s) so we can confirm audio is
-    // alive and the model is processing slices. Demoted to LOGD: same data
-    // streams server-side via the wake_avg_prob channel, and with multiple
-    // wake-word slots configured the per-slot per-10s prints clutter the
-    // monitor without adding signal. Re-enable via `idf.py menuconfig` →
-    // "Log output" → set component "ww" to Debug, if you ever need it.
-    {
-        int64_t now = esp_timer_get_time();
-        if (ww->stats_last_us == 0) ww->stats_last_us = now;
-        if (now - ww->stats_last_us >= 10 * 1000 * 1000) {
-            ESP_LOGD(TAG, "audio_lvl=%d feat_max=%d prob=%u/255",
-                     (int) ww->stats_raw_max_abs,
-                     (int) ww->stats_max_feature,
-                     (unsigned) ww->stats_last_avg_prob);
-            ww->stats_calls = 0;
-            ww->stats_slices = 0;
-            ww->stats_raw_max_abs = 0;
-            ww->stats_max_feature = INT8_MIN;
-            ww->stats_min_feature = INT8_MAX;
-            ww->stats_last_us = now;
-        }
-    }
-
     xSemaphoreGive(ww->model_mutex);
     return detected;
+}
+
+// The stats window used to be drained here on a self-timed ~10 s tick and
+// printed at LOGD, which made it serial-only and invisible in the field. The
+// window is now drained by whoever reports it (main.c's heartbeat), so the
+// reporter owns the cadence and there is exactly one resetter — two would
+// each see a torn, partial window.
+void wakeword_read_stats(wakeword_t *ww, wakeword_stats_t *out)
+{
+    if (!ww || !out) return;
+    // Same lock as wakeword_feed: the audio task writes these fields every
+    // 80 ms, so an unlocked read-and-clear could drop a sample between the
+    // read and the reset.
+    if (xSemaphoreTake(ww->model_mutex, portMAX_DELAY) != pdTRUE) {
+        memset(out, 0, sizeof(*out));
+        out->feat_max = INT8_MIN;   // same "no data" sentinel the window uses
+        return;
+    }
+    out->audio_lvl     = ww->stats_raw_max_abs;
+    out->feat_max      = ww->stats_max_feature;
+    out->peak_avg_prob   = ww->stats_peak_avg_prob;
+    out->slices          = ww->stats_slices;
+    out->scored_windows  = ww->stats_scored_windows;
+    out->gated_windows   = ww->stats_gated_windows;
+
+    ESP_LOGD(TAG, "audio_lvl=%d feat_max=%d peak_prob=%u/255 slices=%u",
+             (int) ww->stats_raw_max_abs,
+             (int) ww->stats_max_feature,
+             (unsigned) ww->stats_peak_avg_prob,
+             (unsigned) ww->stats_slices);
+
+    ww->stats_calls = 0;
+    ww->stats_slices = 0;
+    ww->stats_raw_max_abs = 0;
+    ww->stats_max_feature = INT8_MIN;
+    ww->stats_min_feature = INT8_MAX;
+    ww->stats_peak_avg_prob = 0;
+    ww->stats_scored_windows = 0;
+    ww->stats_gated_windows = 0;
+    xSemaphoreGive(ww->model_mutex);
 }
 
 void wakeword_notify_speaking_began(wakeword_t *ww) {

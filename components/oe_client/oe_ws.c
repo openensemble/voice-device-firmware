@@ -685,27 +685,56 @@ esp_err_t oe_ws_send_stt_backlog(const char *turn_id, uint8_t wake_slot,
     return ESP_OK;
 }
 
-esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples)
+esp_err_t oe_ws_send_stt_end(const char *turn_id, uint32_t total_samples,
+                             const char *end_reason, uint32_t speech_ms,
+                             uint32_t peak_energy, uint32_t energy_threshold)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "stt_end");
     if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
     cJSON_AddNumberToObject(o, "samples", total_samples);
+    // Why the device stopped listening, and how much headroom the speech had
+    // over the VAD floor. The server cannot infer either — without this a
+    // turn truncated by a mid-sentence pause is indistinguishable from one the
+    // user actually finished. Optional on the wire: older servers ignore them.
+    if (end_reason && end_reason[0]) cJSON_AddStringToObject(o, "end_reason", end_reason);
+    cJSON_AddNumberToObject(o, "speech_ms", speech_ms);
+    cJSON_AddNumberToObject(o, "peak_energy", peak_energy);
+    cJSON_AddNumberToObject(o, "energy_threshold", energy_threshold);
     esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(2000));
     cJSON_Delete(o);
     return err;
 }
 
-esp_err_t oe_ws_send_stt_abort(const char *turn_id)
+// Aborts carry the same VAD account as stt_end. A no_speech abort IS a turn
+// outcome — the user woke the device and it heard nothing — so the server's
+// journal needs the evidence for that just as much as for a completed
+// utterance. Omitting it here is what left every no_speech row blank.
+esp_err_t oe_ws_send_stt_abort_full(const char *turn_id, const char *end_reason,
+                                    uint32_t speech_ms, uint32_t peak_energy,
+                                    uint32_t energy_threshold)
 {
     if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "stt_abort");
     if (turn_id && turn_id[0]) cJSON_AddStringToObject(o, "turn_id", turn_id);
+    if (end_reason && end_reason[0]) {
+        cJSON_AddStringToObject(o, "end_reason", end_reason);
+        cJSON_AddNumberToObject(o, "speech_ms", speech_ms);
+        cJSON_AddNumberToObject(o, "peak_energy", peak_energy);
+        cJSON_AddNumberToObject(o, "energy_threshold", energy_threshold);
+    }
     esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
     cJSON_Delete(o);
     return err;
+}
+
+// Back-compat shim for the abort paths with no utterance context (a partial
+// server session dropped after a send failure, not a turn outcome).
+esp_err_t oe_ws_send_stt_abort(const char *turn_id)
+{
+    return oe_ws_send_stt_abort_full(turn_id, NULL, 0, 0, 0);
 }
 
 esp_err_t oe_ws_send_ambient_stopped(const char *reason)

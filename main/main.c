@@ -163,7 +163,43 @@ static void boot_indicator_task(void *arg)
 // Defer the freeze until we observe sustained acoustic quiet via
 // audio_io_get_capture_rms_1s(). Caps total wait so a permanently noisy
 // room still gets a freeze rather than no freeze.
-static void agc_freeze_task(void *arg)
+// Outcome of the one-shot freeze, kept for the lifetime of the boot so the
+// heartbeat can report it. The frozen gain IS the device's sensitivity until
+// the next reboot, so "which freeze did this boot get" has to be answerable at
+// any time, not only from whoever happened to be reading the log at startup.
+static volatile bool     s_agc_freeze_done = false;
+static volatile bool     s_agc_freeze_capped = false;
+static volatile uint32_t s_agc_freeze_waited_s = 0;
+static volatile uint32_t s_agc_freeze_rms = 0;
+// Re-arm accounting: how many times this boot, and when last, so a device that
+// keeps re-arming is visibly distinct from one that locked correctly once.
+static volatile uint32_t s_agc_rearm_count = 0;
+static volatile int64_t  s_agc_last_rearm_us = 0;
+static volatile bool     s_agc_rearm_inflight = false;
+
+// Starvation thresholds for the self-heal watchdog. Derived from the
+// 2026-08-09 Kitchen measurement, the only session where healthy wakes and
+// their features were captured together: real "hey sydney" fires produced
+// feat_max 88..107 at audio_lvl 1723..6171, while the idle room sat at
+// audio_lvl 473..726 / feat_max 30..50. A gain lock frozen too low shows up
+// as the first pair without the second: speech-level input that never lifts
+// the features into the band the model needs.
+//
+// These are calibrated against ONE device-session. They are deliberately
+// conservative — three consecutive windows, not one — because a false re-arm
+// costs a few seconds of degraded detection, and because a single room's
+// numbers are thin evidence for a fleet-wide constant. Revisit once the
+// bedroom has produced comparable healthy-wake data.
+#define AGC_SPEECH_LVL_MIN     1500   // audio_lvl above this = someone spoke
+#define AGC_STARVED_FEAT_MAX     70   // healthy speech reached 88+
+#define AGC_STARVED_WINDOWS       3   // consecutive starved windows before acting
+#define AGC_REARM_MIN_INTERVAL_US (10LL * 60 * 1000 * 1000)   // 10 min
+
+// Wait for sustained acoustic quiet, then halt AGC adaptation. Shared by the
+// boot freeze and the re-arm path so both use identical criteria — a re-arm
+// that captured gain on looser terms than boot would be its own bug.
+// Returns with the freeze applied (or attempted) and the state vars updated.
+static void agc_wait_quiet_and_freeze(const char *reason)
 {
     // Tuned by ear on a quiet bedroom + music-playing test:
     //   - quiet room peak-RMS sits ~500–1500
@@ -217,15 +253,98 @@ static void agc_freeze_task(void *arg)
         }
     }
 
+    // Whether this freeze captured a settled quiet-room gain or gave up
+    // against a noisy room decides the device's sensitivity until the next
+    // reboot, so it belongs in the field log, not just on a serial cable.
+    // `capped=1` means the wait ran out with the room still noisy — the
+    // locked gain is whatever the AGC had adapted DOWN to, and a starved
+    // wake path (low audio_lvl/feat_max in the [hb] wake line) follows.
+    const bool capped = (quiet_seconds < QUIET_SECONDS_NEEDED);
+    uint32_t rms_at_freeze = audio_io_get_capture_rms_1s();
+    s_agc_freeze_capped   = capped;
+    s_agc_freeze_waited_s = (uint32_t)total_seconds;
+    s_agc_freeze_rms      = rms_at_freeze;
+    s_agc_freeze_done     = true;
     uint8_t zero_int32[4] = {0, 0, 0, 0};
     esp_err_t e = xvf3800_xmos_write(XVF_RESID_PP, XVF_CMD_PP_AGCONOFF, zero_int32, 4);
+    char line[160];
     if (e == ESP_OK) {
         ESP_LOGI(TAG, "agc_freeze: PP_AGCONOFF=0 OK after %ds (quiet=%d/%d, cap=%ds)",
                  total_seconds, quiet_seconds, QUIET_SECONDS_NEEDED, MAX_WAIT_SECONDS);
+        snprintf(line, sizeof(line),
+                 "[agc] freeze ok waited=%ds quiet=%d/%d capped=%d rms=%u",
+                 total_seconds, quiet_seconds, QUIET_SECONDS_NEEDED,
+                 capped ? 1 : 0, (unsigned)rms_at_freeze);
     } else {
         ESP_LOGW(TAG, "agc_freeze: PP_AGCONOFF write failed (%s)", esp_err_to_name(e));
+        snprintf(line, sizeof(line),
+                 "[agc] freeze FAILED (%s) waited=%ds quiet=%d/%d capped=%d rms=%u",
+                 esp_err_to_name(e), total_seconds, quiet_seconds,
+                 QUIET_SECONDS_NEEDED, capped ? 1 : 0, (unsigned)rms_at_freeze);
     }
+    {
+        char tagged[224];
+        snprintf(tagged, sizeof(tagged), "%s reason=%s rearms=%u",
+                 line, reason ? reason : "boot", (unsigned)s_agc_rearm_count);
+        oe_udplog_send(tagged);
+    }
+}
+
+static void agc_freeze_task(void *arg)
+{
+    agc_wait_quiet_and_freeze("boot");
     vTaskDelete(NULL);
+}
+
+// Re-arm: let the XVF AGC adapt again, then re-freeze on the same quiet
+// criteria as boot. This is the whole point of the self-heal — the boot freeze
+// is a one-shot gamble on whatever the room was doing at startup, and an OTA
+// or a power blip re-rolls it. Without a way to redo it, a device that locked
+// low stays deaf until someone thinks to reboot it in a quiet room.
+//
+// The cost is real and bounded: while AGC adapts, its spectral re-shaping is
+// exactly what the wake models don't recognize, so detection is degraded for
+// the adapt window. That is why this only runs on sustained evidence of
+// starvation, never during playback or a live turn, and no more than once
+// per AGC_REARM_MIN_INTERVAL_US.
+static void agc_rearm_task(void *arg)
+{
+    s_agc_rearm_count++;
+    s_agc_last_rearm_us = esp_timer_get_time();
+
+    uint8_t one_int32[4] = {1, 0, 0, 0};
+    esp_err_t e = xvf3800_xmos_write(XVF_RESID_PP, XVF_CMD_PP_AGCONOFF, one_int32, 4);
+    if (e != ESP_OK) {
+        char l[128];
+        snprintf(l, sizeof(l), "[agc] rearm ABORTED — AGCONOFF=1 failed (%s)",
+                 esp_err_to_name(e));
+        ESP_LOGW(TAG, "%s", l);
+        oe_udplog_send(l);
+        s_agc_rearm_inflight = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    oe_udplog_send("[agc] rearm — AGC adapting, detection degraded until re-freeze");
+    // Give the AGC time to actually climb back to a quiet-room gain before we
+    // start counting quiet seconds; freezing the instant it re-enables would
+    // just relock the same starved coefficient we are trying to escape.
+    vTaskDelay(pdMS_TO_TICKS(4000));
+
+    agc_wait_quiet_and_freeze("starved");
+    s_agc_rearm_inflight = false;
+    vTaskDelete(NULL);
+}
+
+// udplog with an explicit turn id appended. The server's turn journal keys on
+// the device-minted turn_id, so tagging the device-side turn path lets a
+// verdict here be joined to the outcome there instead of matched by timestamp
+// — which is guesswork the moment two turns overlap or a retry lands.
+static void udplog_turn(const char *msg, const char *turn_id)
+{
+    char line[224];
+    snprintf(line, sizeof(line), "%s turn=%s",
+             msg, (turn_id && turn_id[0]) ? turn_id : "-");
+    oe_udplog_send(line);
 }
 
 dev_config_t g_dev_config = {0};
@@ -775,6 +894,23 @@ static volatile uint8_t s_followup_slot = 0;
 // only grazes 800k triggers a word late. A too-eager trigger is cheap — the
 // capture just ends as no-speech / an empty transcript apology.
 #define FOLLOWUP_TRIGGER_ENERGY 300000
+// The VAD's speech floor was a fixed VOICE_ENERGY_THRESHOLD, which is a bet
+// that every room's noise sits well below one constant. Measured 2026-08-09 in
+// the Kitchen at 6am — nominally a quiet room — peak frame energy inside a
+// listening window reached 719799 against the 800000 floor: 90% of the way to
+// being scored as speech. In that room a softly-spoken command is already
+// under the bar, and "it cut me off mid-sentence" is what that feels like.
+//
+// So derive the floor from the same idle-room EMA the follow-up trigger uses,
+// and CLAMP IT TO THE OLD CONSTANT AT THE TOP. That bound is deliberate: the
+// threshold can only move DOWN from today's behaviour, never up. A quiet room
+// gets a lower bar (soft speech is heard); a noisy room gets exactly what it
+// got before. Whatever this changes, it cannot make the device less willing to
+// hear you than it already is — which is the only direction with a live
+// complaint attached.
+#define VAD_FLOOR_MULT      8
+#define VAD_ENERGY_MIN      200000               // ≈ -37 dBFS; below this is room tone
+#define VAD_ENERGY_MAX      VOICE_ENERGY_THRESHOLD
 // …cheap in a QUIET room. Near speakers the fixed 300k answered the TV:
 // dialog/music bleed sits above 300k, every window fired on it, and STT
 // happily transcribed the TV line as the user's answer. So the effective
@@ -857,6 +993,27 @@ static bool doa_gate_allows(const char *what)
     return false;
 }
 static vad_state_t *s_vad = NULL;
+
+// Arm the VAD for a new utterance: recompute the speech floor from the room's
+// learned idle energy, then reset. The threshold is recomputed ONLY here, so
+// it can never shift under a capture already in progress — a floor that moved
+// mid-sentence would end the turn on its own arithmetic rather than on the
+// user having stopped talking.
+//
+// Before the room floor has been learned (s_room_floor == 0, first seconds
+// after boot) we keep the historical constant rather than guessing low.
+static void vad_arm(void)
+{
+    uint32_t thr = VOICE_ENERGY_THRESHOLD;
+    if (s_room_floor > 0) {
+        uint64_t t = (uint64_t)s_room_floor * VAD_FLOOR_MULT;
+        if (t < VAD_ENERGY_MIN) t = VAD_ENERGY_MIN;
+        if (t > VAD_ENERGY_MAX) t = VAD_ENERGY_MAX;
+        thr = (uint32_t)t;
+    }
+    vad_set_energy_threshold(s_vad, thr);
+    vad_reset(s_vad);
+}
 static QueueHandle_t s_sentence_q = NULL;
 
 // Pre-roll: a rolling window of the most recent mic audio, kept while idle so
@@ -3814,9 +3971,10 @@ static vad_end_reason_t vg_provisional_step(const int16_t *frame, size_t n)
     }
 
     if (eff != OE_VERIFY_ACCEPT) {
-        oe_udplog_send(eff == OE_VERIFY_REJECT
-                           ? "[verify] reject — fire dropped silently"
-                           : "[verify] error — fire dropped fail-closed");
+        udplog_turn(eff == OE_VERIFY_REJECT
+                        ? "[verify] reject — fire dropped silently"
+                        : "[verify] error — fire dropped fail-closed",
+                    s_prov_turn_id);
         // Optimistic-ack retract: the LED flashed LISTENING at the fire; pull
         // it back to IDLE now that the gate did not accept (leave mute/alarm
         // visuals to their own owners).
@@ -3905,7 +4063,9 @@ static vad_end_reason_t vg_provisional_step(const int16_t *frame, size_t n)
     s_prov_vad_end = VAD_END_NONE;
     s_prov_turn_id[0] = 0;
     s_verify_cancelled = false;
-    oe_udplog_send("[verify] accept — turn proceeds");
+    // s_prov_turn_id was cleared just above; by here vg_accept_identity() has
+    // promoted it, so s_turn_id is the id the server will journal this under.
+    udplog_turn("[verify] accept — turn proceeds", s_turn_id);
     return accepted_end;
 }
 
@@ -4210,7 +4370,7 @@ static void capture_and_drive_task(void *arg)
                         oe_udplog_send("[barge] speech confirmed — capturing");
                         s_barge_state = BARGE_NONE;
                         s_barge_capture = true;
-                        vad_reset(s_vad);
+                        vad_arm();
                         // Prepend everything from just BEFORE the candidate
                         // (BARGE_PREROLL_LEAD_MS covers the trigger frames +
                         // the sub-threshold onset ramp) through now. Field
@@ -4279,7 +4439,7 @@ static void capture_and_drive_task(void *arg)
                         // posting it. Replaying makes the word that already
                         // happened count, so 500 ms of live silence then closes
                         // the utterance normally and stage C gets a transcript.
-                        vad_reset(s_vad);
+                        vad_arm();
                         bool preroll_had_speech = false;
                         for (size_t off = 0; off + WW_FRAME_SAMPLES <= s_capture_used;
                              off += WW_FRAME_SAMPLES) {
@@ -4603,7 +4763,7 @@ static void capture_and_drive_task(void *arg)
                     mint_turn_id();
                     s_prov_identity_valid = false;
                 }
-                vad_reset(s_vad);
+                vad_arm();
                 s_capture_used = 0;
                 capture_sat_logged = false;
                 if (fired_from_followup) {
@@ -4625,7 +4785,7 @@ static void capture_and_drive_task(void *arg)
                     s_verify_win_len = s_verify_pre_len;
                     s_prov_vad_end = VAD_END_NONE;
                     s_prov_state = PROV_FILL_TAIL;
-                    oe_udplog_send("[verify] provisional — capturing wake window");
+                    udplog_turn("[verify] provisional — capturing wake window", s_prov_turn_id);
                 } else {
                     // Gate explicitly disabled, or intentional follow-up/alarm
                     // bypass: original immediate path.
@@ -4686,8 +4846,31 @@ static void capture_and_drive_task(void *arg)
                 }
                 vad_feed(s_vad, frame, n, &end_reason);
             }
+            vad_utterance_stats_t utt = {0};
             if (end_reason != VAD_END_NONE) {
                 s_in_utterance = false;
+                vad_get_utterance_stats(s_vad, &utt);
+
+                // Every utterance end, with the evidence for WHY it ended.
+                // end=silence with speech_ms far below ms, or peak_e close to
+                // thr, is the signature of "it cut me off mid-sentence": the
+                // VAD's speech floor is absolute, so any drop in mic gain
+                // walks ordinary speech down toward it and ordinary pauses
+                // start terminating turns. Logged for all three reasons so the
+                // ratio between them is countable, not anecdotal.
+                {
+                    char ul[192];
+                    snprintf(ul, sizeof(ul),
+                             "[stt] utt end=%s turn=%s ms=%lu speech_ms=%lu "
+                             "peak_e=%lu thr=%lu samples=%lu",
+                             vad_end_reason_name(end_reason),
+                             s_turn_id[0] ? s_turn_id : "-",
+                             (unsigned long)utt.total_ms, (unsigned long)utt.speech_ms,
+                             (unsigned long)utt.peak_energy, (unsigned long)utt.threshold,
+                             (unsigned long)s_capture_used);
+                    ESP_LOGI(TAG, "%s", ul);
+                    oe_udplog_send(ul);
+                }
 
                 if (end_reason == VAD_END_NO_SPEECH) {
                     if (s_stt_streaming) {
@@ -4695,7 +4878,10 @@ static void capture_and_drive_task(void *arg)
                         // drop the accumulated session (it would TTL out
                         // anyway; this is just prompt cleanup).
                         s_stt_streaming = false;
-                        oe_ws_send_stt_abort(s_turn_id);
+                        oe_ws_send_stt_abort_full(s_turn_id,
+                                                  vad_end_reason_name(end_reason),
+                                                  utt.speech_ms, utt.peak_energy,
+                                                  utt.threshold);
                     }
                     if (s_barge_capture) {
                         // Confirmed energy but no sustained speech followed —
@@ -4737,7 +4923,10 @@ static void capture_and_drive_task(void *arg)
                     bool stream_clean = !s_stt_send_failed;
                     s_stt_streaming = false;
                     if (stream_clean &&
-                        oe_ws_send_stt_end(s_turn_id, (uint32_t)s_capture_used) == ESP_OK) {
+                        oe_ws_send_stt_end(s_turn_id, (uint32_t)s_capture_used,
+                                           vad_end_reason_name(end_reason),
+                                           utt.speech_ms, utt.peak_energy,
+                                           utt.threshold) == ESP_OK) {
                         s_capture_used = 0;
                         continue;
                     }
@@ -5665,6 +5854,9 @@ static void heartbeat_task(void *arg)
     uint32_t prev_decode_errs = 0;
     uint32_t prev_tick_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     uint32_t prev_cap_samples = audio_io_get_capture_samples_total();
+    // Consecutive heartbeat windows that contained speech but produced starved
+    // features. Drives the AGC self-heal below.
+    int starved_windows = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
         {
@@ -5702,6 +5894,95 @@ static void heartbeat_task(void *arg)
                      (unsigned long)audio_io_get_playback_drop_samples());
             ESP_LOGI(TAG, "%s", hbline);
             oe_udplog_send(hbline);
+        }
+        {
+            // Wake-detector telemetry, drained on this same 10 s tick (the
+            // heartbeat is the sole resetter of the stats window).
+            //
+            // audio_lvl/feat_max localize a starved capture path: the mic can
+            // be alive (cap_sps ~16000 above) while the level sitting under it
+            // is too low for the frontend to build a confident score — the
+            // AGC-freeze failure mode, where the XVF gain got locked while the
+            // room was noisy and stays low until the next reboot.
+            //
+            // peak= is the highest sliding-window probability per loaded slot
+            // over the interval. It is the only view of NEAR-MISSES that
+            // exists: wake_avg_prob reaches the server only when a fire clears
+            // the cutoff, so a word that peaked just under it is currently
+            // indistinguishable from never having been spoken. Sensitivity
+            // cannot be tuned honestly without this number.
+            int lvl = 0, fmax = INT8_MIN;
+            uint32_t slices = 0, scored = 0, gated = 0;
+            char peaks[96];
+            int poff = 0;
+            peaks[0] = '\0';
+            for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i) {
+                if (!s_ww[i]) continue;
+                wakeword_stats_t st;
+                wakeword_read_stats(s_ww[i], &st);
+                // Every slot sees the same capture buffer, so reduce the audio
+                // gauges across slots rather than printing N copies; an
+                // unloaded slot contributes zeros and loses the max.
+                if (st.audio_lvl > lvl) lvl = st.audio_lvl;
+                if (st.feat_max > fmax) fmax = st.feat_max;
+                if (st.slices > slices) slices = st.slices;
+                scored += st.scored_windows;
+                gated  += st.gated_windows;
+                int w = snprintf(peaks + poff, sizeof(peaks) - (size_t)poff,
+                                 " s%u=%u", (unsigned)i, (unsigned)st.peak_avg_prob);
+                if (w <= 0 || (size_t)w >= sizeof(peaks) - (size_t)poff) break;
+                poff += w;
+            }
+            if (poff > 0) {
+                char wline[288];
+                snprintf(wline, sizeof(wline),
+                         "[hb] wake audio_lvl=%d feat_max=%d slices=%lu scored=%lu gated=%lu peak:%s"
+                         " agc=%s waited=%lus rms=%lu rearms=%lu starved=%d",
+                         lvl, (int)fmax, (unsigned long)slices,
+                         (unsigned long)scored, (unsigned long)gated, peaks,
+                         !s_agc_freeze_done ? "pending"
+                                            : (s_agc_freeze_capped ? "capped" : "ok"),
+                         (unsigned long)s_agc_freeze_waited_s,
+                         (unsigned long)s_agc_freeze_rms,
+                         (unsigned long)s_agc_rearm_count,
+                         starved_windows);
+                ESP_LOGI(TAG, "%s", wline);
+                oe_udplog_send(wline);
+            }
+
+            // Self-heal watchdog. Speech-level input that never lifts the
+            // features into the healthy band means the frozen gain is too low
+            // for this room — the failure the boot-time gamble produces and
+            // that nothing else recovers from short of a manual reboot.
+            //
+            // Only windows that CONTAIN speech vote. A quiet window says
+            // nothing about the gain (low features are correct when there is
+            // nothing to hear), so it neither accuses nor exonerates; letting
+            // it reset the counter would make the check unable to fire in a
+            // room where speech is sparse, which is every real room.
+            if (poff > 0 && lvl > AGC_SPEECH_LVL_MIN) {
+                if (fmax < AGC_STARVED_FEAT_MAX) starved_windows++;
+                else starved_windows = 0;   // healthy speech clears suspicion
+            }
+            if (starved_windows >= AGC_STARVED_WINDOWS &&
+                s_agc_freeze_done && !s_agc_rearm_inflight &&
+                !audio_io_playback_active() && !airplay_is_streaming() &&
+                !s_awaiting_reply && !s_in_utterance &&
+                (s_agc_last_rearm_us == 0 ||
+                 esp_timer_get_time() - s_agc_last_rearm_us > AGC_REARM_MIN_INTERVAL_US)) {
+                starved_windows = 0;
+                s_agc_rearm_inflight = true;
+                char rl[160];
+                snprintf(rl, sizeof(rl),
+                         "[agc] starvation detected (audio_lvl=%d feat_max=%d) — re-arming",
+                         lvl, (int)fmax);
+                ESP_LOGW(TAG, "%s", rl);
+                oe_udplog_send(rl);
+                if (xTaskCreate(agc_rearm_task, "agc_rearm", 3072, NULL, 4, NULL) != pdPASS) {
+                    s_agc_rearm_inflight = false;
+                    oe_udplog_send("[agc] rearm task spawn failed");
+                }
+            }
         }
         if ((n % 6) == 0) {
             char line[256];
