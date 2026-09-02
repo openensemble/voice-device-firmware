@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify captive-portal request-header budget
+        run: python3 tests/check_captive_portal_header_budget.py
+
       - name: ESP-IDF build (esp32s3)
         uses: espressif/esp-idf-ci-action@v1
         with:
