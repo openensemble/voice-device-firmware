@@ -95,10 +95,9 @@ bool StreamingModel::load_model_() {
     }
 
     TfLiteTensor *input = this->interpreter_->input(0);
-    if ((input->dims->size != 3) || (input->dims->data[0] != 1) ||
+    if (!input || !input->dims || (input->dims->size != 3) || (input->dims->data[0] != 1) ||
         (input->dims->data[2] != PREPROCESSOR_FEATURE_SIZE)) {
-      ESP_LOGE(TAG, "input tensor shape unexpected (size=%d, dims=[%d,%d,%d])",
-               input->dims->size, input->dims->data[0], input->dims->data[1], input->dims->data[2]);
+      ESP_LOGE(TAG, "input tensor shape unexpected");
       this->interpreter_.reset();
       return false;
     }
@@ -108,7 +107,7 @@ bool StreamingModel::load_model_() {
       return false;
     }
     TfLiteTensor *output = this->interpreter_->output(0);
-    if ((output->dims->size != 2) || (output->dims->data[0] != 1) || (output->dims->data[1] != 1)) {
+    if (!output || !output->dims || (output->dims->size != 2) || (output->dims->data[0] != 1) || (output->dims->data[1] != 1)) {
       ESP_LOGE(TAG, "output tensor dim not 1x1");
       this->interpreter_.reset();
       return false;

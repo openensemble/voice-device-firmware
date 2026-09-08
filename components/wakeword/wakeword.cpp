@@ -39,6 +39,8 @@
 #include "upstream/streaming_model.h"
 
 #include "cJSON.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "flatbuffers/verifier.h"
 
 extern "C" {
 #include <frontend.h>
@@ -241,15 +243,13 @@ static bool normalize_wake_slug(const char *wake_word, char *out, size_t out_len
     return used > 0;
 }
 
-static bool read_slot_manifest(uint8_t slot, slot_manifest_t *m) {
+static bool read_slot_manifest(uint8_t slot, const char *path, slot_manifest_t *m) {
     // Defaults match okay_nabu (matches the comment block at file head).
     m->probability_cutoff = WW_DEFAULT_PROBABILITY_CUTOFF;
     m->sliding_window_size = WW_DEFAULT_SLIDING_WINDOW;
     m->tensor_arena_size  = WW_DEFAULT_TENSOR_ARENA;
     m->wake_slug[0] = '\0';
 
-    char path[64];
-    snprintf(path, sizeof(path), "/ww/slot%u.json", (unsigned) slot);
     FILE *f = fopen(path, "rb");
     if (!f) {
         ESP_LOGE(TAG, "no manifest at %s — wake identity unavailable", path);
@@ -312,9 +312,7 @@ static bool read_slot_manifest(uint8_t slot, slot_manifest_t *m) {
     return true;
 }
 
-static esp_err_t load_model_file(uint8_t slot, uint8_t **out_buf, size_t *out_len) {
-    char path[64];
-    snprintf(path, sizeof(path), "/ww/slot%u.tflite", (unsigned) slot);
+static esp_err_t load_model_file(uint8_t slot, const char *path, uint8_t **out_buf, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         ESP_LOGE(TAG, "wake-word slot %u not found at %s", slot, path);
@@ -333,86 +331,85 @@ static esp_err_t load_model_file(uint8_t slot, uint8_t **out_buf, size_t *out_le
     size_t r = fread(buf, 1, len, f);
     fclose(f);
     if (r != (size_t) len) { heap_caps_free(buf); return ESP_FAIL; }
+    flatbuffers::Verifier verifier(buf, (size_t)len);
+    if (!tflite::VerifyModelBuffer(verifier)) {
+        heap_caps_free(buf);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const auto *schema = tflite::GetModel(buf);
+    if (!schema->subgraphs() || schema->subgraphs()->size() == 0 ||
+        !schema->subgraphs()->Get(0)->inputs() || schema->subgraphs()->Get(0)->inputs()->size() == 0 ||
+        !schema->subgraphs()->Get(0)->outputs() || schema->subgraphs()->Get(0)->outputs()->size() == 0) {
+        heap_caps_free(buf);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     *out_buf = buf;
     *out_len = (size_t) len;
     return ESP_OK;
 }
 
+// Build and validate independently of the live detector. A rejected upload
+// must never release its working model/arena or leave the slot unloaded.
+static esp_err_t prepare_model(uint8_t slot, const char *model_path,
+                               const char *manifest_path,
+                               std::unique_ptr<WakeWordModel> &model,
+                               uint8_t **bytes, size_t *length) {
+    slot_manifest_t manifest;
+    if (!read_slot_manifest(slot, manifest_path, &manifest) ||
+        manifest.sliding_window_size > 1024 || manifest.tensor_arena_size > 1024 * 1024)
+        return ESP_ERR_INVALID_RESPONSE;
+    esp_err_t e = load_model_file(slot, model_path, bytes, length);
+    if (e != ESP_OK) return e;
+    char id[16];
+    snprintf(id, sizeof(id), "slot%u", (unsigned)slot);
+    model.reset(new (std::nothrow) WakeWordModel(
+        std::string(id), *bytes, manifest.probability_cutoff,
+        manifest.sliding_window_size, std::string(manifest.wake_slug),
+        manifest.tensor_arena_size, true));
+    int8_t features[PREPROCESSOR_FEATURE_SIZE] = {0};
+    if (!model || !model->perform_streaming_inference(features)) {
+        if (model) { model->unload_model(); model.reset(); }
+        heap_caps_free(*bytes);
+        *bytes = nullptr;
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    model->reset_probabilities();
+    return ESP_OK;
+}
+
+esp_err_t wakeword_validate_files(uint8_t slot, const char *model_path, const char *manifest_path) {
+    std::unique_ptr<WakeWordModel> model;
+    uint8_t *bytes = nullptr;
+    size_t length = 0;
+    esp_err_t e = prepare_model(slot, model_path, manifest_path, model, &bytes, &length);
+    if (model) { model->unload_model(); model.reset(); }
+    if (bytes) heap_caps_free(bytes);
+    return e;
+}
+
 esp_err_t wakeword_load_slot(wakeword_t *ww, uint8_t slot) {
     if (!ww) return ESP_ERR_INVALID_ARG;
-    // Block the audio task from touching the interpreter while we tear it
-    // down + rebuild it. Worst-case wait is one slice (~10 ms inference).
+    char model_path[64], manifest_path[64];
+    snprintf(model_path, sizeof(model_path), "/ww/slot%u.tflite", (unsigned)slot);
+    snprintf(manifest_path, sizeof(manifest_path), "/ww/slot%u.json", (unsigned)slot);
+    std::unique_ptr<WakeWordModel> next;
+    uint8_t *bytes = nullptr;
+    size_t length = 0;
+    esp_err_t e = prepare_model(slot, model_path, manifest_path, next, &bytes, &length);
+    if (e != ESP_OK) return e;
+
     xSemaphoreTake(ww->model_mutex, portMAX_DELAY);
-
-    // A model without a valid manifest wake_word cannot be verified. Parse the
-    // complete <=4 KB manifest before tearing down the currently-live model so
-    // a malformed hot-swap cannot replace a working slot with an ungateable one.
-    slot_manifest_t manifest;
-    if (!read_slot_manifest(slot, &manifest)) {
-        xSemaphoreGive(ww->model_mutex);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    if (ww->model) {
-        ww->model->unload_model();
-        ww->model.reset();
-    }
-    if (ww->model_buf) {
-        heap_caps_free(ww->model_buf);
-        ww->model_buf = nullptr;
-        ww->model_len = 0;
-    }
-
-    esp_err_t e = load_model_file(slot, &ww->model_buf, &ww->model_len);
-    if (e != ESP_OK) {
-        xSemaphoreGive(ww->model_mutex);
-        return e;
-    }
-
-    // The model id stays slot-scoped, while the wake identity comes only from
-    // manifest.wake_word. Model filenames are packaging details and are not a
-    // verifier contract.
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "slot%u", (unsigned) slot);
-
-    // Exceptions are disabled in ESP-IDF, so plain `new` here. The vector
-    // resize() inside the ctor cannot recover from OOM with -fno-exceptions
-    // and will abort the system, but that is consistent with how every other
-    // OOM in this firmware is handled (we don't try to limp on after a heap
-    // exhaustion early in boot).
-    ww->model.reset(new (std::nothrow) WakeWordModel(
-        std::string(id_buf),
-        ww->model_buf,
-        manifest.probability_cutoff,
-        manifest.sliding_window_size,
-        std::string(manifest.wake_slug),
-        manifest.tensor_arena_size,
-        /*default_enabled=*/true));
-    if (!ww->model) {
-        ESP_LOGE(TAG, "WakeWordModel alloc failed");
-        heap_caps_free(ww->model_buf);
-        ww->model_buf = nullptr;
-        ww->model_len = 0;
-        xSemaphoreGive(ww->model_mutex);
-        return ESP_ERR_NO_MEM;
-    }
-
-    ww->model->log_model_config();
-    int8_t zero_features[PREPROCESSOR_FEATURE_SIZE] = {0};
-    if (!ww->model->perform_streaming_inference(zero_features)) {
-        ESP_LOGE(TAG, "slot %u model validation failed", slot);
-        ww->model->unload_model();
-        ww->model.reset();
-        heap_caps_free(ww->model_buf);
-        ww->model_buf = nullptr;
-        ww->model_len = 0;
-        xSemaphoreGive(ww->model_mutex);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    ww->model->reset_probabilities();
+    // Readers see either complete model generation; all fallible work above
+    // happens before taking ownership from the previous one.
+    if (ww->model) { ww->model->unload_model(); ww->model.reset(); }
+    if (ww->model_buf) heap_caps_free(ww->model_buf);
+    ww->model = std::move(next);
+    ww->model_buf = bytes;
+    ww->model_len = length;
     ww->active_slot = slot;
-    ESP_LOGI(TAG, "slot %u loaded (%u bytes)", slot, (unsigned) ww->model_len);
+    FrontendReset(&ww->frontend_state);
     xSemaphoreGive(ww->model_mutex);
+    ESP_LOGI(TAG, "slot %u loaded (%u bytes)", slot, (unsigned)length);
     return ESP_OK;
 }
 

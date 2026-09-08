@@ -287,6 +287,8 @@ static void send_auth(void)
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "auth");
     cJSON_AddStringToObject(o, "token", s_token);
+    cJSON *caps = cJSON_AddArrayToObject(o, "caps");
+    cJSON_AddItemToArray(caps, cJSON_CreateString("scheduled_alarms"));
     // PROJECT_VER from CMakeLists.txt -> baked into esp_app_desc -> here.
     // Server stores this on voice-devices.json and uses it to decide whether
     // an OTA is needed (and to display the current version in the UI).
@@ -768,6 +770,21 @@ static esp_err_t send_alarm_ack(const char *type, const char *alarm_id)
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", type);
     cJSON_AddStringToObject(o, "id", alarm_id);
+    esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
+    cJSON_Delete(o);
+    return err;
+}
+
+esp_err_t oe_ws_send_alarm_armed(const char *alarm_id, esp_err_t result)
+{
+    if (!oe_ws_connected()) return ESP_ERR_INVALID_STATE;
+    if (!alarm_id) return ESP_ERR_INVALID_ARG;
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return ESP_ERR_NO_MEM;
+    cJSON_AddStringToObject(o, "type", "alarm_armed");
+    cJSON_AddStringToObject(o, "id", alarm_id);
+    cJSON_AddBoolToObject(o, "ok", result == ESP_OK);
+    if (result != ESP_OK) cJSON_AddStringToObject(o, "error", esp_err_to_name(result));
     esp_err_t err = ws_send_json(o, pdMS_TO_TICKS(1000));
     cJSON_Delete(o);
     return err;

@@ -1,6 +1,9 @@
 #include "captive_portal.h"
 
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include "cJSON.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -18,6 +21,19 @@ static captive_submit_callback_t s_cb = NULL;
 static void *s_cb_user = NULL;
 static bool s_running = false;
 static TaskHandle_t s_dns_task = NULL;
+static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_pairing = false;
+static bool s_paired = false;
+static char s_message[192] = "";
+
+void captive_portal_set_result(bool paired, const char *message)
+{
+    portENTER_CRITICAL(&s_status_mux);
+    s_pairing = false;
+    s_paired = paired;
+    snprintf(s_message, sizeof(s_message), "%s", message ? message : "");
+    portEXIT_CRITICAL(&s_status_mux);
+}
 
 static const char INDEX_HTML[] =
 "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -28,17 +44,44 @@ static const char INDEX_HTML[] =
 "button{margin-top:1.5em;width:100%;padding:.8em;font-size:1em;background:#1769ff;color:#fff;border:0;border-radius:4px}"
 "h1{font-size:1.2em}</style></head><body>"
 "<h1>Pair this voice device with OpenEnsemble</h1>"
-"<form action='/submit' method='POST'>"
-"<label>Wi-Fi network<input name=ssid required></label>"
-"<label>Wi-Fi password<input name=password type=password></label>"
-"<label>OE server URL<input name=server_url placeholder='https://your-oe.example' required></label>"
+"<form id=setup action='/submit' method='POST'>"
+"<label>Wi-Fi network<input name=ssid required maxlength=32></label>"
+"<label>Wi-Fi password<input name=password type=password maxlength=63></label>"
+"<label>OE server URL<input name=server_url placeholder='https://your-oe.example' required maxlength=255></label>"
 "<label>Pairing code (from OE Settings)<input name=pair_code required maxlength=8></label>"
-"<label>Device name<input name=device_name placeholder='Kitchen speaker'></label>"
-"<button>Pair</button></form></body></html>";
+"<label>Device name<input name=device_name placeholder='Kitchen speaker' maxlength=63></label>"
+"<button id=pair>Pair</button></form><p id=status role=status aria-live=polite></p>"
+"<script>const f=document.getElementById('setup'),b=document.getElementById('pair'),s=document.getElementById('status');"
+"let watching=false;async function poll(){if(!watching)return;try{const r=await fetch('/status',{cache:'no-store'});"
+"const d=await r.json();s.textContent=d.message;if(!d.pairing){watching=false;b.disabled=d.paired;return;}}"
+"catch(e){s.textContent='Reconnecting to setup. Stay connected to this device Wi-Fi.';}setTimeout(poll,750);}"
+"f.addEventListener('submit',async e=>{e.preventDefault();b.disabled=true;s.textContent='Connecting and pairing…';"
+"try{const r=await fetch('/submit',{method:'POST',body:new URLSearchParams(new FormData(f))});"
+"if(!r.ok)throw Error(await r.text());watching=true;poll();}catch(e){s.textContent=e.message;b.disabled=false;}});"
+"</script></body></html>";
 
-static const char DONE_HTML[] =
-"<!doctype html><body style='font-family:system-ui;padding:2em'>"
-"<h2>OK — pairing…</h2><p>This device will reboot and join your Wi-Fi.</p></body>";
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    char message[sizeof(s_message)];
+    bool pairing, paired;
+    portENTER_CRITICAL(&s_status_mux);
+    pairing = s_pairing;
+    paired = s_paired;
+    memcpy(message, s_message, sizeof(message));
+    portEXIT_CRITICAL(&s_status_mux);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "pairing", pairing);
+    cJSON_AddBoolToObject(j, "paired", paired);
+    cJSON_AddStringToObject(j, "message", message);
+    char *body = cJSON_PrintUnformatted(j);
+    cJSON_Delete(j);
+    if (!body) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t e = httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    free(body);
+    return e;
+}
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
@@ -78,10 +121,12 @@ static int find_field(const char *body, const char *key, char *out, size_t out_l
 static esp_err_t submit_handler(httpd_req_t *req)
 {
     char body[1024];
+    if (req->content_len == 0 || req->content_len >= sizeof(body))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid setup form size");
     int total = 0;
-    while (total < (int)sizeof(body) - 1) {
-        int got = httpd_req_recv(req, body + total, sizeof(body) - 1 - total);
-        if (got <= 0) break;
+    while (total < req->content_len) {
+        int got = httpd_req_recv(req, body + total, req->content_len - total);
+        if (got <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete setup form; retry");
         total += got;
     }
     body[total] = 0;
@@ -93,11 +138,22 @@ static esp_err_t submit_handler(httpd_req_t *req)
     find_field(body, "pair_code",   r.pair_code,   sizeof(r.pair_code));
     find_field(body, "device_name", r.device_name, sizeof(r.device_name));
 
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, DONE_HTML, sizeof(DONE_HTML) - 1);
-
+    if (!r.ssid[0] || strlen(r.ssid) > 32 || !r.server_url[0] || !r.pair_code[0])
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Network, server URL and pairing code are required");
+    portENTER_CRITICAL(&s_status_mux);
+    bool busy = s_pairing || s_paired;
+    if (!busy) {
+        s_pairing = true;
+        snprintf(s_message, sizeof(s_message), "Connecting to Wi-Fi and pairing with OE…");
+    }
+    portEXIT_CRITICAL(&s_status_mux);
+    if (busy) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "Pairing is already in progress");
+    }
     if (s_cb) s_cb(&r, s_cb_user);
-    return ESP_OK;
+    else captive_portal_set_result(false, "Pairing is unavailable. Restart the device and retry.");
+    return status_handler(req);
 }
 
 static void dns_hijack_task(void *arg)
@@ -157,12 +213,14 @@ esp_err_t captive_portal_start(const char *ap_ssid, captive_submit_callback_t cb
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_handler };
     httpd_uri_t sub  = { .uri = "/submit", .method = HTTP_POST, .handler = submit_handler };
+    httpd_uri_t status = { .uri = "/status", .method = HTTP_GET, .handler = status_handler };
     httpd_uri_t cap1 = { .uri = "/generate_204", .method = HTTP_GET, .handler = captive_redirect_handler };
     httpd_uri_t cap2 = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_handler };
     httpd_uri_t cap3 = { .uri = "/connectivity-check.html", .method = HTTP_GET, .handler = captive_redirect_handler };
     httpd_uri_t wild = { .uri = "/*", .method = HTTP_GET, .handler = captive_redirect_handler };
     httpd_register_uri_handler(s_httpd, &root);
     httpd_register_uri_handler(s_httpd, &sub);
+    httpd_register_uri_handler(s_httpd, &status);
     httpd_register_uri_handler(s_httpd, &cap1);
     httpd_register_uri_handler(s_httpd, &cap2);
     httpd_register_uri_handler(s_httpd, &cap3);

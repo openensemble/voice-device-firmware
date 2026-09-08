@@ -8,22 +8,11 @@
 /**
  * Device-side alarm system.
  *
- * Owns the local alarm registry (in PSRAM + persisted in NVS), schedules
- * esp_timers against wall-clock epoch ms (requires SNTP-synced time), and
- * plays the chime+TTS ring cycle until dismissed.
- *
- * v1 scope:
- *   - Timer alarms (server pushes a trigger_at_ms + pre-synthesized
- *     announcement MP3 cached server-side; device fetches once and stores
- *     in PSRAM).
- *   - Audio buffer is RAM-only; reboot loses it but NVS metadata survives,
- *     so post-reboot alarms ring chime-only ("user infers from context").
- *
- * Out of scope for v1 (deferred):
- *   - Wall-clock alarms ("wake me at 7am") — same machinery, no TTS, future.
- *   - User-uploaded chime via LittleFS — defaults to built-in tone for now.
- *   - Multi-alarm combined audio sequencing — v1 plays each alarm's audio
- *     in sequence within a ring cycle.
+ * Owns a registry persisted in NVS and schedules esp_timers. Server-provided
+ * relative delays use the monotonic clock immediately; restoring deadlines
+ * after reboot requires SNTP. Audio is RAM-only, so restored alarms use the
+ * built-in or uploaded chime. Completed IDs are retained for at least two
+ * hours after their deadline/dismissal to make reconnect replay idempotent.
  */
 
 // Called once at boot, AFTER nvs_flash_init. Loads any alarms persisted in
@@ -34,8 +23,8 @@ esp_err_t alarm_init(void);
 
 // Arm a new alarm. Called from main.c's WS event dispatcher when an
 // alarm_arm payload arrives. Stores in NVS + schedules esp_timer. The audio
-// buffer is copied into PSRAM and owned by the alarm subsystem from here
-// on; the caller must NOT free it.
+// buffer's ownership transfers on every return path, including failures;
+// the caller must NOT free it. Repeated IDs preserve their original countdown.
 //
 // trigger_at_ms is wall-clock epoch milliseconds. If it's already past
 // when this is called (e.g. reboot replay), the alarm fires immediately.
@@ -46,8 +35,14 @@ esp_err_t alarm_arm(const char *id,
                     size_t audio_mp3_len,
                     const char *type);
 
-// Cancel a pending alarm by id. No-op if not found. Stops the ring loop
-// if this alarm was currently firing.
+// Relative delay from authenticated server time; -1 retains the legacy
+// wall-clock path. Ownership of audio is transferred even on failure.
+esp_err_t alarm_arm_with_delay(const char *id, const char *label, int64_t trigger_at_ms,
+                    uint8_t *audio_mp3, size_t audio_mp3_len, const char *type, int64_t delay_ms);
+
+// Cancel an alarm by id, including one whose arm worker has not arrived yet.
+// Stops its ring loop and persists a completion record before acknowledging.
+// Returns an error if persistence or completion-record capacity is unavailable.
 esp_err_t alarm_disarm(const char *id);
 
 // Stop currently-firing alarm(s). If id is non-NULL, stops only that one;
@@ -58,15 +53,15 @@ void alarm_stop(const char *id);
 // this to decide whether to treat a wake fire as a local dismiss.
 bool alarm_is_firing(void);
 
-// Re-send alarm_fired for every currently-ringing alarm. Call on WS
+// Re-send alarm_fired and durable local dismissals after authenticated WS
 // (re)connect: alarm_fired is fire-and-forget, so a WS blip at the fire
 // instant otherwise leaves the server thinking the alarm never rang.
 // Idempotent server-side.
 void alarm_resend_fired(void);
 
 // Local dismiss path — invoked by the wake handler when wake fires while
-// alarm_is_firing() is true. Stops the ring, sends alarm_acked over WS,
-// removes the alarm(s) from NVS, and suppresses the normal STT/utterance
+// alarm_is_firing() is true. Stops the ring, sends alarm_acked after committing
+// the dismissal to NVS, and suppresses the normal STT/utterance
 // pipeline for this wake event (returns true if a dismiss happened so the
 // caller knows to suppress the rest of the wake flow).
 bool alarm_handle_local_dismiss(void);

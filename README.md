@@ -29,8 +29,12 @@ you only need this repo to hack on the firmware itself. Overview:
   the WS and played out the speaker. Barge-in works during playback.
 - **AirPlay 1 receiver** — stream music to the device from iOS/macOS;
   wake words stay live during playback.
-- **Alarms & timers** — armed device-side so they fire even if Wi-Fi is down,
-  with a server watchdog fallback.
+- **Alarms & timers** — compatible OE versions send the future deadline and
+  wait for durable device acknowledgment. Up to eight armed alarms can ring
+  through a Wi-Fi/server outage using the local monotonic clock. After a
+  reboot, persisted deadlines require wall-clock synchronization; a cold boot
+  without network time cannot recover elapsed time. Cancellation and local
+  dismissal reconcile on the next authenticated connection.
 - **Ambient audio, volume/pause voice intents, headphone/line-out mode.**
 - **OTA updates** — server-driven `esp_https_ota` with dual app slots.
 - **First-boot captive portal** — the device comes up as a Wi-Fi AP; a small

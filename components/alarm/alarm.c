@@ -17,6 +17,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/time.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -48,6 +49,8 @@
 static const char *TAG = "alarm";
 
 #define ALARM_MAX           8
+#define ALARM_DONE_MAX      64
+#define DONE_RETENTION_MS   (2LL * 60 * 60 * 1000)
 #define NVS_NS              "alarms"
 #define NVS_KEY             "all"
 #define RING_CYCLE_MS       5500
@@ -66,6 +69,7 @@ typedef struct {
     char label[64];
     char type[16];
     int64_t trigger_at_ms;
+    int64_t monotonic_due_us; // relative deadlines work even before SNTP
     uint8_t *audio_mp3;       // PSRAM, may be NULL post-reboot or wallclock-type
     size_t audio_mp3_len;
     esp_timer_handle_t timer;
@@ -77,6 +81,69 @@ typedef struct {
 
 static alarm_entry_t s_alarms[ALARM_MAX];
 static SemaphoreHandle_t s_mutex;
+// Serializes registry mutations through their durable NVS commit.
+static SemaphoreHandle_t s_store_mutex;
+// A local dismissal may silence immediately even if NVS is unavailable. Until
+// a later commit succeeds, do not acknowledge that state as reboot-safe.
+static bool s_store_dirty;
+typedef struct { char id[40]; int64_t until_ms; } alarm_done_t;
+static alarm_done_t s_done[ALARM_DONE_MAX];
+static int64_t now_epoch_ms(void);
+
+// Caller holds both store and registry mutexes. Unknown-ID cancellations made
+// before SNTP retain a zero expiry until the clock can give them a full window.
+static void prune_done_locked(void)
+{
+    int64_t now = now_epoch_ms();
+    if (now <= MIN_VALID_EPOCH_MS) return;
+    for (int i = 0; i < ALARM_DONE_MAX; ++i) {
+        if (!s_done[i].id[0]) continue;
+        if (!s_done[i].until_ms) {
+            s_done[i].until_ms = now + DONE_RETENTION_MS;
+            s_store_dirty = true;
+        } else if (s_done[i].until_ms < now) {
+            memset(&s_done[i], 0, sizeof(s_done[i]));
+            s_store_dirty = true;
+        }
+    }
+}
+
+static bool done_locked(const char *id)
+{
+    for (int i = 0; i < ALARM_DONE_MAX; ++i)
+        if (strcmp(s_done[i].id, id) == 0) return true;
+    return false;
+}
+// Reserve one completion record for every active alarm. Capacity pressure must
+// reject new work, never evict an unexpired cancellation and resurrect its ID.
+static int completion_capacity_locked(const char *replacing_id)
+{
+    int available = 0;
+    for (int i = 0; i < ALARM_DONE_MAX; ++i)
+        if (!s_done[i].id[0]) available++;
+    for (int i = 0; i < ALARM_MAX; ++i) {
+        if (!s_alarms[i].used || s_alarms[i].delete_pending || done_locked(s_alarms[i].id)) continue;
+        if (replacing_id && strcmp(s_alarms[i].id, replacing_id) == 0) continue;
+        available--;
+    }
+    return available;
+}
+
+static bool remember_done_locked(const char *id, int64_t deadline)
+{
+    if (done_locked(id)) return true;
+    if (completion_capacity_locked(id) <= 0) return false;
+    for (int i = 0; i < ALARM_DONE_MAX; ++i) {
+        if (s_done[i].id[0]) continue;
+        int64_t now = now_epoch_ms();
+        if (now > deadline) deadline = now;
+        snprintf(s_done[i].id, sizeof(s_done[i].id), "%s", id);
+        s_done[i].until_ms = deadline >= MIN_VALID_EPOCH_MS ? deadline + DONE_RETENTION_MS : 0;
+        s_store_dirty = true;
+        return true;
+    }
+    return false;
+}
 static SemaphoreHandle_t s_ring_signal;
 static QueueHandle_t s_event_q;
 
@@ -85,6 +152,7 @@ static alarm_amp_cb_t      s_amp_cb      = NULL;
 
 typedef enum {
     ALARM_EVT_FIRED = 1,
+    ALARM_EVT_ACKED = 2,
 } alarm_event_type_t;
 
 typedef struct {
@@ -129,9 +197,9 @@ void alarm_set_amp_callback(alarm_amp_cb_t cb)           { s_amp_cb = cb; }
 
 static int64_t now_epoch_ms(void)
 {
-    time_t now;
-    time(&now);
-    return (int64_t)now * 1000;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 static bool wallclock_ready(void)
@@ -183,61 +251,37 @@ static void free_entry_locked(alarm_entry_t *e)
 // Audio buffer is intentionally NOT persisted — RAM-only by design.
 static esp_err_t nvs_save(void)
 {
-    typedef struct {
-        char id[40];
-        char label[64];
-        char type[16];
-        int64_t trigger_at_ms;
-    } alarm_persist_t;
-
-    alarm_persist_t snap[ALARM_MAX] = {0};
-    uint8_t count = 0;
+    // Caller holds s_store_mutex. Encode directly into a heap snapshot: the
+    // completion registry alone is 3 KB and must not consume a worker's stack.
+    const size_t cap = 2 + sizeof(s_done) + ALARM_MAX * (1 + 39 + 2 + 63 + 1 + 15 + 8);
+    uint8_t *buf = malloc(cap);
+    if (!buf) return ESP_ERR_NO_MEM;
+    uint8_t *p = buf + 1;
+    *buf = 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < ALARM_MAX; ++i) {
-        if (!s_alarms[i].used || s_alarms[i].delete_pending) continue;
-        strncpy(snap[count].id, s_alarms[i].id, sizeof(snap[count].id) - 1);
-        strncpy(snap[count].label, s_alarms[i].label, sizeof(snap[count].label) - 1);
-        strncpy(snap[count].type, s_alarms[i].type, sizeof(snap[count].type) - 1);
-        snap[count].trigger_at_ms = s_alarms[i].trigger_at_ms;
-        count++;
+        const alarm_entry_t *a = &s_alarms[i];
+        if (!a->used || a->delete_pending) continue;
+        size_t idl = strlen(a->id), lbl = strlen(a->label), tpl = strlen(a->type);
+        *p++ = (uint8_t)idl; memcpy(p, a->id, idl); p += idl;
+        *p++ = (uint8_t)(lbl & 0xff); *p++ = (uint8_t)(lbl >> 8); memcpy(p, a->label, lbl); p += lbl;
+        *p++ = (uint8_t)tpl; memcpy(p, a->type, tpl); p += tpl;
+        memcpy(p, &a->trigger_at_ms, 8); p += 8;
+        (*buf)++;
     }
+    // Optional versioned trailer; older firmware reads only active entries.
+    *p++ = 1;
+    memcpy(p, s_done, sizeof(s_done)); p += sizeof(s_done);
     xSemaphoreGive(s_mutex);
 
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
-    if (e != ESP_OK) return e;
-
-    size_t cap = 1;
-    for (int i = 0; i < count; ++i) {
-        cap += 1 + strlen(snap[i].id);
-        cap += 2 + strlen(snap[i].label);
-        cap += 1 + strlen(snap[i].type);
-        cap += 8;
-    }
-    if (count == 0) {
-        // No alarms — remove the blob entirely
-        nvs_erase_key(h, NVS_KEY);
-        nvs_commit(h);
-        nvs_close(h);
-        return ESP_OK;
-    }
-    uint8_t *buf = malloc(cap);
-    if (!buf) { nvs_close(h); return ESP_ERR_NO_MEM; }
-    uint8_t *p = buf;
-    *p++ = count;
-    for (int i = 0; i < count; ++i) {
-        size_t idl = strlen(snap[i].id);
-        size_t lbl = strlen(snap[i].label);
-        size_t tpl = strlen(snap[i].type);
-        *p++ = (uint8_t)idl; memcpy(p, snap[i].id, idl); p += idl;
-        *p++ = (uint8_t)(lbl & 0xff); *p++ = (uint8_t)(lbl >> 8); memcpy(p, snap[i].label, lbl); p += lbl;
-        *p++ = (uint8_t)tpl; memcpy(p, snap[i].type, tpl); p += tpl;
-        memcpy(p, &snap[i].trigger_at_ms, 8); p += 8;
-    }
+    if (e != ESP_OK) { free(buf); return e; }
     e = nvs_set_blob(h, NVS_KEY, buf, p - buf);
     if (e == ESP_OK) e = nvs_commit(h);
     free(buf);
     nvs_close(h);
+    if (e == ESP_OK) s_store_dirty = false;
     return e;
 }
 
@@ -245,7 +289,8 @@ static esp_err_t nvs_load(void)
 {
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READONLY, &h);
-    if (e != ESP_OK) return ESP_OK;  // namespace not created yet = no alarms
+    if (e == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (e != ESP_OK) return e;
 
     size_t needed = 0;
     e = nvs_get_blob(h, NVS_KEY, NULL, &needed);
@@ -290,6 +335,10 @@ static esp_err_t nvs_load(void)
         slot->state = ALARM_STATE_ARMED;
         // audio_mp3 stays NULL — RAM cache lost on reboot, chime-only ring.
     }
+    if ((size_t)(end - p) == 1 + sizeof(s_done) && *p++ == 1) {
+        memcpy(s_done, p, sizeof(s_done));
+        for (int i = 0; i < ALARM_DONE_MAX; ++i) s_done[i].id[39] = 0;
+    }
     free(buf);
     return ESP_OK;
 }
@@ -322,13 +371,14 @@ static void alarm_event_task(void *arg)
     while (1) {
         if (xQueueReceive(s_event_q, &ev, portMAX_DELAY) != pdTRUE) continue;
         if (ev.type == ALARM_EVT_FIRED) oe_ws_send_alarm_fired(ev.id);
+        if (ev.type == ALARM_EVT_ACKED) oe_ws_send_alarm_acked(ev.id);
     }
 }
 
 // Caller holds s_mutex.
 static esp_err_t schedule_locked(alarm_entry_t *e)
 {
-    if (!wallclock_ready()) {
+    if (!e->monotonic_due_us && !wallclock_ready()) {
         // Caller (deferred_schedule_task) retries once NTP acquires.
         return ESP_ERR_INVALID_STATE;
     }
@@ -343,9 +393,15 @@ static esp_err_t schedule_locked(alarm_entry_t *e)
     } else {
         esp_timer_stop(e->timer);
     }
-    int64_t delay_ms = e->trigger_at_ms - now_epoch_ms();
-    uint64_t delay_us = (delay_ms <= 0) ? 0 : (uint64_t)delay_ms * 1000ULL;
-    return esp_timer_start_once(e->timer, delay_us);
+    int64_t delay = e->monotonic_due_us ? e->monotonic_due_us - esp_timer_get_time()
+        : (e->trigger_at_ms - now_epoch_ms()) * 1000;
+    uint64_t delay_us = delay > 0 ? (uint64_t)delay : 1;
+    esp_err_t result = esp_timer_start_once(e->timer, delay_us);
+    if (result != ESP_OK) {
+        esp_timer_delete(e->timer);
+        e->timer = NULL;
+    }
+    return result;
 }
 
 // ── Audio: procedural chime + MP3 playback ───────────────────────────────────
@@ -672,44 +728,60 @@ static void ring_task(void *arg)
     }
 }
 
-// Background task: if NTP wasn't ready at boot, persisted alarms got loaded
-// into s_alarms[] but couldn't be scheduled. Wait for wallclock_ready() and
-// then schedule them all.
+// Recover persisted deadlines when the wall clock arrives, and retry transient
+// timer/storage failures after boot. Serialize with writers so no pending arm
+// can fire before its durable commit. Clean ticks perform no flash writes.
 static void deferred_schedule_task(void *arg)
 {
     (void)arg;
-    while (!wallclock_ready()) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
-    ESP_LOGI(TAG, "wall-clock acquired; scheduling persisted alarms");
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    for (int i = 0; i < ALARM_MAX; ++i) {
-        if (s_alarms[i].used && !s_alarms[i].delete_pending &&
-            s_alarms[i].state == ALARM_STATE_ARMED && !s_alarms[i].timer) {
-            schedule_locked(&s_alarms[i]);
+    for (;;) {
+        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        prune_done_locked();
+        xSemaphoreGive(s_mutex);
+        bool was_dirty = s_store_dirty;
+        esp_err_t saved = was_dirty ? nvs_save() : ESP_OK;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        for (int i = 0; i < ALARM_MAX; ++i) {
+            if (saved == ESP_OK && s_alarms[i].used && !s_alarms[i].delete_pending &&
+                s_alarms[i].state == ALARM_STATE_ARMED && !s_alarms[i].timer) {
+                schedule_locked(&s_alarms[i]);
+            }
         }
+        if (was_dirty && saved == ESP_OK) {
+            for (int i = 0; i < ALARM_DONE_MAX; ++i) {
+                if (!s_done[i].id[0]) continue;
+                alarm_event_t ev = { .type = ALARM_EVT_ACKED };
+                snprintf(ev.id, sizeof(ev.id), "%s", s_done[i].id);
+                if (s_event_q) xQueueSend(s_event_q, &ev, 0);
+            }
+        }
+        xSemaphoreGive(s_mutex);
+        xSemaphoreGive(s_store_mutex);
+        vTaskDelay(pdMS_TO_TICKS(wallclock_ready() ? 1000 : 10000));
     }
-    xSemaphoreGive(s_mutex);
-    vTaskDelete(NULL);
 }
 
 esp_err_t alarm_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
+    s_store_mutex = xSemaphoreCreateMutex();
     s_ring_signal = xSemaphoreCreateBinary();
-    s_event_q = xQueueCreate(8, sizeof(alarm_event_t));
-    if (!s_mutex || !s_ring_signal || !s_event_q) return ESP_ERR_NO_MEM;
+    s_event_q = xQueueCreate(ALARM_MAX + ALARM_DONE_MAX, sizeof(alarm_event_t));
+    if (!s_mutex || !s_store_mutex || !s_ring_signal || !s_event_q) return ESP_ERR_NO_MEM;
 
     build_chime_pcm();
     // If a user-uploaded chime is on disk, decode + install it (replaces the
     // procedural one). Failures fall through silently — procedural chime is
     // already installed.
     try_load_custom_chime();
-    nvs_load();
+    esp_err_t loaded = nvs_load();
+    if (loaded != ESP_OK || !s_chime_pcm) return loaded != ESP_OK ? loaded : ESP_ERR_NO_MEM;
 
-    xTaskCreate(ring_task, "alarm_ring", 4096, NULL, 5, NULL);
-    xTaskCreate(alarm_event_task, "alarm_evt", 4096, NULL, 4, NULL);
-    xTaskCreate(deferred_schedule_task, "alarm_sched", 3072, NULL, 4, NULL);
+    if (xTaskCreate(ring_task, "alarm_ring", 4096, NULL, 5, NULL) != pdPASS ||
+        xTaskCreate(alarm_event_task, "alarm_evt", 4096, NULL, 4, NULL) != pdPASS ||
+        xTaskCreate(deferred_schedule_task, "alarm_sched", 3072, NULL, 4, NULL) != pdPASS)
+        return ESP_ERR_NO_MEM;
 
     int armed = 0;
     for (int i = 0; i < ALARM_MAX; ++i) if (s_alarms[i].used) armed++;
@@ -717,91 +789,126 @@ esp_err_t alarm_init(void)
     return ESP_OK;
 }
 
-esp_err_t alarm_arm(const char *id, const char *label,
-                    int64_t trigger_at_ms,
-                    uint8_t *audio_mp3, size_t audio_mp3_len,
-                    const char *type)
+esp_err_t alarm_arm(const char *id, const char *label, int64_t trigger_at_ms,
+                    uint8_t *audio_mp3, size_t audio_mp3_len, const char *type)
 {
-    if (!id || !label || !type) {
+    return alarm_arm_with_delay(id, label, trigger_at_ms, audio_mp3, audio_mp3_len, type, -1);
+}
+
+esp_err_t alarm_arm_with_delay(const char *id, const char *label, int64_t trigger_at_ms,
+                    uint8_t *audio_mp3, size_t audio_mp3_len, const char *type, int64_t delay_ms)
+{
+    if (!id || !id[0] || strlen(id) >= sizeof(s_alarms[0].id) || !label || !type ||
+        trigger_at_ms < MIN_VALID_EPOCH_MS || delay_ms < -1 || delay_ms > 366LL*24*60*60*1000) {
         if (audio_mp3) heap_caps_free(audio_mp3);
         return ESP_ERR_INVALID_ARG;
     }
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    prune_done_locked();
     alarm_entry_t *e = find_by_id_locked(id);
-    if (e) free_entry_locked(e);
-    e = alloc_slot_locked();
-    if (!e) {
+    bool dismissed = done_locked(id);
+    // Replayed arm packets must not reset a countdown or restart a dismissed ring.
+    if (dismissed || e) {
+        if (dismissed && e) {
+            free_entry_locked(e);
+            s_store_dirty = true;
+        }
         xSemaphoreGive(s_mutex);
-        ESP_LOGW(TAG, "alarm_arm: no free slot (max=%d)", ALARM_MAX);
+        esp_err_t result = s_store_dirty ? nvs_save() : ESP_OK;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (result == ESP_OK && !dismissed && e->state == ALARM_STATE_ARMED && !e->timer) {
+            // A restored row has no monotonic clock. A retry of a failed timer
+            // start does, and must keep that original countdown deadline.
+            if (!e->monotonic_due_us && delay_ms >= 0)
+                e->monotonic_due_us = esp_timer_get_time() + delay_ms * 1000 + 1;
+            result = schedule_locked(e);
+        }
+        xSemaphoreGive(s_mutex);
+        xSemaphoreGive(s_store_mutex);
+        if (audio_mp3) heap_caps_free(audio_mp3);
+        if (dismissed && result == ESP_OK) oe_ws_send_alarm_acked(id);
+        return result;
+    }
+    e = alloc_slot_locked();
+    if (!e || completion_capacity_locked(NULL) <= 0) {
+        xSemaphoreGive(s_mutex);
+        xSemaphoreGive(s_store_mutex);
         if (audio_mp3) heap_caps_free(audio_mp3);
         return ESP_ERR_NO_MEM;
     }
     e->used = true;
-    strncpy(e->id, id, sizeof(e->id) - 1);
-    strncpy(e->label, label, sizeof(e->label) - 1);
-    strncpy(e->type, type, sizeof(e->type) - 1);
+    snprintf(e->id, sizeof(e->id), "%s", id);
+    snprintf(e->label, sizeof(e->label), "%s", label);
+    snprintf(e->type, sizeof(e->type), "%s", type);
     e->trigger_at_ms = trigger_at_ms;
+    e->monotonic_due_us = delay_ms >= 0 ? esp_timer_get_time() + delay_ms * 1000 + 1 : 0;
     e->audio_mp3 = audio_mp3;
     e->audio_mp3_len = audio_mp3_len;
     e->state = ALARM_STATE_ARMED;
-    e->timer = NULL;
-
-    esp_err_t er = schedule_locked(e);
+    s_store_dirty = true;
     xSemaphoreGive(s_mutex);
 
-    nvs_save();
-    if (er == ESP_OK) {
-        ESP_LOGI(TAG, "alarm armed: id=%s label=%s trigger_at_ms=%lld",
-                 id, label, (long long)trigger_at_ms);
-    } else if (er == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "alarm armed (deferred — NTP not ready): id=%s", id);
-        er = ESP_OK;  // not an error — deferred scheduler will pick up
+    // Commit before starting the timer or acknowledging durable ownership.
+    esp_err_t result = nvs_save();
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (result == ESP_OK) {
+        // Keep a committed entry on timer failure so a retry can start it
+        // without resetting the countdown or disagreeing with NVS.
+        result = schedule_locked(e);
     } else {
-        ESP_LOGE(TAG, "alarm_arm schedule failed: %d", er);
+        free_entry_locked(e);
+        s_store_dirty = true;
     }
-    return er;
+    xSemaphoreGive(s_mutex);
+    xSemaphoreGive(s_store_mutex);
+    return result;
 }
 
 esp_err_t alarm_disarm(const char *id)
 {
-    if (!id) return ESP_ERR_INVALID_ARG;
-    char ack_id[40] = {0};
-    bool was_firing = false;
+    if (!id || !id[0] || strlen(id) >= sizeof(s_alarms[0].id)) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    prune_done_locked();
     alarm_entry_t *e = find_by_id_locked(id);
-    if (!e) {
+    if (!remember_done_locked(id, e ? e->trigger_at_ms : now_epoch_ms())) {
         xSemaphoreGive(s_mutex);
-        return ESP_ERR_NOT_FOUND;
+        xSemaphoreGive(s_store_mutex);
+        return ESP_ERR_NO_MEM;
     }
-    was_firing = e->state == ALARM_STATE_FIRING;
-    strncpy(ack_id, e->id, sizeof(ack_id) - 1);
-    free_entry_locked(e);
+    if (e) free_entry_locked(e);
+    if (e) s_store_dirty = true;
     xSemaphoreGive(s_mutex);
-    nvs_save();
-    if (was_firing) oe_ws_send_alarm_acked(ack_id);
-    ESP_LOGI(TAG, "alarm disarmed: id=%s", id);
-    return ESP_OK;
+    esp_err_t result = s_store_dirty ? nvs_save() : ESP_OK;
+    xSemaphoreGive(s_store_mutex);
+    if (result == ESP_OK) oe_ws_send_alarm_acked(id);
+    return result;
 }
 
 void alarm_stop(const char *id)
 {
-    bool changed = false;
     char ack_ids[ALARM_MAX][40] = {0};
     int ack_count = 0;
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    prune_done_locked();
     for (int i = 0; i < ALARM_MAX; ++i) {
         if (!s_alarms[i].used) continue;
         if (s_alarms[i].delete_pending) continue;
         if (s_alarms[i].state != ALARM_STATE_FIRING) continue;
         if (id && strcmp(s_alarms[i].id, id) != 0) continue;
+        if (!remember_done_locked(s_alarms[i].id, s_alarms[i].trigger_at_ms)) continue;
         ESP_LOGI(TAG, "alarm_stop: id=%s", s_alarms[i].id);
         strncpy(ack_ids[ack_count++], s_alarms[i].id, sizeof(ack_ids[0]) - 1);
         free_entry_locked(&s_alarms[i]);
-        changed = true;
+        s_store_dirty = true;
     }
     xSemaphoreGive(s_mutex);
-    if (changed) nvs_save();
-    for (int i = 0; i < ack_count; ++i) oe_ws_send_alarm_acked(ack_ids[i]);
+    esp_err_t saved = s_store_dirty ? nvs_save() : ESP_OK;
+    xSemaphoreGive(s_store_mutex);
+    if (saved == ESP_OK)
+        for (int i = 0; i < ack_count; ++i) oe_ws_send_alarm_acked(ack_ids[i]);
 }
 
 bool alarm_is_firing(void)
@@ -825,6 +932,11 @@ bool alarm_is_firing(void)
 // under the mutex (same rule as the fire path).
 void alarm_resend_fired(void)
 {
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    prune_done_locked();
+    xSemaphoreGive(s_mutex);
+    esp_err_t saved = s_store_dirty ? nvs_save() : ESP_OK;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < ALARM_MAX; ++i) {
         if (s_alarms[i].used && !s_alarms[i].delete_pending &&
@@ -835,7 +947,14 @@ void alarm_resend_fired(void)
             if (s_event_q) xQueueSend(s_event_q, &ev, 0);
         }
     }
+    for (int i = 0; i < ALARM_DONE_MAX; ++i) {
+        if (saved != ESP_OK || !s_done[i].id[0]) continue;
+        alarm_event_t ev = { .type = ALARM_EVT_ACKED };
+        snprintf(ev.id, sizeof(ev.id), "%s", s_done[i].id);
+        if (s_event_q) xQueueSend(s_event_q, &ev, 0);
+    }
     xSemaphoreGive(s_mutex);
+    xSemaphoreGive(s_store_mutex);
 }
 
 bool alarm_handle_local_dismiss(void)
@@ -843,18 +962,24 @@ bool alarm_handle_local_dismiss(void)
     bool any = false;
     char ack_ids[ALARM_MAX][40] = {0};
     int ack_count = 0;
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    prune_done_locked();
     for (int i = 0; i < ALARM_MAX; ++i) {
         if (!s_alarms[i].used || s_alarms[i].delete_pending ||
             s_alarms[i].state != ALARM_STATE_FIRING) continue;
+        if (!remember_done_locked(s_alarms[i].id, s_alarms[i].trigger_at_ms)) continue;
         any = true;
         ESP_LOGI(TAG, "alarm local dismiss: id=%s", s_alarms[i].id);
         strncpy(ack_ids[ack_count++], s_alarms[i].id, sizeof(ack_ids[0]) - 1);
         free_entry_locked(&s_alarms[i]);
+        s_store_dirty = true;
     }
     xSemaphoreGive(s_mutex);
-    if (any) nvs_save();
-    for (int i = 0; i < ack_count; ++i) oe_ws_send_alarm_acked(ack_ids[i]);
+    esp_err_t saved = s_store_dirty ? nvs_save() : ESP_OK;
+    xSemaphoreGive(s_store_mutex);
+    if (saved == ESP_OK)
+        for (int i = 0; i < ack_count; ++i) oe_ws_send_alarm_acked(ack_ids[i]);
     return any;
 }
 

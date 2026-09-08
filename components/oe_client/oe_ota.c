@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -207,7 +208,13 @@ static esp_err_t parse_manifest(const char *body, char **out_version,
             strcmp(jname->valuestring, "app") == 0) {
             appfile = jfile->valuestring;
             const cJSON *jsha = cJSON_GetObjectItem(p, "sha256");
-            if (cJSON_IsString(jsha)) appsha = jsha->valuestring;
+            if (jsha) {
+                if (!cJSON_IsString(jsha) || strlen(jsha->valuestring) != 64) goto out;
+                for (size_t i = 0; i < 64; ++i) {
+                    if (!isxdigit((unsigned char)jsha->valuestring[i])) goto out;
+                }
+                appsha = jsha->valuestring;
+            }
             break;
         }
     }
@@ -241,10 +248,11 @@ static esp_err_t ota_partition_sha256_check(const esp_partition_t *part,
 {
     if (!part || !out_match) return ESP_ERR_INVALID_ARG;
     *out_match = false;
-    if (!expected_hex || strlen(expected_hex) != 64) {
-        *out_match = true;  // older manifest without a usable hash
+    if (!expected_hex) {
+        *out_match = true;  // legacy manifest with the checksum field absent
         return ESP_OK;
     }
+    if (strlen(expected_hex) != 64) return ESP_ERR_INVALID_RESPONSE;
     uint8_t want[32];
     for (int i = 0; i < 32; ++i) {
         char c1 = expected_hex[i * 2], c2 = expected_hex[i * 2 + 1];
@@ -629,16 +637,24 @@ esp_err_t oe_ota_start_check(const char *server_url)
     return ota_schedule_normal(server_url);
 }
 
-void oe_ota_mark_running_valid(void)
+esp_err_t oe_ota_mark_running_valid(void)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
-    if (!running) return;
+    if (!running) return ESP_ERR_NOT_FOUND;
     esp_ota_img_states_t state;
-    if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+    esp_err_t result = esp_ota_get_state_partition(running, &state);
+    // A factory/USB flash may leave otadata erased, with no state record and
+    // no rollback obligation. Other query failures still prevent acceptance.
+    if (result == ESP_ERR_NOT_FOUND) return ESP_OK;
+    if (result != ESP_OK) return result;
     if (state == ESP_OTA_IMG_PENDING_VERIFY) {
         // Cancel the auto-rollback that IDF armed when we booted from a
         // freshly-OTA'd image. From here on, the new image is "blessed".
         esp_err_t e = esp_ota_mark_app_valid_cancel_rollback();
         ESP_LOGI(TAG, "marked running app valid: %s", esp_err_to_name(e));
+        return e;
     }
+    // A USB/factory image may have no pending validation obligation.
+    return state == ESP_OTA_IMG_VALID || state == ESP_OTA_IMG_UNDEFINED
+        ? ESP_OK : ESP_ERR_INVALID_STATE;
 }

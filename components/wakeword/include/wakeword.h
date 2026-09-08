@@ -35,6 +35,8 @@ wakeword_t *wakeword_create(const wakeword_config_t *cfg);
 void wakeword_destroy(wakeword_t *ww);
 
 esp_err_t wakeword_load_slot(wakeword_t *ww, uint8_t slot);
+// Validate a staged pair without changing any live detector.
+esp_err_t wakeword_validate_files(uint8_t slot, const char *model_path, const char *manifest_path);
 uint8_t   wakeword_active_slot(const wakeword_t *ww);
 
 // Tear down the currently-loaded model and free its arena WITHOUT destroying

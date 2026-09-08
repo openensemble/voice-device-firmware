@@ -243,6 +243,7 @@ esp_err_t oe_ws_send_ww_ack(int slot, bool ok, const char *err);
 // the user dismisses (wake-while-firing). Server uses these to cancel
 // the ack-timeout watchdog (no email/telegram fallback needed) and to
 // clean up its own registry entry.
+esp_err_t oe_ws_send_alarm_armed(const char *alarm_id, esp_err_t result);
 esp_err_t oe_ws_send_alarm_fired(const char *alarm_id);
 esp_err_t oe_ws_send_alarm_acked(const char *alarm_id);
 
@@ -379,4 +380,4 @@ esp_err_t oe_ota_resume_pending(const char *server_url);
 // pending rollback. Call once Wi-Fi is associated and the WS is connected —
 // that proves the new image isn't fundamentally broken. Without this,
 // IDF will boot the previous slot next time. Safe to call repeatedly.
-void oe_ota_mark_running_valid(void);
+esp_err_t oe_ota_mark_running_valid(void);

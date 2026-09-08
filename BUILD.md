@@ -36,6 +36,22 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 First boot will come up as a Wi-Fi AP named `oe-voice-XXXX`. Join the AP, fill in the captive portal form (Wi-Fi creds + OE server URL + an 8-char pairing code generated from OE Settings → Devices), the device redeems the code, then reboots into operational mode.
 
+## Host regression checks
+
+With a host C compiler and ESP-IDF available (`IDF_PATH`, or `~/esp/esp-idf`):
+
+```bash
+python3 tests/check_firmware_regressions.py
+python3 tests/check_alarm_regressions.py
+python3 tests/check_captive_portal_header_budget.py
+```
+
+These run production C paths with hardware boundaries stubbed: capture limits,
+TTS burst handoff, pairing retry, persisted volume, OTA validation/readiness,
+alarm persistence, cancellation/replay, and interrupted wake-word file updates (including a second interruption during
+recovery). They do not flash a device. Audio quality, AP/STA transitions and
+physical power-loss behavior still require device validation.
+
 ## Wake-word models
 
 The `wakewords` partition is an SPIFFS image at `/ww/`. Slot files are named `slot0.tflite`, `slot1.tflite`, etc.

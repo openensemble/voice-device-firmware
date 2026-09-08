@@ -23,6 +23,7 @@
 #include "audio_io.h"
 #include "xvf3800_ctrl.h"
 #include "wakeword.h"
+#include "ww-store.h"
 #include "mbedtls/base64.h"   // server-side TTS streaming: decode pushed PCM frames
 #include "vad.h"
 #include "mp3_decode.h"
@@ -534,9 +535,9 @@ static void apply_verify_gate_server_caps(const cJSON *j)
 // 459,364 B of slot files fit, 476,034 B did not. Six ~63 KB (v1) pairs fit
 // comfortably; the retrained ~79 KB pairs (tensor_arena_size 78240) max out
 // at FIVE — six of those overflow. The OE server refuses over-budget pushes
-// up front (lib/voice-config.mjs, WW_SPIFFS_BUDGET_BYTES = 460000), which
-// matters because apply_ww_upload below unlinks the old slot file before
-// writing — a failed write would leave that slot empty. Bumping capacity
+// up front (lib/voice-config.mjs, WW_SPIFFS_BUDGET_BYTES = 460000).
+// Updates additionally need room for one complete staged model/manifest pair;
+// the device rejects a push if retaining the working pair leaves too little room. Bumping capacity
 // would require resizing the partition (USB re-flash) or shrinking the
 // SPIFFS image somehow.
 #define WW_NUM_SLOTS 6
@@ -563,6 +564,7 @@ static uint8_t     s_default_cutoff[WW_NUM_SLOTS] = {0};
 // WS; the device plays them. Declared here so the WS callback (above the player
 // task) can reference them. See stream_finalize_task / stream_abort_local.
 static volatile bool s_stream_active  = false;   // between tts_audio_begin and finalize
+static volatile uint32_t s_stream_generation = 0; // every admitted burst, including same-turn reopen
 static volatile bool s_stream_end_req = false;   // tts_audio_end received; finalize task drains
 // Legacy HTTP TTS can overlap the pushed stream's teardown; the WS disconnect
 // path needs this ownership bit early enough to preserve its speech output.
@@ -818,6 +820,10 @@ static volatile bool s_ota_marked_valid = false;
 // asynchronous, so caps can otherwise race the remaining task allocations.
 static volatile bool s_authenticated_caps_seen = false;
 static volatile bool s_operational_boot_ready = false;
+static volatile bool s_tts_worker_ready = false;
+static volatile bool s_stream_finalizer_ready = false;
+static volatile bool s_drive_ready = false;
+static volatile uint32_t s_drive_frames = 0;
 
 static void maybe_resume_pending_ota(void)
 {
@@ -1078,12 +1084,12 @@ static inline bool frame_is_speech(const int16_t *samples, size_t n)
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 static EventGroupHandle_t s_wifi_evt = NULL;
+static volatile bool s_wifi_reconnect_enabled = true;
 
-// Must hold a full VAD-bounded utterance: max_utterance_ms is 15 s, so 16 s
-// gives the ceiling plus margin. 12 s (pre-0.2.62) silently truncated the
-// longest questions — the append gate below just stops copying when full, so
-// STT got a cut-off utterance with no error anywhere. 512 KB, lands in PSRAM.
-#define CAPTURE_BUFFER_SAMPLES (16000 * 16)
+// VAD counts new frames only; follow-up capture also includes the full
+// pre-roll. Reserve one additional frame for VAD's rounded final boundary.
+#define CAPTURE_MAX_UTTERANCE_MS 15000
+#define CAPTURE_BUFFER_SAMPLES (PREROLL_SAMPLES + (16000 * CAPTURE_MAX_UTTERANCE_MS / 1000) + WW_FRAME_SAMPLES)
 static int16_t *s_capture_buf = NULL;
 static size_t s_capture_used = 0;
 
@@ -1137,11 +1143,12 @@ static void set_ui_state(ui_state_t s) { s_ui_state = s; leds_buttons_set_state(
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (s_wifi_reconnect_enabled) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "wifi disconnected, retrying");
+        xEventGroupClearBits(s_wifi_evt, WIFI_CONNECTED_BIT);
         xEventGroupSetBits(s_wifi_evt, WIFI_FAIL_BIT);
-        esp_wifi_connect();
+        if (s_wifi_reconnect_enabled) esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ESP_LOGI(TAG, "got IP");
         // Re-assert PS_NONE on every reconnect. The Wi-Fi stack resets the
@@ -1157,16 +1164,30 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
 static esp_err_t wifi_sta_start(const char *ssid, const char *password)
 {
-    s_wifi_evt = xEventGroupCreate();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&ic));
-    esp_event_handler_instance_t inst_any, inst_ip;
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &inst_any);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &inst_ip);
+    // Provisioning keeps AP + HTTP alive while STA joins and OE redeems the
+    // code, so mistakes can be corrected without unplugging the device.
+    const bool provisioning = captive_portal_running();
+    static bool sta_created = false;
+    if (!s_wifi_evt) s_wifi_evt = xEventGroupCreate();
+    if (!s_wifi_evt) return ESP_ERR_NO_MEM;
+    if (!sta_created) {
+        if (!esp_netif_create_default_wifi_sta()) return ESP_ERR_NO_MEM;
+        if (!provisioning) {
+            wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
+            ESP_ERROR_CHECK(esp_wifi_init(&ic));
+        }
+        esp_event_handler_instance_t inst_any, inst_ip;
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &inst_any));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &inst_ip));
+        sta_created = true;
+    }
+    s_wifi_reconnect_enabled = false;
+    (void)esp_wifi_disconnect();
+    xEventGroupClearBits(s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
     wifi_config_t wc = {0};
-    strncpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid) - 1);
+    // ESP-IDF's 32-byte SSID field need not be NUL-terminated at full length.
+    memcpy(wc.sta.ssid, ssid, strnlen(ssid, sizeof(wc.sta.ssid)));
     strncpy((char *)wc.sta.password, password, sizeof(wc.sta.password) - 1);
     wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     // Wake on every DTIM beacon, not every 3rd (the IDF default). Belt-and-
@@ -1174,9 +1195,11 @@ static esp_err_t wifi_sta_start(const char *ssid, const char *password)
     // shortest possible wake interval so incoming AirPlay TCP / mDNS PTR
     // queries aren't held up.
     wc.sta.listen_interval = 1;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_err_t configured = esp_wifi_set_mode(provisioning ? WIFI_MODE_APSTA : WIFI_MODE_STA);
+    if (configured == ESP_OK) configured = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (configured == ESP_OK) configured = esp_wifi_start();
+    if (configured != ESP_OK) return configured;
+    s_wifi_reconnect_enabled = true;
     // Voice devices are always mains-powered; the default MIN_MODEM
     // power-save lets the radio sleep between DTIM beacons (~100 ms),
     // which delivers UDP audio (AirPlay) and our WS frames in bursts.
@@ -1184,81 +1207,62 @@ static esp_err_t wifi_sta_start(const char *ssid, const char *password)
     // round-trip, and AirPlay clock sync alike. esp_wifi_set_ps must
     // run AFTER esp_wifi_start.
     esp_wifi_set_ps(WIFI_PS_NONE);
+    (void)esp_wifi_connect();
 
     EventBits_t b = xEventGroupWaitBits(s_wifi_evt, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
     return (b & WIFI_CONNECTED_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
-// Pairing worker — runs in its own task spawned from portal_submit_cb. The
-// callback can't do this work inline: it executes inside the captive portal's
-// httpd request handler, and the first thing we need to do is stop that
-// httpd (and the Wi-Fi AP it lives on). Tearing the handler out from under
-// itself causes a LoadProhibited panic in uxListRemove (FreeRTOS list of
-// active worker contexts).
+// Pairing runs away from HTTP; the AP stays usable throughout the attempt.
 static void pair_worker_task(void *arg)
 {
-    captive_form_result_t *r = (captive_form_result_t *) arg;
-
-    // Give the httpd worker that called us a moment to finish flushing the
-    // DONE_HTML response and tear down its socket cleanly. ~500 ms is the
-    // same delay the original inline path used.
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    captive_portal_stop();
-    vTaskDelay(pdMS_TO_TICKS(200));
-    esp_wifi_stop();
-    esp_wifi_deinit();
-
+    captive_form_result_t *r = (captive_form_result_t *)arg;
     if (wifi_sta_start(r->ssid, r->password) != ESP_OK) {
-        ESP_LOGE(TAG, "STA failed, rebooting to retry");
-        free(r);
-        esp_restart();
-    }
-
-    oe_pair_result_t pr = {0};
-    if (oe_pair_redeem(r->server_url, r->pair_code, r->device_name, &pr) == ESP_OK) {
-        nvs_creds_set_token(pr.token);
-        if (pr.server_hint[0]) nvs_creds_set_server(pr.server_hint);
-        if (pr.device_id[0]) {
-            esp_err_t e = nvs_creds_set_device_id(pr.device_id);
-            if (e != ESP_OK) {
-                ESP_LOGW(TAG, "paired device_id NVS write failed: %s",
-                         esp_err_to_name(e));
-            }
-        }
-        ESP_LOGI(TAG, "paired — rebooting into operational mode");
-        free(r);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_restart();
-    } else {
-        ESP_LOGE(TAG, "pair redeem failed");
-        set_ui_state(UI_STATE_ERROR);
+        captive_portal_set_result(false, "Wi-Fi connection failed. Check the network and password, then retry.");
         free(r);
         vTaskDelete(NULL);
+        return;
     }
+    oe_pair_result_t pr = {0};
+    if (oe_pair_redeem(r->server_url, r->pair_code, r->device_name, &pr) != ESP_OK) {
+        captive_portal_set_result(false, "OE pairing failed. Check the server address and use a fresh pairing code.");
+        free(r);
+        vTaskDelete(NULL);
+        return;
+    }
+    // Token is the provisioned-state marker; write it last and check every
+    // write. A failed attempt must not leave a falsely provisioned device.
+    // Clear even a stale token first: a previous interrupted setup could
+    // have left a token without a server. NVS commits individual keys.
+    esp_err_t e = nvs_creds_set_token("");
+    if (e == ESP_OK) e = nvs_creds_set_wifi(r->ssid, r->password);
+    if (e == ESP_OK) e = nvs_creds_set_server(pr.server_hint[0] ? pr.server_hint : r->server_url);
+    if (e == ESP_OK) e = nvs_creds_set_device_name(r->device_name[0] ? r->device_name : "voice-device");
+    if (e == ESP_OK && pr.device_id[0]) e = nvs_creds_set_device_id(pr.device_id);
+    if (e == ESP_OK) e = nvs_creds_set_token(pr.token);
+    free(r);
+    if (e != ESP_OK) {
+        captive_portal_set_result(false, "Pairing could not be saved. Create a fresh pairing code and retry.");
+        vTaskDelete(NULL);
+        return;
+    }
+    captive_portal_set_result(true, "Paired. Restarting on your Wi-Fi network.");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
 }
 
 static void portal_submit_cb(const captive_form_result_t *r, void *user)
 {
-    ESP_LOGI(TAG, "portal: ssid=%s server=%s code=%s name=%s",
-             r->ssid, r->server_url, r->pair_code, r->device_name);
-    nvs_creds_set_wifi(r->ssid, r->password);
-    nvs_creds_set_server(r->server_url);
-    nvs_creds_set_device_name(r->device_name[0] ? r->device_name : "voice-device");
-
-    // Hand off the heavy work (stop captive portal, switch to STA, redeem)
-    // to a separate task so the httpd handler that called us can return
-    // cleanly. Doing it inline tears down the httpd from inside its own
-    // worker thread → LoadProhibited in uxListRemove.
-    captive_form_result_t *copy = (captive_form_result_t *) malloc(sizeof(*copy));
+    captive_form_result_t *copy = malloc(sizeof(*copy));
     if (!copy) {
-        ESP_LOGE(TAG, "pair_worker malloc failed");
+        captive_portal_set_result(false, "Not enough memory to pair. Retry in a moment.");
         return;
     }
     *copy = *r;
+    nvs_creds_normalize_server_url(copy->server_url);
     if (xTaskCreate(pair_worker_task, "pair_worker", 6144, copy, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "pair_worker task spawn failed");
         free(copy);
+        captive_portal_set_result(false, "Pairing worker could not start. Retry in a moment.");
     }
 }
 
@@ -1373,20 +1377,14 @@ static void accumulate_token(const char *tok, size_t len, const char *turn_id)
     token_unlock();
 }
 
-// Helper for apply_ww_upload — open/write/close a SPIFFS file in one
-// call. Returns false on open failure OR short write so the caller can
-// decide whether to force a GC pass and retry.
-static bool ww_write_file(const char *path, const void *data, size_t len)
+static bool ww_validate_staged(unsigned slot, const char *model, const char *manifest, void *user)
 {
-    FILE *f = fopen(path, "wb");
-    if (!f) { ESP_LOGE(TAG, "ww_upload: open %s failed", path); return false; }
-    size_t w = fwrite(data, 1, len, f);
-    fclose(f);
-    if (w != len) {
-        ESP_LOGE(TAG, "ww_upload: short write %s (%u/%u)", path, (unsigned)w, (unsigned)len);
-        return false;
-    }
-    return true;
+    return wakeword_validate_files((uint8_t)slot, model, manifest) == ESP_OK;
+}
+
+static bool ww_activate_staged(unsigned slot, const char *model, const char *manifest, void *user)
+{
+    return s_ww[slot] && wakeword_load_slot(s_ww[slot], (uint8_t)slot) == ESP_OK;
 }
 
 // True iff the file at `path` exists and its bytes exactly equal `data[0..len)`.
@@ -1487,6 +1485,12 @@ static void apply_ww_upload(const char *json_text, size_t json_len)
     const char *manifest_text = jmanifest->valuestring;
     size_t manifest_len = strlen(manifest_text);
 
+    if (!ww_store_recover("/ww", slot)) {
+        heap_caps_free(tflite);
+        cJSON_Delete(j);
+        oe_ws_send_ww_ack(ack_slot, false, "model_recovery_failed");
+        return;
+    }
     char tflite_path[64], manifest_path[64];
     snprintf(tflite_path, sizeof(tflite_path),   "/ww/slot%d.tflite", slot);
     snprintf(manifest_path, sizeof(manifest_path), "/ww/slot%d.json",   slot);
@@ -1507,84 +1511,40 @@ static void apply_ww_upload(const char *json_text, size_t json_len)
         return;
     }
 
-    // Write order: tflite first, manifest second. If we crash between writes
-    // the model file matches the slot index but the manifest is stale —
-    // wakeword_load_slot will use the OLD probability_cutoff with the NEW
-    // model, which usually still works (cutoffs are similar across v2 models).
-    // The reverse order would mean a manifest pointing at a stale .tflite,
-    // which is identical to the pre-upload state. Neither is great; the
-    // chosen order biases toward the upload taking effect.
-    // SPIFFS quirk: overwriting an existing file doesn't immediately free
-    // the old pages — they're marked deleted but stay reserved until GC
-    // runs. unlink() alone isn't enough: SPIFFS GC is opportunistic, so a
-    // back-to-back rewrite can still fwrite() 0 bytes. Force GC with
-    // headroom for both the tflite and the manifest, then write. If the
-    // first write still short-writes, run GC again with a larger budget
-    // and retry once. CONFIG_SPIFFS_GC_MAX_RUNS=32 in sdkconfig.defaults
-    // ensures each GC pass can reclaim enough to land a ~62 KB tflite.
-    unlink(tflite_path);
-    unlink(manifest_path);
-    esp_spiffs_gc("wakewords", bin_len + manifest_len + 4096);
-
-    bool ok = true;
-    if (!ww_write_file(tflite_path, tflite, bin_len)) {
-        ESP_LOGW(TAG, "ww_upload: tflite short-write — forcing GC and retrying");
-        esp_spiffs_gc("wakewords", bin_len * 2);
-        if (!ww_write_file(tflite_path, tflite, bin_len)) {
-            ESP_LOGE(TAG, "ww_upload: tflite short write after GC retry (%u bytes)", (unsigned)bin_len);
-            ok = false;
-        }
-    }
-    heap_caps_free(tflite);
-
-    if (ok && !ww_write_file(manifest_path, manifest_text, manifest_len)) {
-        ESP_LOGW(TAG, "ww_upload: manifest short-write — forcing GC and retrying");
-        esp_spiffs_gc("wakewords", manifest_len + 4096);
-        if (!ww_write_file(manifest_path, manifest_text, manifest_len)) {
-            ESP_LOGE(TAG, "ww_upload: manifest short write after GC retry");
-            ok = false;
-        }
-    }
-
-    cJSON_Delete(j);
-    if (!ok) {
-        oe_ws_send_ww_ack(ack_slot, false, "spiffs");
+    // Reserve room for a complete replacement while retaining the previous
+    // pair. Low-space devices reject the push without deleting working files.
+    size_t total = 0, used = 0;
+    const size_t reserve = bin_len + manifest_len + 8192;
+    esp_spiffs_gc("wakewords", reserve);
+    if (esp_spiffs_info("wakewords", &total, &used) != ESP_OK ||
+        used > total || reserve > total - used || manifest_len > 4096) {
+        heap_caps_free(tflite);
+        cJSON_Delete(j);
+        oe_ws_send_ww_ack(ack_slot, false, "insufficient_staging_space");
         return;
     }
-
-    // Hot-reload the slot — wakeword_load_slot already handles cleanup of
-    // the previous model and re-reads the manifest. Skip if the slot's
-    // wakeword_t never created (e.g. boot-time alloc failure). Files
-    // landed on disk in this case, so the next reboot will pick them up;
-    // we still ack ok=true to let the server mark this slot complete.
     if (!s_ww[slot]) {
-        // No live detector to hot-swap (boot-time alloc failure). Files are on
-        // flash; reboot so the next boot loads them instead of leaving the slot
-        // running nothing until a manual power-cycle.
-        ESP_LOGW(TAG, "ww_upload: slot %d has no wakeword_t — rebooting to pick up", slot);
-        oe_ws_send_ww_ack(ack_slot, true, NULL);
-        vTaskDelay(pdMS_TO_TICKS(800));
-        esp_restart();
+        wakeword_config_t cfg = {.slot = slot, .threshold = 0.7f,
+            .cooldown_ms = 1500, .refractory_after_speak_ms = 400};
+        s_ww[slot] = wakeword_create(&cfg);
     }
-    esp_err_t e = wakeword_load_slot(s_ww[slot], slot);
-    if (e != ESP_OK) {
-        // Hot-swap failed but the .tflite + manifest are already on flash, so a
-        // clean boot WILL load them. Reboot rather than limp along on a stale /
-        // half-torn-down model (the cause of "had to power-cycle to get the new
-        // wake word to work"). Ack ok=true since the reboot completes the swap.
-        ESP_LOGE(TAG, "ww_upload: slot %d reload failed: %s — rebooting to load from flash", slot, esp_err_to_name(e));
-        oe_ws_send_ww_ack(ack_slot, true, NULL);
-        vTaskDelay(pdMS_TO_TICKS(800));  // let the ack WS frame flush first
-        esp_restart();
-    } else {
-        ESP_LOGI(TAG, "ww_upload: slot %d hot-swapped (%u bytes)", slot, (unsigned)bin_len);
-        // Refresh the playback-aware cutoff task's per-slot default from the
-        // just-loaded manifest. Without this its boot-time value would clobber
-        // this freshly-pushed cutoff on the next TTS/AirPlay edge (the "cutoff
-        // change only sticks after a reboot" bug).
-        s_default_cutoff[slot] = wakeword_get_default_cutoff(s_ww[slot]);
-        oe_ws_send_ww_ack(ack_slot, true, NULL);
+    const bool ok = s_ww[slot] && ww_store_install("/ww", slot,
+        tflite, bin_len, manifest_text, manifest_len,
+        ww_validate_staged, ww_activate_staged, NULL);
+    heap_caps_free(tflite);
+    cJSON_Delete(j);
+    if (!ok) {
+        // In the rare case activation succeeded but journal commit failed,
+        // disk recovery restores the old pair; restore that live model too.
+        if (s_ww[slot] && ww_store_recover("/ww", slot)) {
+            if (wakeword_load_slot(s_ww[slot], slot) != ESP_OK &&
+                access(tflite_path, F_OK) != 0) wakeword_unload_slot(s_ww[slot]);
+        }
+        oe_ws_send_ww_ack(ack_slot, false, "model_update_failed");
+        return;
     }
+    s_default_cutoff[slot] = wakeword_get_default_cutoff(s_ww[slot]);
+    oe_ws_send_ww_ack(ack_slot, true, NULL);
 }
 
 // Clear a wake-word slot. The server sends { type:'ww_clear', slot:N } for
@@ -1624,6 +1584,10 @@ static void apply_ww_clear(const char *json_text, size_t json_len)
         return;
     }
 
+    if (!ww_store_recover("/ww", slot)) {
+        oe_ws_send_ww_ack(ack_slot, false, "model_recovery_failed");
+        return;
+    }
     // Unload the live detector first so the audio task stops feeding it the
     // moment the files go away. Safe when the slot was never loaded (NULL).
     if (s_ww[slot]) wakeword_unload_slot(s_ww[slot]);
@@ -1651,6 +1615,7 @@ typedef struct {
     char type[16];
     char marker[64];
     int64_t trigger_at_ms;
+    int64_t monotonic_due_us;
 } alarm_arm_req_t;
 static void alarm_arm_worker(void *arg);
 
@@ -1722,9 +1687,6 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
             // reconnects are safe. Service name uses the configured device
             // name so multiple devices show distinct entries in iOS.
             airplay_init(g_dev_config.device_name[0] ? g_dev_config.device_name : "OE Voice");
-            // Re-report any alarm still ringing. oe_ws.c sends {type:'auth'}
-            // before this event fires, so the session is established first.
-            alarm_resend_fired();
             break;
         case OE_WS_EVT_CHAT_TOKEN: {
             if (!vg_lifecycle_take()) break;
@@ -1812,7 +1774,9 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 vg_lifecycle_give();
                 break;
             }
-            if (!leds_buttons_is_muted() && !s_stream_active) {
+            if (!leds_buttons_is_muted()) {
+                ++s_stream_generation;
+                s_stream_end_pending = false;
                 if (s_verify_playback_hold_active &&
                     (!evt->turn_id || !evt->turn_id[0])) {
                     s_verify_hold_untagged_stream_owned = true;
@@ -1956,6 +1920,7 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                          (int)s_caps_stt_stream);
                 cJSON_Delete(j);
                 s_authenticated_caps_seen = true;
+                alarm_resend_fired(); // replay only after server confirms authentication
                 maybe_resume_pending_ota();
             }
             break;
@@ -2124,7 +2089,12 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                 const cJSON *jts     = cJSON_GetObjectItem(j, "triggerAtMs");
                 const cJSON *jtype   = cJSON_GetObjectItem(j, "alarmType");
                 const cJSON *jmarker = cJSON_GetObjectItem(j, "audioMarker");
-                if (cJSON_IsString(jid) && cJSON_IsString(jlabel) && cJSON_IsNumber(jts)) {
+                const cJSON *jdelay = cJSON_GetObjectItem(j, "delayMs");
+                if (cJSON_IsString(jid) && jid->valuestring[0] && strlen(jid->valuestring) < 40 &&
+                    cJSON_IsString(jlabel) && cJSON_IsNumber(jts) &&
+                    jts->valuedouble >= 1704067200000.0 && jts->valuedouble < 9007199254740991.0 &&
+                    (!jdelay || (cJSON_IsNumber(jdelay) && jdelay->valuedouble >= 0 &&
+                        jdelay->valuedouble <= 366.0*24*60*60*1000))) {
                     alarm_arm_req_t *req = calloc(1, sizeof(*req));
                     if (req) {
                         strncpy(req->id, jid->valuestring, sizeof(req->id) - 1);
@@ -2136,7 +2106,13 @@ static void ws_event_cb(const oe_ws_payload_t *evt, void *user)
                             strncpy(req->marker, jmarker->valuestring, sizeof(req->marker) - 1);
                         }
                         req->trigger_at_ms = (int64_t) jts->valuedouble;
-                        xTaskCreate(alarm_arm_worker, "alarm_arm_w", 4096, req, 4, NULL);
+                        req->monotonic_due_us = jdelay ? esp_timer_get_time() + (int64_t)jdelay->valuedouble * 1000 + 1 : 0;
+                        if (xTaskCreate(alarm_arm_worker, "alarm_arm_w", 4096, req, 4, NULL) != pdPASS) {
+                            oe_ws_send_alarm_armed(req->id, ESP_ERR_NO_MEM);
+                            free(req);
+                        }
+                    } else {
+                        oe_ws_send_alarm_armed(jid->valuestring, ESP_ERR_NO_MEM);
                     }
                 }
                 cJSON_Delete(j);
@@ -2520,44 +2496,46 @@ static void tts_pcm_cb(const int16_t *pcm, size_t samples, uint32_t rate, void *
 // what fixes the "last sentence clipped" race.
 static void stream_finalize_task(void *arg)
 {
+    s_stream_finalizer_ready = true;
     while (1) {
         if (s_stream_end_req && s_stream_active &&
             !s_verify_playback_hold_active) {
-            s_stream_end_req = false;
-            bool deferred = false;
-            for (int i = 0; i < 300; ++i) {           // up to ~15 s safety cap
-                // A verify hold can begin after this task observed end_req.
-                // Hand ownership back to the gate instead of finalizing the
-                // old reply underneath a potentially-rejected wake.
-                if (s_verify_playback_hold_active || !s_stream_active) {
-                    deferred = true;
-                    break;
-                }
+            if (!vg_lifecycle_take()) continue;
+            const uint32_t generation = s_stream_generation;
+            const bool can_drain = s_stream_end_req && s_stream_active &&
+                !s_verify_playback_hold_active;
+            vg_lifecycle_give();
+            if (!can_drain) continue;
+            bool drained = false;
+            for (int i = 0; i < 300; ++i) {
+                if (s_verify_playback_hold_active || !s_stream_active ||
+                    s_stream_generation != generation) break;
                 uint32_t used = 0, cap = 0;
                 audio_io_get_playback_buf_stats(&used, &cap);
-                if (used == 0) break;
+                if (used == 0 && s_speech_writers == 0) { drained = true; break; }
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
-            if (deferred || s_verify_playback_hold_active ||
-                !s_stream_active) {
-                if (s_stream_active) s_stream_end_req = true;
+            if (!drained) {
                 vTaskDelay(pdMS_TO_TICKS(30));
                 continue;
             }
-            vTaskDelay(pdMS_TO_TICKS(120));           // I²S DMA tail margin
+            vTaskDelay(pdMS_TO_TICKS(120)); // I²S DMA tail margin
             if (!vg_lifecycle_take()) continue;
-            if (s_verify_playback_hold_active || !s_stream_active) {
-                if (s_stream_active) s_stream_end_req = true;
+            uint32_t used = 0, cap = 0;
+            audio_io_get_playback_buf_stats(&used, &cap);
+            if (s_verify_playback_hold_active || !s_stream_active ||
+                !s_stream_end_req || s_stream_generation != generation ||
+                used != 0 || s_speech_writers != 0) {
                 vg_lifecycle_give();
                 continue;
             }
+            s_stream_end_req = false;
             // Publish the terminal stream state while begin/commit/mute are
             // excluded. A gate that wins this mutex sees a live stream and
             // holds it; a finalizer that wins first makes the old reply fully
             // terminal before that gate snapshots playback.
             s_stream_active = false;
             s_stream_turn_id[0] = 0;
-            vg_lifecycle_give();
             for (uint8_t _i = 0; _i < WW_NUM_SLOTS; ++_i)
                 if (s_ww[_i]) wakeword_notify_speaking_ended(s_ww[_i]);
             xvf3800_enable_amplifier(false);
@@ -2588,6 +2566,7 @@ static void stream_finalize_task(void *arg)
             }
             s_stream_end_pending = false;
             airplay_resume();
+            vg_lifecycle_give();
         } else if (s_stream_active && !s_stream_end_req &&
                    !s_paused_for_barge &&
                    !s_verify_playback_hold_active) {
@@ -2611,14 +2590,15 @@ static void stream_finalize_task(void *arg)
                 // Revalidate under the lifecycle lock; a gate may have begun
                 // after the watchdog's outer snapshot and intentionally
                 // stopped frame arrival.
+                audio_io_get_playback_buf_stats(&used, &cap);
                 if (s_verify_playback_hold_active || !s_stream_active ||
-                    s_stream_end_req || s_paused_for_barge) {
+                    s_stream_end_req || s_paused_for_barge || used != 0 ||
+                    s_speech_writers != 0 || s_last_tts_frame_us != last) {
                     vg_lifecycle_give();
                     continue;
                 }
                 s_stream_active = false;
                 s_stream_turn_id[0] = 0;
-                vg_lifecycle_give();
                 ESP_LOGW(TAG, "tts stream stalled (%d ms, ring empty, no end) — tearing down SPEAKING",
                          TTS_STREAM_STALL_TIMEOUT_MS);
                 oe_udplog_send("[tts] stream stall watchdog fired");
@@ -2631,6 +2611,7 @@ static void stream_finalize_task(void *arg)
                 s_followup_pending_ms = 0;
                 set_ui_state(UI_STATE_IDLE);
                 airplay_resume();
+                vg_lifecycle_give();
             }
         }
         // Wait-LED expiry: the turn never continued (abandoned delegation,
@@ -2649,6 +2630,7 @@ static void stream_finalize_task(void *arg)
 static void tts_worker_task(void *arg)
 {
     sentence_t s;
+    s_tts_worker_ready = true;
     while (1) {
         if (xQueueReceive(s_sentence_q, &s, portMAX_DELAY) != pdTRUE) continue;
         if (leds_buttons_is_muted()) continue;
@@ -3876,7 +3858,7 @@ static vad_end_reason_t vg_provisional_step(const int16_t *frame, size_t n)
     // Mirror normal capture through the first terminal VAD frame. Once VAD
     // ends, later frames are gate-polling time, not part of this utterance.
     if (s_prov_vad_end == VAD_END_NONE) {
-        if (s_capture_used + n < CAPTURE_BUFFER_SAMPLES) {
+        if (n <= CAPTURE_BUFFER_SAMPLES - s_capture_used) {
             memcpy(s_capture_buf + s_capture_used, frame, n * sizeof(int16_t));
             s_capture_used += n;
         }
@@ -4093,10 +4075,16 @@ static void capture_and_drive_task(void *arg)
         .energy_threshold = VOICE_ENERGY_THRESHOLD,
         .silence_ms_to_end = 500,
         .no_speech_ms_to_end = 5000,
-        .max_utterance_ms = 15000,
+        .max_utterance_ms = CAPTURE_MAX_UTTERANCE_MS,
         .sample_rate = 16000,
     };
     s_vad = vad_create(&vcfg);
+    if (!s_vad) {
+        ESP_LOGE(TAG, "VAD allocation failed; voice drive unavailable");
+        vTaskDelete(NULL);
+        return;
+    }
+    s_drive_ready = true;
 
     s_in_utterance = false;
     // Log-once guard for the capture-buffer saturation warning below —
@@ -4133,6 +4121,7 @@ static void capture_and_drive_task(void *arg)
         }
         size_t n = audio_io_read_frame(frame, WW_FRAME_SAMPLES, 200);
         if (n < WW_FRAME_SAMPLES) continue;
+        ++s_drive_frames;
 
         // Verify-gate self-heal: a gate POST wedged on a half-open socket (e.g.
         // OE mid-restart) pins s_verify_inflight, so verify_gate_state() returns
@@ -4823,7 +4812,7 @@ static void capture_and_drive_task(void *arg)
                 end_reason = vg_provisional_step(frame, n);
                 if (end_reason == VAD_END_NONE) continue;
             } else {
-                if (s_capture_used + n < CAPTURE_BUFFER_SAMPLES) {
+                if (n <= CAPTURE_BUFFER_SAMPLES - s_capture_used) {
                     memcpy(s_capture_buf + s_capture_used, frame, n * sizeof(int16_t));
                     s_capture_used += n;
                     // Streaming STT: ship this frame now so the upload overlaps
@@ -4837,8 +4826,8 @@ static void capture_and_drive_task(void *arg)
                     }
                 } else if (!capture_sat_logged) {
                     // Saturated mid-utterance: STT will get a truncated question.
-                    // Should be unreachable now that the buffer (16 s) exceeds
-                    // the VAD ceiling (max_utterance_ms 15 s) — log loudly if it
+                    // Should be unreachable with capacity derived from pre-roll
+                    // plus the VAD ceiling and its final frame — log loudly if it
                     // ever happens instead of silently cutting the user off.
                     ESP_LOGW(TAG, "capture buffer full at %u samples — utterance tail dropped",
                              (unsigned)s_capture_used);
@@ -5063,7 +5052,14 @@ static void alarm_arm_worker(void *arg)
             audio = NULL; audio_len = 0;
         }
     }
-    alarm_arm(req->id, req->label, req->trigger_at_ms, audio, audio_len, req->type);
+    int64_t delay_ms = -1;
+    if (req->monotonic_due_us) {
+        int64_t remaining = req->monotonic_due_us - esp_timer_get_time();
+        delay_ms = remaining > 0 ? remaining / 1000 : 0;
+    }
+    esp_err_t result = alarm_arm_with_delay(req->id, req->label, req->trigger_at_ms,
+                                           audio, audio_len, req->type, delay_ms);
+    oe_ws_send_alarm_armed(req->id, result);
     free(req);
     vTaskDelete(NULL);
 }
@@ -5603,7 +5599,7 @@ static void boot_operational(void)
     // audio_io default (80 %) if no value persisted yet — e.g. first
     // boot after factory reset.
     uint8_t saved_vol = 0;
-    if (nvs_creds_get_volume(&saved_vol) == ESP_OK && saved_vol > 0 && saved_vol <= 100) {
+    if (nvs_creds_get_volume(&saved_vol) == ESP_OK && saved_vol <= 100) {
         audio_io_set_volume(saved_vol);
         ESP_LOGI(TAG, "restored volume from NVS: %u%%", saved_vol);
     }
@@ -5674,7 +5670,7 @@ static void boot_operational(void)
     // and after WiFi is up (so the deferred scheduler can succeed).
     alarm_set_speaking_callback(alarm_speaking_cb);
     alarm_set_amp_callback(alarm_amp_cb);
-    alarm_init();
+    ESP_ERROR_CHECK(alarm_init());
 
     // Amplifier is enabled lazily, only around TTS playback (in
     // tts_worker_task). Leaving it enabled at boot suppressed wake-word
@@ -5691,6 +5687,10 @@ static void boot_operational(void)
     // error worth logging but not crashing on.
     uint8_t loaded = 0;
     for (uint8_t i = 0; i < WW_NUM_SLOTS; ++i) {
+        if (!ww_store_recover("/ww", i)) {
+            ESP_LOGE(TAG, "wakeword slot %u: interrupted update recovery failed", i);
+            continue;
+        }
         wakeword_config_t wcfg = {
             .slot = i,
             .threshold = 0.7f,
@@ -5719,6 +5719,7 @@ static void boot_operational(void)
     }
 
     s_sentence_q = xQueueCreate(16, sizeof(sentence_t));
+    if (!s_sentence_q) { ESP_LOGE(TAG, "sentence queue alloc"); esp_restart(); }
     s_token_mutex = xSemaphoreCreateMutex();
     if (!s_token_mutex) { ESP_LOGE(TAG, "token mutex alloc"); esp_restart(); }
     s_capture_buf = malloc(CAPTURE_BUFFER_SAMPLES * sizeof(int16_t));
@@ -5802,9 +5803,13 @@ static void boot_operational(void)
     if (s_ambient_req_q) xTaskCreate(ambient_task, "ambient", 12288, NULL, 4, NULL);
     else ESP_LOGE(TAG, "ambient queue alloc failed — ambient playback disabled");
 
-    xTaskCreate(tts_worker_task, "tts_worker", 12288, NULL, 6, NULL);
-    xTaskCreate(stream_finalize_task, "stream_fin", 4096, NULL, 6, NULL);
-    xTaskCreatePinnedToCore(capture_and_drive_task, "drive", 12288, NULL, 7, NULL, 0);
+    if (xTaskCreate(tts_worker_task, "tts_worker", 12288, NULL, 6, NULL) != pdPASS ||
+        xTaskCreate(stream_finalize_task, "stream_fin", 4096, NULL, 6, NULL) != pdPASS ||
+        xTaskCreatePinnedToCore(capture_and_drive_task, "drive", 12288, NULL, 7, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "essential voice task creation failed");
+        esp_restart();
+        return;
+    }
     xTaskCreate(xvf_migration_task, "xvf_migrate", 3072, NULL, 3, NULL);
     xTaskCreate(boot_indicator_task, "boot_ind", 3072, NULL, 4, NULL);
     xTaskCreate(agc_freeze_task, "agc_freeze", 3072, NULL, 4, NULL);
@@ -5819,7 +5824,11 @@ static void boot_operational(void)
     // dump: 256-byte line buffer + ESP_LOGI (vprintf) + xTaskGetHandle +
     // uxTaskGetStackHighWaterMark traversal added enough stack pressure
     // to overflow the original 2 KB allocation (observed 0.2.34 boot).
-    xTaskCreate(heartbeat_task, "hb", 6144, NULL, 1, NULL);
+    if (xTaskCreate(heartbeat_task, "hb", 6144, NULL, 1, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "health task creation failed");
+        esp_restart();
+        return;
+    }
 
     s_operational_boot_ready = true;
     maybe_resume_pending_ota();
@@ -5854,6 +5863,9 @@ static void heartbeat_task(void *arg)
     uint32_t prev_decode_errs = 0;
     uint32_t prev_tick_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     uint32_t prev_cap_samples = audio_io_get_capture_samples_total();
+    uint32_t prev_drive_frames = s_drive_frames;
+    uint32_t healthy_connection = s_ws_connection_epoch;
+    unsigned healthy_windows = 0;
     // Consecutive heartbeat windows that contained speech but produced starved
     // features. Drives the AGC self-heal below.
     int starved_windows = 0;
@@ -5874,9 +5886,21 @@ static void heartbeat_task(void *arg)
             const uint32_t cap_total = audio_io_get_capture_samples_total();
             const uint32_t cap_sps = (cap_total - prev_cap_samples) / 10u;
             prev_cap_samples = cap_total;
-            if (!s_ota_marked_valid && s_ws_connected && cap_sps > 0) {
-                oe_ota_mark_running_valid();
-                s_ota_marked_valid = true;
+            const uint32_t drive_frames = s_drive_frames;
+            const bool healthy = s_ws_connected && s_authenticated_caps_seen &&
+                s_operational_boot_ready && s_tts_worker_ready &&
+                s_stream_finalizer_ready && s_drive_ready && cap_sps > 0 &&
+                drive_frames != prev_drive_frames &&
+                healthy_connection == s_ws_connection_epoch;
+            prev_drive_frames = drive_frames;
+            healthy_connection = s_ws_connection_epoch;
+            healthy_windows = healthy ? healthy_windows + 1 : 0;
+            // Require three full, authenticated health windows (30 seconds),
+            // restarting the probation interval after any reconnect or stall.
+            if (!s_ota_marked_valid && healthy_windows >= 3) {
+                esp_err_t valid = oe_ota_mark_running_valid();
+                s_ota_marked_valid = valid == ESP_OK;
+                if (valid != ESP_OK) ESP_LOGW(TAG, "OTA acceptance failed: %s", esp_err_to_name(valid));
             }
             const uint32_t int_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
             char hbline[192];

@@ -16,3 +16,5 @@ typedef void (*captive_submit_callback_t)(const captive_form_result_t *r, void *
 esp_err_t captive_portal_start(const char *ap_ssid, captive_submit_callback_t cb, void *user);
 esp_err_t captive_portal_stop(void);
 bool      captive_portal_running(void);
+// Finish a submitted attempt. The AP remains available for correcting errors.
+void captive_portal_set_result(bool paired, const char *message);
