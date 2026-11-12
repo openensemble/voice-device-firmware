@@ -2854,8 +2854,8 @@ static bool transcript_is_filler(const char *t)
 #define VG_PRE_SAMPLES   (16000 * 2000 / 1000)              // 2.0 s pre-fire  (32000)
 #define VG_TAIL_SAMPLES  (16000 *  500 / 1000)              // 0.5 s post-fire  (8000)
 #define VG_WIN_SAMPLES   (VG_PRE_SAMPLES + VG_TAIL_SAMPLES) // 2.5 s window    (40000)
-#define VG_DEADLINE_MS   1200                               // client long-poll deadline
-#define VG_INFLIGHT_HARD_MS 4000                            // gate POST wedged past this → self-heal abort
+#define VG_DEADLINE_MS   OE_VERIFY_GATE_TIMEOUT_MS          // includes remote STT network headroom
+#define VG_INFLIGHT_HARD_MS (VG_DEADLINE_MS + 2500)           // abort a wedged POST after the provisional deadline
 #define VG_STT_REPLAY_BUDGET_MS 160                         // ample margin under 512 ms ring
 #define VG_CONTROL_SEND_TIMEOUT_MS 20                       // never starve capture
 

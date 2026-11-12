@@ -516,7 +516,7 @@ esp_err_t oe_verify_gate_post(const char *server_url, const char *gate_path,
         .method = HTTP_METHOD_POST,
         .event_handler = http_evt,
         .user_data = &rb,
-        .timeout_ms = timeout_ms > 0 ? timeout_ms : 1200,
+        .timeout_ms = timeout_ms > 0 ? timeout_ms : OE_VERIFY_GATE_TIMEOUT_MS,
         .crt_bundle_attach = esp_crt_bundle_attach,
         // The fixed same-origin endpoint is part of the bearer boundary.
         // A redirect must fail closed rather than forwarding credentials or

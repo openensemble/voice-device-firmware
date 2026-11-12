@@ -44,6 +44,7 @@ With a host C compiler and ESP-IDF available (`IDF_PATH`, or `~/esp/esp-idf`):
 python3 tests/check_firmware_regressions.py
 python3 tests/check_alarm_regressions.py
 python3 tests/check_captive_portal_header_budget.py
+python3 tests/check_wake_verification_deadlines.py
 ```
 
 These run production C paths with hardware boundaries stubbed: capture limits,
@@ -51,6 +52,8 @@ TTS burst handoff, pairing retry, persisted volume, OTA validation/readiness,
 alarm persistence, cancellation/replay, and interrupted wake-word file updates (including a second interruption during
 recovery). They do not flash a device. Audio quality, AP/STA transitions and
 physical power-loss behavior still require device validation.
+The wake-verification check covers delayed API acceptance, command buffering,
+deadline rejection, stale verdicts, mute cancellation, and stuck-request recovery.
 
 ## Wake-word models
 

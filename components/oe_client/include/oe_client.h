@@ -265,9 +265,10 @@ esp_err_t oe_stt_post(const char *server_url, const char *token,
 // Second-stage wake verification. POSTs the wake window as multipart/form-data
 // to OE_VERIFY_GATE_PATH on the already-paired OE origin. HTTP is accepted only
 // when that origin is on the local network — written as an IPv4 literal or as a
-// name that resolves to one; HTTPS is accepted for any host. OE authenticates the voice-device session, derives the canonical
-// device id, and privately relays to the loopback verifier. The response carries
-// no transcript text.
+// name that resolves to one; HTTPS is accepted for any host. OE authenticates
+// the voice-device session and verifies with its selected STT provider.
+// The response carries no transcript text.
+#define OE_VERIFY_GATE_TIMEOUT_MS 3500  // OE remote STT allows 2.5 s; leave network headroom
 typedef enum {
     OE_VERIFY_ACCEPT = 0,   // effective=="accept"  → proceed with the turn
     OE_VERIFY_REJECT,       // effective=="reject"  → drop the fire silently
@@ -282,8 +283,8 @@ typedef enum {
 // wake_words_json: JSON array string, e.g. "[\"hey_computer\"]".
 // detector_score: [0,1], or <0 to omit the field.
 // fired_at      : ISO8601 string, or "" to omit.
-// timeout_ms    : client long-poll deadline (~1200; just above the gate's 1 s
-//                 whisper timeout). *out_effective is ALWAYS written (ERROR on
+// timeout_ms    : client request timeout (OE_VERIFY_GATE_TIMEOUT_MS by default).
+//                 *out_effective is ALWAYS written (ERROR on
 //                 any transport/parse/identity failure). The response must
 //                 echo the exact device_id and session_id before its verdict
 //                 is consumed. Return value is for logging only — callers act
